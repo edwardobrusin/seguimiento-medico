@@ -12,6 +12,7 @@ const createMedSchema = z.object({
   name: z.string().min(1).max(150).optional(),
   active_ingredient: z.string().max(150).nullable().optional(),
   presentation: z.string().min(1).max(80).optional(),
+  units_per_package: z.number().positive().optional(),
   dose_amount: z.number().positive().optional(),
   current_stock: z.number().min(0).optional(),
   frequency_type: z
@@ -59,6 +60,7 @@ export async function POST(req: Request) {
       name: parsed.name,
       active_ingredient: parsed.active_ingredient ?? null,
       presentation: parsed.presentation,
+      units_per_package: parsed.units_per_package,
       dose_amount: parsed.dose_amount,
       current_stock: parsed.current_stock ?? 0,
       frequency_type: parsed.frequency_type,

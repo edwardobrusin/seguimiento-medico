@@ -13,6 +13,7 @@ export interface CreateMedicationInput {
   name: string;
   active_ingredient?: string | null;
   presentation: string;
+  units_per_package?: number;
   dose_amount: number;
   current_stock: number;
   frequency_type: MedFrequencyType;
@@ -136,31 +137,37 @@ export class DoseClusteringService {
       input.frequency_value
     );
 
+    const unitsPerPkg =
+      input.units_per_package && input.units_per_package > 0
+        ? input.units_per_package
+        : 30;
+
     const medResult = await query<Medication>(
       input.id
         ? `UPDATE medications
            SET name = $2,
                active_ingredient = $3,
                presentation = $4,
-               dose_amount = $5,
-               current_stock = $6,
-               frequency_type = $7::med_frequency_type,
-               frequency_value = $8,
-               tolerance_window_mins = $9,
-               intake_rule = $10::intake_constraint,
-               daily_consumption_rate = $11,
-               clinical_notes = $12,
+               units_per_package = $5,
+               dose_amount = $6,
+               current_stock = $7,
+               frequency_type = $8::med_frequency_type,
+               frequency_value = $9,
+               tolerance_window_mins = $10,
+               intake_rule = $11::intake_constraint,
+               daily_consumption_rate = $12,
+               clinical_notes = $13,
                updated_at = NOW()
            WHERE id = $1
            RETURNING *`
         : `INSERT INTO medications (
-             name, active_ingredient, presentation, dose_amount, current_stock,
+             name, active_ingredient, presentation, units_per_package, dose_amount, current_stock,
              frequency_type, frequency_value, tolerance_window_mins, intake_rule,
              daily_consumption_rate, clinical_notes
            ) VALUES (
-             $1, $2, $3, $4, $5,
-             $6::med_frequency_type, $7, $8, $9::intake_constraint,
-             $10, $11
+             $1, $2, $3, $4, $5, $6,
+             $7::med_frequency_type, $8, $9, $10::intake_constraint,
+             $11, $12
            )
            RETURNING *`,
       input.id
@@ -169,6 +176,7 @@ export class DoseClusteringService {
             input.name,
             input.active_ingredient ?? null,
             input.presentation,
+            unitsPerPkg,
             input.dose_amount,
             input.current_stock,
             input.frequency_type,
@@ -182,6 +190,7 @@ export class DoseClusteringService {
             input.name,
             input.active_ingredient ?? null,
             input.presentation,
+            unitsPerPkg,
             input.dose_amount,
             input.current_stock,
             input.frequency_type,
@@ -583,9 +592,10 @@ export class DoseClusteringService {
   static async confirmClusterIntake(
     clusterId: string,
     dateStr: string,
-    recordedBy: string
+    recordedBy: string,
+    options?: { origin?: "WEB" | "TELEGRAM" }
   ): Promise<{ updatedCount: number; restockTriggered: string[] }> {
-    return withTransaction(async (tx) => {
+    const result = await withTransaction(async (tx) => {
       const updatedRes = await tx.query<{ medication_id: string }>(
         `UPDATE intake_logs
          SET status = 'TAKEN',
@@ -632,36 +642,72 @@ export class DoseClusteringService {
         restockTriggered,
       };
     });
+
+    if (options?.origin !== "TELEGRAM") {
+      const { TelegramNotificationService } = await import(
+        "./telegram-notification.service"
+      );
+      await TelegramNotificationService.syncClusterStateFromWeb(
+        clusterId,
+        dateStr
+      );
+    }
+
+    return result;
   }
 
   static async confirmSingleIntakeLog(
     intakeLogId: string,
     status: IntakeStatus,
     recordedBy: string,
-    observations?: string
-  ): Promise<void> {
-    await query(
+    observations?: string,
+    options?: { origin?: "WEB" | "TELEGRAM" }
+  ): Promise<{ clusterId: string | null; dateStr: string | null }> {
+    const res = await query<{
+      cluster_id: string | null;
+      date_str: string;
+    }>(
       `UPDATE intake_logs
        SET status = $2::intake_status,
            taken_at = CASE WHEN $2::intake_status = 'TAKEN' THEN NOW() ELSE taken_at END,
            recorded_by = $3,
            observations = COALESCE($4, observations)
-       WHERE id = $1`,
+       WHERE id = $1
+       RETURNING cluster_id, (scheduled_for AT TIME ZONE 'UTC')::date::text AS date_str`,
       [intakeLogId, status, recordedBy, observations ?? null]
     );
+
+    const row = res.rows[0];
+    if (options?.origin !== "TELEGRAM" && row?.cluster_id && row?.date_str) {
+      const { TelegramNotificationService } = await import(
+        "./telegram-notification.service"
+      );
+      await TelegramNotificationService.syncClusterStateFromWeb(
+        row.cluster_id,
+        row.date_str
+      );
+    }
+
+    return {
+      clusterId: row?.cluster_id ?? null,
+      dateStr: row?.date_str ?? null,
+    };
   }
 
   static async restockMedication(
     medicationId: string,
-    quantityToAdd: number
+    quantityToAdd: number,
+    recordedBy = "RESTOCK_WEB",
+    options?: { origin?: "WEB" | "TELEGRAM" }
   ): Promise<Medication> {
-    return withTransaction(async (tx) => {
+    const { med, sentNotifications } = await withTransaction(async (tx) => {
       const res = await tx.query<Medication>(
         `UPDATE medications
          SET current_stock = current_stock + $2,
              updated_at = NOW()
          WHERE id = $1
          RETURNING *,
+           units_per_package::float8 AS units_per_package,
            dose_amount::float8 AS dose_amount,
            current_stock::float8 AS current_stock,
            daily_consumption_rate::float8 AS daily_consumption_rate,
@@ -669,25 +715,51 @@ export class DoseClusteringService {
         [medicationId, quantityToAdd]
       );
 
-      const med = res.rows[0];
-      if (!med) {
+      const updatedMed = res.rows[0];
+      if (!updatedMed) {
         throw new Error("Medicamento no encontrado para restock.");
       }
 
-      if (Number(med.days_of_supply_remaining) > 7) {
-        await tx.query(
-          `UPDATE notification_queue
-           SET status = 'ACKNOWLEDGED',
-               acknowledged_at = NOW(),
-               acknowledged_by_chat_id = 'RESTOCK_WEB'
+      const notifRes = await tx.query<{
+        id: string;
+        title: string;
+        message: string;
+        status: string;
+        telegram_message_ids: unknown;
+      }>(
+        `WITH prev AS (
+           SELECT id, title, message, status, telegram_message_ids
+           FROM notification_queue
            WHERE source_type = 'RESTOCK_ALERT'
              AND source_id = $1
-             AND status IN ('QUEUED', 'SENT')`,
-          [medicationId]
-        );
-      }
+             AND status IN ('QUEUED', 'SENT')
+         )
+         UPDATE notification_queue nq
+         SET status = 'ACKNOWLEDGED',
+             acknowledged_at = NOW(),
+             acknowledged_by_chat_id = $2
+         FROM prev
+         WHERE nq.id = prev.id
+         RETURNING prev.id, prev.title, prev.message, prev.status, prev.telegram_message_ids`,
+        [medicationId, recordedBy]
+      );
 
-      return med;
+      return {
+        med: updatedMed,
+        sentNotifications: notifRes.rows.filter((n) => n.status === "SENT"),
+      };
     });
+
+    if (options?.origin !== "TELEGRAM" && sentNotifications.length > 0) {
+      const { TelegramNotificationService } = await import(
+        "./telegram-notification.service"
+      );
+      await TelegramNotificationService.syncRestockFromWeb(
+        med,
+        sentNotifications
+      );
+    }
+
+    return med;
   }
 }

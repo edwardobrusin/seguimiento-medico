@@ -22,6 +22,7 @@ interface MedicationsInventoryViewProps {
     name: string;
     active_ingredient: string;
     presentation: string;
+    units_per_package: number;
     dose_amount: number;
     current_stock: number;
     frequency_type: MedFrequencyType;
@@ -65,6 +66,7 @@ export function MedicationsInventoryView({
   const [name, setName] = useState("");
   const [activeIngredient, setActiveIngredient] = useState("");
   const [presentation, setPresentation] = useState("Tableta");
+  const [unitsPerPackage, setUnitsPerPackage] = useState("30");
   const [doseAmount, setDoseAmount] = useState("1");
   const [currentStock, setCurrentStock] = useState("30");
   const [frequencyType, setFrequencyType] =
@@ -94,6 +96,7 @@ export function MedicationsInventoryView({
       return;
     }
     const doseNum = Number(doseAmount);
+    const pkgNum = Number(unitsPerPackage);
     const stockNum = Number(currentStock);
     const freqNum = Number(frequencyValue);
     const tolNum = Number(toleranceMins);
@@ -120,6 +123,7 @@ export function MedicationsInventoryView({
         name: name.trim(),
         active_ingredient: activeIngredient.trim(),
         presentation: presentation.trim() || "Tableta",
+        units_per_package: Number.isFinite(pkgNum) && pkgNum > 0 ? pkgNum : 30,
         dose_amount: doseNum,
         current_stock: stockNum,
         frequency_type: frequencyType,
@@ -259,6 +263,25 @@ export function MedicationsInventoryView({
                 <option value="ml">ml</option>
                 <option value="Gotas">Gotas</option>
               </select>
+            </div>
+
+            <div>
+              <label
+                htmlFor="med-pkg-units"
+                className="block text-[14px] font-medium text-[#0F172A] mb-1"
+              >
+                Unidades por envase / caja
+              </label>
+              <input
+                id="med-pkg-units"
+                type="number"
+                step="1"
+                min="1"
+                required
+                value={unitsPerPackage}
+                onChange={(e) => setUnitsPerPackage(e.target.value)}
+                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[16px] tabular-nums"
+              />
             </div>
 
             <div>
@@ -535,7 +558,12 @@ export function MedicationsInventoryView({
                     </td>
 
                     <td className="py-3.5 px-3 align-top font-mono text-[15px] font-bold tabular-nums text-[#0F172A]">
-                      {med.current_stock} {med.presentation}
+                      <div>
+                        {med.current_stock} {med.presentation}
+                      </div>
+                      <div className="text-[13px] font-normal text-[#64748B]">
+                        Envase: {med.units_per_package ?? 30} u.
+                      </div>
                     </td>
 
                     <td className="py-3.5 px-3 align-top min-w-[170px]">
@@ -618,7 +646,7 @@ export function MedicationsInventoryView({
                           type="button"
                           onClick={() => {
                             setRestockId(med.id);
-                            setRestockQty("30");
+                            setRestockQty(String(med.units_per_package ?? 30));
                           }}
                           className="clinical-btn inline-flex items-center gap-1.5 px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px] font-medium"
                         >

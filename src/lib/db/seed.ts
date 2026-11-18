@@ -108,11 +108,11 @@ export async function seedClinicalDatabaseIfEmpty(
 
   const medAdalimumab = await db.query<{ id: string }>(
     `INSERT INTO medications (
-      name, active_ingredient, presentation, dose_amount, current_stock,
+      name, active_ingredient, presentation, units_per_package, dose_amount, current_stock,
       frequency_type, frequency_value, tolerance_window_mins, intake_rule,
       daily_consumption_rate, clinical_notes
     ) VALUES (
-      'Adalimumab 40mg', 'Adalimumab', 'Jeringa Prellenada', 1, 2,
+      'Adalimumab 40mg', 'Adalimumab', 'Jeringa Prellenada', 2, 1, 2,
       'INTERVAL_WEEKS', 3, 60, 'NONE',
       0.0476, 'Biologico subcutaneo cada 21 dias. Mantener refrigerado entre 2 y 8 grados.'
     ) RETURNING id`

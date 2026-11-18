@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS medications (
     name VARCHAR(150) NOT NULL,
     active_ingredient VARCHAR(150),
     presentation VARCHAR(80) NOT NULL,
+    units_per_package NUMERIC(10, 2) NOT NULL DEFAULT 30,
     dose_amount NUMERIC(10, 2) NOT NULL,
     current_stock NUMERIC(10, 2) NOT NULL DEFAULT 0,
     frequency_type med_frequency_type NOT NULL,
@@ -61,6 +62,9 @@ CREATE TABLE IF NOT EXISTS medications (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE medications
+ADD COLUMN IF NOT EXISTS units_per_package NUMERIC(10, 2) NOT NULL DEFAULT 30;
 
 -- 2. Bloques de Agrupacion Horaria (Clusters de Toma Optimizada)
 CREATE TABLE IF NOT EXISTS intake_clusters (

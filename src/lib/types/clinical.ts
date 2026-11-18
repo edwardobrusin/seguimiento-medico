@@ -42,6 +42,7 @@ export interface Medication {
   name: string;
   active_ingredient: string | null;
   presentation: string;
+  units_per_package: number;
   dose_amount: number;
   current_stock: number;
   frequency_type: MedFrequencyType;
@@ -81,6 +82,7 @@ export interface ClusterIntakeItem {
   medication_name: string;
   active_ingredient: string | null;
   presentation: string;
+  units_per_package: number;
   dose_amount: number;
   quantity_deducted: number;
   intake_rule: IntakeConstraint;

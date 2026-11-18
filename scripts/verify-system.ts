@@ -12,7 +12,10 @@ import { closeDbForTests, ensureInitialized, query } from "../src/lib/db/client"
 import { DoseClusteringService } from "../src/lib/services/dose-clustering.service";
 import { ClinicalEventsService } from "../src/lib/services/clinical-events.service";
 import { FollowUpTopicsService } from "../src/lib/services/follow-up-topics.service";
-import { TelegramNotificationService } from "../src/lib/services/telegram-notification.service";
+import {
+  PATIENT_PERSISTENT_KEYBOARD,
+  TelegramNotificationService,
+} from "../src/lib/services/telegram-notification.service";
 import { getCommandCenterSnapshot } from "../src/lib/services/command-center.service";
 import {
   GET as cronDispatchGet,
@@ -307,8 +310,136 @@ async function runVerification() {
   );
   assert.equal(webhookReg.secret_configured, true);
 
-  // 9. Escaneo estricto cero emojis
-  console.log("[9/9] Auditando cero emojis en todo src/ ...");
+  // 9. Terminal Bilateral del Paciente en Telegram (Menu persistente, ack_log parcial, restock_add, sync Web->TG)
+  console.log("[9/10] Verificando Terminal Bilateral del Paciente en Telegram...");
+  assert.equal(PATIENT_PERSISTENT_KEYBOARD.is_persistent, true);
+  assert.equal(PATIENT_PERSISTENT_KEYBOARD.resize_keyboard, true);
+
+  // Probar botones del teclado persistente
+  for (const [btnText, expectedAction] of [
+    ["[ Tomas de Hoy ]", "tomas_hoy"],
+    ["[ Registrar Restock ]", "restock_menu"],
+    ["[ Proximas Citas ]", "citas"],
+    ["[ Estado de Inventario ]", "estado"],
+  ] as const) {
+    const btnResp = await TelegramNotificationService.handleWebhookUpdate(
+      {
+        update_id: Date.now(),
+        message: {
+          message_id: 100,
+          chat: { id: 100100002 },
+          text: btnText,
+        },
+      },
+      "verify-secret-token"
+    );
+    assert.equal(btnResp.ok, true);
+    assert.equal(btnResp.action, expectedAction);
+  }
+
+  // Verificar units_per_package y teclados <= 64 bytes
+  const adaMed = snapshot.medications.find((m) =>
+    m.name.includes("Adalimumab")
+  );
+  assert.ok(adaMed && adaMed.units_per_package === 2, "Adalimumab debe tener units_per_package = 2");
+
+  const restockKb = TelegramNotificationService.buildRestockInlineKeyboard(
+    medLowTrigger.id,
+    30
+  );
+  for (const row of restockKb.inline_keyboard) {
+    for (const btn of row) {
+      assert.ok(Buffer.byteLength(btn.callback_data, "utf8") <= 64);
+    }
+  }
+
+  // Probar restock_sel y restock_add de 1 toque
+  const selResp = await TelegramNotificationService.handleWebhookUpdate(
+    {
+      update_id: Date.now(),
+      callback_query: {
+        id: "sim_sel_1",
+        from: { id: 100100002 },
+        message: { message_id: 201, chat: { id: 100100002 }, text: "Select" },
+        data: `restock_sel:${medLowTrigger.id}`,
+      },
+    },
+    "verify-secret-token"
+  );
+  assert.equal(selResp.action, "restock_sel");
+
+  const addResp = await TelegramNotificationService.handleWebhookUpdate(
+    {
+      update_id: Date.now(),
+      callback_query: {
+        id: "sim_add_1",
+        from: { id: 100100002 },
+        message: { message_id: 201, chat: { id: 100100002 }, text: "Select" },
+        data: `restock_add:${medLowTrigger.id}:30`,
+      },
+    },
+    "verify-secret-token"
+  );
+  assert.equal(addResp.action, "restock_add");
+  assert.ok(addResp.statusHtml?.includes("RESTOCK CONFIRMADO +30"));
+
+  // Verificar que todas las alertas abiertas de restock del farmaco quedaron ACKNOWLEDGED
+  const openRestockAlerts = await query<{ id: string }>(
+    `SELECT id FROM notification_queue
+     WHERE source_type = 'RESTOCK_ALERT'
+       AND source_id = $1::uuid
+       AND status != 'ACKNOWLEDGED'`,
+    [medLowTrigger.id]
+  );
+  assert.equal(openRestockAlerts.rows.length, 0);
+
+  // Probar confirmacion parcial ack_log dentro de Bloque Matutino Alimentos
+  const pendingCluster = snapshot.today_clusters.find(
+    (c) => c.items.filter((i) => i.status === "PENDING").length >= 2
+  );
+  assert.ok(pendingCluster, "Debe haber un bloque con >= 2 medicinas pendientes");
+  const pendingItems = pendingCluster.items.filter((i) => i.status === "PENDING");
+  const partialResp = await TelegramNotificationService.handleWebhookUpdate(
+    {
+      update_id: Date.now(),
+      callback_query: {
+        id: "sim_ack_log_1",
+        from: { id: 100100002 },
+        message: { message_id: 202, chat: { id: 100100002 }, text: "Bloque" },
+        data: `ack_log:${pendingItems[0].intake_log_id}`,
+      },
+    },
+    "verify-secret-token"
+  );
+  assert.equal(partialResp.action, "ack_log_partial");
+  assert.ok(partialResp.statusHtml?.includes("[CONFIRMADO]"));
+  assert.ok(partialResp.statusHtml?.includes("[PENDIENTE]"));
+
+  // Probar sincronizacion inversa Web -> Telegram al confirmar resto del bloque desde Web
+  await DoseClusteringService.confirmClusterIntake(
+    pendingCluster.cluster_id,
+    snapshot.target_date,
+    "Consola Clinica Web",
+    { origin: "WEB" }
+  );
+  const syncedNotif = await query<{ status: string; message: string }>(
+    `SELECT status, message FROM notification_queue
+     WHERE source_type = 'MEDICATION_INTAKE'
+       AND source_id = $1::uuid
+       AND idempotency_key = $2`,
+    [
+      pendingCluster.cluster_id,
+      `CLUSTER_${pendingCluster.cluster_id}_${snapshot.target_date}`,
+    ]
+  );
+  assert.equal(syncedNotif.rows[0]?.status, "ACKNOWLEDGED");
+  assert.ok(
+    syncedNotif.rows[0]?.message.includes("ACTUALIZADO DESDE EL PANEL WEB"),
+    "Debe sincronizar la confirmacion Web hacia el texto de la notificacion"
+  );
+
+  // 10. Escaneo estricto cero emojis
+  console.log("[10/10] Auditando cero emojis en todo src/ ...");
   const emojiHits = scanForEmojis(path.resolve(process.cwd(), "src"));
   assert.equal(
     emojiHits.length,
@@ -318,7 +449,7 @@ async function runVerification() {
 
   await closeDbForTests();
   fs.rmSync(testPgDir, { recursive: true, force: true });
-  console.log("VERIFICACION INTEGRAL EXITOSA: 9/9 PRUEBAS SUPERADAS CON CERO EMOJIS.");
+  console.log("VERIFICACION INTEGRAL EXITOSA: 10/10 PRUEBAS SUPERADAS CON CERO EMOJIS.");
 }
 
 runVerification().catch(async (err) => {

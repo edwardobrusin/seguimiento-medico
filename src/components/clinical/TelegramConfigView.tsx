@@ -267,6 +267,54 @@ export function TelegramConfigView({
 
           <button
             type="button"
+            disabled={busyAction === "menu_tomas"}
+            onClick={async () => {
+              setBusyAction("menu_tomas");
+              try {
+                const firstChatId =
+                  snapshot.telegram_recipients[0]?.telegram_chat_id ?? "100100002";
+                const res = await onSimulateWebhook({
+                  type: "command",
+                  command: "[ Tomas de Hoy ]",
+                  chat_id: firstChatId,
+                });
+                if (res.statusHtml) setStatusReportHtml(res.statusHtml);
+                setActionLog("[MENU PACIENTE] Simulado boton [ Tomas de Hoy ].");
+              } finally {
+                setBusyAction(null);
+              }
+            }}
+            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
+          >
+            Probar [ Tomas de Hoy ]
+          </button>
+
+          <button
+            type="button"
+            disabled={busyAction === "menu_restock"}
+            onClick={async () => {
+              setBusyAction("menu_restock");
+              try {
+                const firstChatId =
+                  snapshot.telegram_recipients[0]?.telegram_chat_id ?? "100100002";
+                const res = await onSimulateWebhook({
+                  type: "command",
+                  command: "[ Registrar Restock ]",
+                  chat_id: firstChatId,
+                });
+                if (res.statusHtml) setStatusReportHtml(res.statusHtml);
+                setActionLog("[MENU PACIENTE] Simulado boton [ Registrar Restock ].");
+              } finally {
+                setBusyAction(null);
+              }
+            }}
+            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
+          >
+            Probar [ Registrar Restock ]
+          </button>
+
+          <button
+            type="button"
             disabled={busyAction === "dispatch"}
             onClick={handleRunDispatch}
             className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"

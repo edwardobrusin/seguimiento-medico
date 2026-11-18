@@ -23,6 +23,17 @@ async function main() {
   console.log("DB_MODE:", getDbMode());
   await ensureInitialized();
 
+  // Asegurar migracion idempotente de columna units_per_package y valor de Adalimumab
+  await query(
+    `ALTER TABLE medications
+     ADD COLUMN IF NOT EXISTS units_per_package NUMERIC(10, 2) NOT NULL DEFAULT 30`
+  );
+  await query(
+    `UPDATE medications
+     SET units_per_package = 2
+     WHERE name = 'Adalimumab 40mg' AND units_per_package = 30`
+  );
+
   const meds = await query<{ c: number }>(
     "SELECT count(*)::int AS c FROM medications"
   );

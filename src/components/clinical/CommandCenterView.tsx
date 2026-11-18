@@ -305,7 +305,7 @@ export function CommandCenterView({
                         type="button"
                         onClick={() => {
                           setRestockTargetId(med.id);
-                          setRestockQty("30");
+                          setRestockQty(String(med.units_per_package ?? 30));
                         }}
                         className="clinical-btn inline-flex items-center gap-2 px-3 bg-[#991B1B] hover:bg-[#7F1D1D] text-white text-[14px] font-medium"
                       >

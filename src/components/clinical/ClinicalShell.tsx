@@ -222,6 +222,7 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     name: string;
     active_ingredient: string;
     presentation: string;
+    units_per_package: number;
     dose_amount: number;
     current_stock: number;
     frequency_type: MedFrequencyType;
