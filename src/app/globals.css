@@ -1,0 +1,147 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-atkinson), "Atkinson Hyperlegible", system-ui, -apple-system, sans-serif;
+  --font-mono: var(--font-jetbrains), "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+:root {
+  /* Paleta clinica sobria (Minimalism & Swiss Style, 90-95% neutro, sin violeta) */
+  --color-background: #F8FAFC;
+  --color-foreground: #0F172A;
+  --color-card: #FFFFFF;
+  --color-card-foreground: #0F172A;
+  --color-muted: #F1F5F9;
+  --color-muted-foreground: #475569;
+  --color-border: #E2E8F0;
+  --color-border-strong: #CBD5E1;
+
+  --color-header-bg: #0F172A;
+  --color-header-accent: #164E63;
+  --color-header-ink: #F8FAFC;
+
+  --color-primary: #0E7490;
+  --color-primary-hover: #155E75;
+  --color-on-primary: #FFFFFF;
+
+  --color-ring: #0891B2;
+
+  /* Estados semanticos clinicos */
+  --status-ok-bg: #ECFDF5;
+  --status-ok-border: #A7F3D0;
+  --status-ok-text: #065F46;
+
+  --status-warn-bg: #FFFBEB;
+  --status-warn-border: #FDE68A;
+  --status-warn-text: #92400E;
+
+  --status-crit-bg: #FEF2F2;
+  --status-crit-border: #FECACA;
+  --status-crit-text: #991B1B;
+
+  --status-info-bg: #ECFEFF;
+  --status-info-border: #A5F3FC;
+  --status-info-text: #164E63;
+
+  /* Radio sobrio y curvos de animacion (emil-design-eng + taste-skill sharp) */
+  --radius: 6px;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-padding-top: 84px;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Skip link accesible */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  padding: 10px 16px;
+  font-weight: 700;
+  font-size: 14px;
+  border-radius: var(--radius);
+}
+
+.skip-link:focus {
+  left: 16px;
+  top: 12px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+
+/* Interaccion tactil sobria (emil-design-eng) */
+.clinical-btn {
+  min-height: 44px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: transform 160ms var(--ease-out), background-color 160ms var(--ease-out), border-color 160ms var(--ease-out);
+}
+
+.clinical-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.clinical-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.clinical-card {
+  background-color: var(--color-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.clinical-enter {
+  animation: clinicalEnter 220ms var(--ease-out) forwards;
+}
+
+@keyframes clinicalEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.98) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .clinical-btn,
+  .clinical-enter {
+    animation: none !important;
+    transition: opacity 150ms ease, background-color 150ms ease !important;
+    transform: none !important;
+  }
+}
