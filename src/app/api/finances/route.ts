@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { getActorLabel, requireAdmin, requireSession } from "@/lib/auth/session";
+import { formatApiError } from "@/lib/api-error";
 import { FinancialPlannerService } from "@/lib/services/financial-planner.service";
 import { NO_STORE_HEADERS, safeRevalidateHome } from "@/lib/vercel-cache";
 
@@ -84,9 +86,16 @@ export async function POST(req: Request) {
     const raw = await req.json();
     const body = financesActionSchema.parse(raw);
 
+    const session =
+      body.action === "delete_expense"
+        ? await requireAdmin()
+        : await requireSession();
+    const actor = getActorLabel(session);
+
     if (body.action === "update_settings") {
       const settings = await FinancialPlannerService.updateFinancialSettings(
-        body
+        body,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -96,7 +105,7 @@ export async function POST(req: Request) {
     }
 
     if (body.action === "create_expense") {
-      const expense = await FinancialPlannerService.createExpense(body);
+      const expense = await FinancialPlannerService.createExpense(body, actor);
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, expense },
@@ -107,7 +116,8 @@ export async function POST(req: Request) {
     if (body.action === "update_expense") {
       const expense = await FinancialPlannerService.updateExpense(
         body.expense_id,
-        body
+        body,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -118,7 +128,8 @@ export async function POST(req: Request) {
 
     if (body.action === "delete_expense") {
       const result = await FinancialPlannerService.deleteExpense(
-        body.expense_id
+        body.expense_id,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -127,18 +138,23 @@ export async function POST(req: Request) {
       );
     }
 
-    const result = await FinancialPlannerService.executePlannedPurchase(body);
+    const result = await FinancialPlannerService.executePlannedPurchase(body, {
+      role: session.role,
+      actor,
+    });
     safeRevalidateHome();
     return NextResponse.json(
       { ok: true, ...result },
       { headers: NO_STORE_HEADERS }
     );
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "Error en modulo financiero.";
+    const { status, message } = formatApiError(
+      err,
+      "Error en modulo financiero."
+    );
     return NextResponse.json(
       { error: message },
-      { status: 400, headers: NO_STORE_HEADERS }
+      { status, headers: NO_STORE_HEADERS }
     );
   }
 }

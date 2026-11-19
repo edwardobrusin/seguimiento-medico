@@ -3,28 +3,42 @@
 import { useState, type FormEvent } from "react";
 import {
   Activity,
-  AlertOctagon,
-  Copy,
+  AlertCircle,
+  Check,
   Edit3,
-  FileText,
+  FileHeart,
   History,
+  KeyRound,
   Phone,
   Plus,
-  Printer,
-  ShieldAlert,
+  ShieldCheck,
   Stethoscope,
   Trash2,
 } from "lucide-react";
 import type {
+  AuthUserPublic,
   CareProvider,
   CommandCenterSnapshot,
+  Medication,
 } from "@/lib/types/clinical";
-import { AUDIT_ACTION_TAG } from "@/lib/clinical-labels";
-import { cn, formatCurrencyMxn, formatDateTimeEs, formatShortTime } from "@/lib/utils";
+import {
+  AUDIT_ACTION_TAG,
+  VERSION_ACTION_LABEL,
+} from "@/lib/clinical-labels";
+import {
+  cn,
+  formatCurrencyMxn,
+  formatDateOnlyEs,
+  formatDateTimeEs,
+} from "@/lib/utils";
+import { ClinicalModal } from "./ClinicalModal";
+import { IconActionButton } from "./IconActionButton";
+import { MedicationVersionsModal } from "./MedicationVersionsModal";
 import { StatusBadge } from "./StatusBadge";
 
 interface PatientDossierViewProps {
   snapshot: CommandCenterSnapshot;
+  isAdmin: boolean;
   onUpdateProfile: (payload: {
     full_name: string;
     birth_date: string | null;
@@ -66,534 +80,995 @@ interface PatientDossierViewProps {
     }
   ) => Promise<void>;
   onDeleteProvider: (providerId: string) => Promise<void>;
+  onUpdateAuthUser: (
+    userId: string,
+    payload: {
+      username?: string;
+      display_name?: string;
+      new_password?: string;
+    }
+  ) => Promise<void>;
+  onRestoreVersion: (medicationId: string, versionId: string) => Promise<void>;
+  onMarkVersionReviewed: (versionId: string) => Promise<void>;
+}
+
+function parseOptionalPos(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function parseOptionalNonNeg(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
 export function PatientDossierView({
   snapshot,
+  isAdmin,
   onUpdateProfile,
   onCreateProvider,
   onUpdateProvider,
   onDeleteProvider,
+  onUpdateAuthUser,
+  onRestoreVersion,
+  onMarkVersionReviewed,
 }: PatientDossierViewProps) {
   const profile = snapshot.patient_profile;
 
-  // Edicion de Perfil Clinico
-  const [editingProfile, setEditingProfile] = useState(false);
-  const [fullName, setFullName] = useState(profile.full_name);
-  const [birthDate, setBirthDate] = useState(profile.birth_date ?? "");
-  const [bloodType, setBloodType] = useState(profile.blood_type ?? "");
-  const [weightKg, setWeightKg] = useState(
-    profile.weight_kg !== null ? String(profile.weight_kg) : ""
-  );
-  const [heightCm, setHeightCm] = useState(
-    profile.height_cm !== null ? String(profile.height_cm) : ""
-  );
-  const [allergies, setAllergies] = useState(profile.allergies ?? "");
-  const [conditions, setConditions] = useState(
-    profile.chronic_conditions ?? ""
-  );
-  const [insProvider, setInsProvider] = useState(
-    profile.insurance_provider ?? ""
-  );
-  const [insPolicy, setInsPolicy] = useState(profile.insurance_policy ?? "");
-  const [emergName, setEmergName] = useState(
-    profile.emergency_contact_name ?? ""
-  );
-  const [emergPhone, setEmergPhone] = useState(
-    profile.emergency_contact_phone ?? ""
-  );
-  const [emergRelation, setEmergRelation] = useState(
-    profile.emergency_contact_relation ?? ""
-  );
-  const [generalNotes, setGeneralNotes] = useState(profile.general_notes ?? "");
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [confirmDeleteProviderId, setConfirmDeleteProviderId] = useState<
+    string | null
+  >(null);
+
+  // Modal Perfil (re-sincronizado al abrir)
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [pFullName, setPFullName] = useState("");
+  const [pBirthDate, setPBirthDate] = useState("");
+  const [pBloodType, setPBloodType] = useState("");
+  const [pWeight, setPWeight] = useState("");
+  const [pHeight, setPHeight] = useState("");
+  const [pAllergies, setPAllergies] = useState("");
+  const [pConditions, setPConditions] = useState("");
+  const [pInsurance, setPInsurance] = useState("");
+  const [pPolicy, setPPolicy] = useState("");
+  const [pEmName, setPEmName] = useState("");
+  const [pEmPhone, setPEmPhone] = useState("");
+  const [pEmRelation, setPEmRelation] = useState("");
+  const [pNotes, setPNotes] = useState("");
+  const [profileError, setProfileError] = useState<string | null>(null);
   const [savingProfile, setSavingProfile] = useState(false);
 
-  // Directorio Medico CRUD
-  const [showProviderForm, setShowProviderForm] = useState(false);
-  const [editingProviderId, setEditingProviderId] = useState<string | null>(
+  // Modal Especialista
+  const [providerOpen, setProviderOpen] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<CareProvider | null>(
     null
   );
-  const [provName, setProvName] = useState("");
-  const [provSpecialty, setProvSpecialty] = useState("");
-  const [provClinic, setProvClinic] = useState("");
-  const [provCity, setProvCity] = useState("");
-  const [provPhone, setProvPhone] = useState("");
-  const [provFee, setProvFee] = useState("");
-  const [provAddress, setProvAddress] = useState("");
-  const [provNotes, setProvNotes] = useState("");
+  const [prName, setPrName] = useState("");
+  const [prSpecialty, setPrSpecialty] = useState("");
+  const [prClinic, setPrClinic] = useState("");
+  const [prCity, setPrCity] = useState("");
+  const [prPhone, setPrPhone] = useState("");
+  const [prFee, setPrFee] = useState("");
+  const [prAddress, setPrAddress] = useState("");
+  const [prNotes, setPrNotes] = useState("");
+  const [prActive, setPrActive] = useState(true);
+  const [providerError, setProviderError] = useState<string | null>(null);
   const [savingProvider, setSavingProvider] = useState(false);
-  const [confirmDeleteProvId, setConfirmDeleteProvId] = useState<string | null>(
-    null
-  );
 
-  // Filtro Auditoria + Copiar Resumen
-  const [auditFilter, setAuditFilter] = useState("ALL");
-  const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  // Modal Versiones de Medicamento (Solo Admin)
+  const [versionsTarget, setVersionsTarget] = useState<Medication | null>(null);
+
+  // Modal Editar Credenciales de Acceso (Solo Admin)
+  const [editingUser, setEditingUser] = useState<AuthUserPublic | null>(null);
+  const [uUsername, setUUsername] = useState("");
+  const [uDisplayName, setUDisplayName] = useState("");
+  const [uPassword, setUPassword] = useState("");
+  const [userError, setUserError] = useState<string | null>(null);
+  const [savingUser, setSavingUser] = useState(false);
+
+  function openProfileModal() {
+    const p = snapshot.patient_profile;
+    setPFullName(p.full_name);
+    setPBirthDate(p.birth_date ? p.birth_date.slice(0, 10) : "");
+    setPBloodType(p.blood_type ?? "");
+    setPWeight(p.weight_kg === null ? "" : String(p.weight_kg));
+    setPHeight(p.height_cm === null ? "" : String(p.height_cm));
+    setPAllergies(p.allergies ?? "");
+    setPConditions(p.chronic_conditions ?? "");
+    setPInsurance(p.insurance_provider ?? "");
+    setPPolicy(p.insurance_policy ?? "");
+    setPEmName(p.emergency_contact_name ?? "");
+    setPEmPhone(p.emergency_contact_phone ?? "");
+    setPEmRelation(p.emergency_contact_relation ?? "");
+    setPNotes(p.general_notes ?? "");
+    setProfileError(null);
+    setProfileOpen(true);
+  }
 
   async function handleProfileSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!fullName.trim()) return;
+    setProfileError(null);
+    if (!pFullName.trim()) {
+      setProfileError("Ingresa el nombre completo del paciente.");
+      return;
+    }
     setSavingProfile(true);
     try {
       await onUpdateProfile({
-        full_name: fullName.trim(),
-        birth_date: birthDate || null,
-        blood_type: bloodType.trim() || null,
-        weight_kg:
-          weightKg.trim() !== "" && Number.isFinite(Number(weightKg))
-            ? Number(weightKg)
-            : null,
-        height_cm:
-          heightCm.trim() !== "" && Number.isFinite(Number(heightCm))
-            ? Number(heightCm)
-            : null,
-        allergies: allergies.trim() || null,
-        chronic_conditions: conditions.trim() || null,
-        insurance_provider: insProvider.trim() || null,
-        insurance_policy: insPolicy.trim() || null,
-        emergency_contact_name: emergName.trim() || null,
-        emergency_contact_phone: emergPhone.trim() || null,
-        emergency_contact_relation: emergRelation.trim() || null,
-        general_notes: generalNotes.trim() || null,
+        full_name: pFullName.trim(),
+        birth_date: pBirthDate.trim() || null,
+        blood_type: pBloodType.trim() || null,
+        weight_kg: parseOptionalPos(pWeight),
+        height_cm: parseOptionalPos(pHeight),
+        allergies: pAllergies.trim() || null,
+        chronic_conditions: pConditions.trim() || null,
+        insurance_provider: pInsurance.trim() || null,
+        insurance_policy: pPolicy.trim() || null,
+        emergency_contact_name: pEmName.trim() || null,
+        emergency_contact_phone: pEmPhone.trim() || null,
+        emergency_contact_relation: pEmRelation.trim() || null,
+        general_notes: pNotes.trim() || null,
       });
-      setEditingProfile(false);
+      setProfileOpen(false);
+    } catch (err) {
+      setProfileError(
+        err instanceof Error
+          ? err.message
+          : "No se pudo actualizar el expediente."
+      );
     } finally {
       setSavingProfile(false);
     }
   }
 
-  function resetProviderForm() {
-    setEditingProviderId(null);
-    setProvName("");
-    setProvSpecialty("");
-    setProvClinic("");
-    setProvCity("");
-    setProvPhone("");
-    setProvFee("");
-    setProvAddress("");
-    setProvNotes("");
+  function openCreateProvider() {
+    setEditingProvider(null);
+    setPrName("");
+    setPrSpecialty("");
+    setPrClinic("");
+    setPrCity("CDMX");
+    setPrPhone("");
+    setPrFee("");
+    setPrAddress("");
+    setPrNotes("");
+    setPrActive(true);
+    setProviderError(null);
+    setProviderOpen(true);
   }
 
-  function startEditProvider(p: CareProvider) {
-    setEditingProviderId(p.id);
-    setProvName(p.name);
-    setProvSpecialty(p.specialty);
-    setProvClinic(p.clinic_or_center ?? "");
-    setProvCity(p.city ?? "");
-    setProvPhone(p.phone ?? "");
-    setProvFee(p.consultation_fee !== null ? String(p.consultation_fee) : "");
-    setProvAddress(p.address ?? "");
-    setProvNotes(p.notes ?? "");
-    setShowProviderForm(true);
+  function openEditProvider(pr: CareProvider) {
+    setEditingProvider(pr);
+    setPrName(pr.name);
+    setPrSpecialty(pr.specialty);
+    setPrClinic(pr.clinic_or_center ?? "");
+    setPrCity(pr.city ?? "");
+    setPrPhone(pr.phone ?? "");
+    setPrFee(pr.consultation_fee === null ? "" : String(pr.consultation_fee));
+    setPrAddress(pr.address ?? "");
+    setPrNotes(pr.notes ?? "");
+    setPrActive(pr.is_active);
+    setProviderError(null);
+    setProviderOpen(true);
   }
 
   async function handleProviderSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!provName.trim() || !provSpecialty.trim()) return;
+    setProviderError(null);
+    if (!prName.trim() || !prSpecialty.trim()) {
+      setProviderError("Nombre y especialidad son obligatorios.");
+      return;
+    }
     const payload = {
-      name: provName.trim(),
-      specialty: provSpecialty.trim(),
-      clinic_or_center: provClinic.trim() || null,
-      city: provCity.trim() || null,
-      phone: provPhone.trim() || null,
-      consultation_fee:
-        provFee.trim() !== "" && Number.isFinite(Number(provFee))
-          ? Number(provFee)
-          : null,
-      address: provAddress.trim() || null,
-      notes: provNotes.trim() || null,
-      is_active: true,
+      name: prName.trim(),
+      specialty: prSpecialty.trim(),
+      clinic_or_center: prClinic.trim() || null,
+      city: prCity.trim() || null,
+      phone: prPhone.trim() || null,
+      consultation_fee: parseOptionalNonNeg(prFee),
+      address: prAddress.trim() || null,
+      notes: prNotes.trim() || null,
+      is_active: prActive,
     };
     setSavingProvider(true);
     try {
-      if (editingProviderId) {
-        await onUpdateProvider(editingProviderId, payload);
+      if (editingProvider) {
+        await onUpdateProvider(editingProvider.id, payload);
       } else {
         await onCreateProvider(payload);
       }
-      resetProviderForm();
-      setShowProviderForm(false);
+      setProviderOpen(false);
+    } catch (err) {
+      setProviderError(
+        err instanceof Error
+          ? err.message
+          : "No se pudo guardar el especialista."
+      );
     } finally {
       setSavingProvider(false);
     }
   }
 
-  async function handleCopyClinicalSummary() {
-    const lines = [
-      `RESUMEN CLINICO PARA CONSULTA MEDICA (${snapshot.target_date})`,
-      "========================================",
-      `Paciente: ${profile.full_name}`,
-      profile.birth_date ? `Fecha nacimiento: ${profile.birth_date}` : null,
-      profile.blood_type ? `Tipo de sangre: ${profile.blood_type}` : null,
-      profile.weight_kg || profile.height_cm
-        ? `Peso / Estatura: ${profile.weight_kg ?? "--"} kg / ${profile.height_cm ?? "--"} cm`
-        : null,
-      `ALERGIAS: ${profile.allergies || "Sin alergias registradas / Por confirmar"}`,
-      `Padecimientos / Seguimiento: ${profile.chronic_conditions || "No especificado"}`,
-      profile.emergency_contact_name
-        ? `Contacto Emergencia: ${profile.emergency_contact_name} (${profile.emergency_contact_relation ?? ""}) Tel: ${profile.emergency_contact_phone ?? "--"}`
-        : null,
-      "",
-      "MEDICACION ACTUAL ACTIVA:",
-      ...snapshot.medications.map((m, idx) => {
-        const sch =
-          m.schedules && m.schedules.length > 0
-            ? m.schedules
-                .map((s) => formatShortTime(s.effective_clustered_time))
-                .join(", ")
-            : "Segun evento clinico";
-        return `${idx + 1}. ${m.name}${m.active_ingredient ? ` (${m.active_ingredient})` : ""} - ${m.dose_amount} ${m.presentation} | Horarios: ${sch} | Stock: ${m.current_stock ?? "Pendiente"}`;
-      }),
-      "",
-      "PROXIMAS CITAS / ESTUDIOS:",
-      ...snapshot.upcoming_events
-        .slice(0, 6)
-        .map(
-          (e) =>
-            `- ${e.title} | ${e.event_datetime.slice(0, 10)}${e.specialist_or_center ? ` | ${e.specialist_or_center}` : ""}`
-        ),
-    ].filter((x): x is string => Boolean(x !== null));
+  function openEditAuthUser(user: AuthUserPublic) {
+    setEditingUser(user);
+    setUUsername(user.username);
+    setUDisplayName(user.display_name);
+    setUPassword("");
+    setUserError(null);
+  }
 
-    const summaryText = lines.join("\n");
+  async function handleAuthUserSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!editingUser) return;
+    setUserError(null);
+    if (!uUsername.trim() || !uDisplayName.trim()) {
+      setUserError("Usuario y nombre visible son obligatorios.");
+      return;
+    }
+    if (uPassword.trim() && uPassword.trim().length < 6) {
+      setUserError("La nueva contrasena debe tener al menos 6 caracteres.");
+      return;
+    }
+    setSavingUser(true);
     try {
-      await navigator.clipboard.writeText(summaryText);
-      setCopyNotice("[COPIADO] Resumen clinico listo para pegar en WhatsApp o correo del medico.");
-    } catch {
-      setCopyNotice(summaryText);
+      await onUpdateAuthUser(editingUser.id, {
+        username: uUsername.trim(),
+        display_name: uDisplayName.trim(),
+        ...(uPassword.trim() ? { new_password: uPassword.trim() } : {}),
+      });
+      setEditingUser(null);
+    } catch (err) {
+      setUserError(
+        err instanceof Error
+          ? err.message
+          : "No se pudieron actualizar las credenciales."
+      );
+    } finally {
+      setSavingUser(false);
     }
   }
 
-  const filteredAudit =
-    auditFilter === "ALL"
-      ? snapshot.recent_audit_logs
-      : snapshot.recent_audit_logs.filter((a) => a.entity_type === auditFilter);
+  const allMedsById = new Map<string, Medication>();
+  for (const m of [...snapshot.medications, ...snapshot.archived_medications]) {
+    allMedsById.set(m.id, m);
+  }
+
+  const unreviewedVersionsCount = isAdmin
+    ? snapshot.medication_versions.filter(
+        (v) => v.changed_by_role === "PATIENT" && !v.reviewed_by_admin
+      ).length
+    : 0;
 
   return (
-    <div className="space-y-6 clinical-enter">
-      {/* Encabezado */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 className="text-[20px] font-bold text-[#0F172A]">
-            Expediente Clinico, Directorio Medico y Auditoria
-          </h2>
-          <p className="text-[14px] text-[#475569]">
-            Ficha integral del paciente, adherencia a 30 dias, red de
-            especialistas y trazabilidad de cada cambio en el sistema.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={handleCopyClinicalSummary}
-            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
-          >
-            <Copy
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
+    <div className="space-y-5 clinical-enter">
+      {/* Ficha Clinica del Paciente */}
+      <section className="clinical-card p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div
+              className="w-10 h-10 rounded-[6px] bg-[#ECFEFF] border border-[#A5F3FC] flex items-center justify-center shrink-0"
               aria-hidden="true"
-            />
-            Copiar Resumen para Consulta
-          </button>
-
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
-          >
-            <Printer
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            Imprimir Ficha
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setEditingProfile((v) => !v)}
-            className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
-          >
-            <Edit3 className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
-            {editingProfile ? "Cancelar Edicion" : "Editar Ficha del Paciente"}
-          </button>
-        </div>
-      </div>
-
-      {copyNotice && (
-        <div className="p-3 bg-[#ECFDF5] border border-[#A7F3D0] rounded-[6px] text-[13px] font-mono text-[#065F46] whitespace-pre-wrap">
-          {copyNotice}
-        </div>
-      )}
-
-      {/* Alerta de Alergias + Resumen del Paciente */}
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div
-          className={cn(
-            "clinical-card p-4 space-y-2",
-            profile.allergies
-              ? "border-[#FECACA] bg-[#FEF2F2]"
-              : "border-[#FDE68A] bg-[#FFFBEB]"
-          )}
-        >
-          <div className="flex items-center gap-2">
-            <AlertOctagon
-              className={cn(
-                "w-5 h-5 shrink-0",
-                profile.allergies ? "text-[#991B1B]" : "text-[#92400E]"
-              )}
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            <h3
-              className={cn(
-                "text-[15px] font-bold",
-                profile.allergies ? "text-[#991B1B]" : "text-[#92400E]"
-              )}
             >
-              Alergias y Precauciones Criticas
-            </h3>
+              <FileHeart className="w-5 h-5 text-[#0E7490]" />
+            </div>
+            <div>
+              <h2 className="text-[20px] font-bold text-[#0F172A]">
+                Expediente Clinico: {profile.full_name}
+              </h2>
+              <p className="mt-0.5 text-[13px] text-[#475569] font-mono tabular-nums">
+                Actualizado: {formatDateTimeEs(profile.updated_at)}
+              </p>
+            </div>
           </div>
-          <p
-            className={cn(
-              "text-[14px]",
-              profile.allergies ? "text-[#7F1D1D] font-semibold" : "text-[#78350F]"
-            )}
-          >
-            {profile.allergies ||
-              "Sin alergias registradas todavia. Edita la ficha para confirmar si existen alergias farmacologicas."}
-          </p>
+
+          <IconActionButton
+            icon={Edit3}
+            label="Editar ficha clinica del paciente"
+            shortLabel="Editar Ficha"
+            tone="primary"
+            onClick={openProfileModal}
+          />
         </div>
 
-        <div className="clinical-card p-4 space-y-1.5">
-          <div className="flex items-center gap-2">
-            <FileText
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            <h3 className="text-[15px] font-bold text-[#0F172A]">
-              {profile.full_name}
-            </h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 pt-2 border-t border-[#E2E8F0] text-[14px]">
+          <div className="p-3 rounded-[6px] bg-[#F8FAFC] border border-[#E2E8F0]">
+            <span className="text-[12px] text-[#64748B] block">
+              Fecha de nacimiento / Sangre
+            </span>
+            <strong className="font-mono text-[#0F172A]">
+              {profile.birth_date
+                ? formatDateOnlyEs(profile.birth_date)
+                : "No registrada"}{" "}
+              | {profile.blood_type ?? "--"}
+            </strong>
           </div>
-          <p className="font-mono text-[13px] text-[#475569] tabular-nums">
-            Sangre: {profile.blood_type || "Pendiente"} | Peso:{" "}
-            {profile.weight_kg ? `${profile.weight_kg} kg` : "--"} | Estatura:{" "}
-            {profile.height_cm ? `${profile.height_cm} cm` : "--"}
-          </p>
-          <p className="text-[13px] text-[#334155]">
-            <strong>Diagnosticos / Seguimiento:</strong>{" "}
-            {profile.chronic_conditions || "Por completar"}
-          </p>
-          {profile.insurance_provider && (
-            <p className="font-mono text-[12px] text-[#475569]">
-              Seguro: {profile.insurance_provider} (Poliza:{" "}
-              {profile.insurance_policy || "--"})
-            </p>
-          )}
-        </div>
 
-        <div className="clinical-card p-4 space-y-1.5">
-          <div className="flex items-center gap-2">
-            <ShieldAlert
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            <h3 className="text-[15px] font-bold text-[#0F172A]">
+          <div className="p-3 rounded-[6px] bg-[#F8FAFC] border border-[#E2E8F0]">
+            <span className="text-[12px] text-[#64748B] block">
+              Peso y Estatura
+            </span>
+            <strong className="font-mono text-[#0F172A]">
+              {profile.weight_kg !== null ? `${profile.weight_kg} kg` : "--"} |{" "}
+              {profile.height_cm !== null ? `${profile.height_cm} cm` : "--"}
+            </strong>
+          </div>
+
+          <div className="p-3 rounded-[6px] bg-[#F8FAFC] border border-[#E2E8F0]">
+            <span className="text-[12px] text-[#64748B] block">
+              Seguro Medico / Poliza
+            </span>
+            <strong className="text-[#0F172A]">
+              {profile.insurance_provider ?? "Sin seguro registrado"}
+              {profile.insurance_policy ? ` (${profile.insurance_policy})` : ""}
+            </strong>
+          </div>
+
+          <div className="p-3 rounded-[6px] bg-[#F8FAFC] border border-[#E2E8F0]">
+            <span className="text-[12px] text-[#64748B] block">
               Contacto de Emergencia
-            </h3>
+            </span>
+            <strong className="text-[#0F172A]">
+              {profile.emergency_contact_name ?? "No registrado"}
+              {profile.emergency_contact_phone
+                ? ` | ${profile.emergency_contact_phone}`
+                : ""}
+            </strong>
           </div>
-          <p className="text-[14px] font-bold text-[#0F172A]">
-            {profile.emergency_contact_name || "Pendiente de asignar"}
-          </p>
-          <p className="font-mono text-[14px] text-[#0E7490] tabular-nums">
-            {profile.emergency_contact_phone || "Sin telefono registrado"}
-          </p>
-          <p className="text-[13px] text-[#475569]">
-            Parentesco: {profile.emergency_contact_relation || "--"}
-          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5 text-[14px]">
+          <div className="p-3.5 rounded-[6px] border border-[#FECACA] bg-[#FEF2F2]/40">
+            <span className="text-[12px] font-bold text-[#991B1B] block mb-1">
+              Alergias Conocidas
+            </span>
+            <p className="text-[#0F172A]">
+              {profile.allergies || "Sin alergias registradas"}
+            </p>
+          </div>
+
+          <div className="p-3.5 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC]">
+            <span className="text-[12px] font-bold text-[#0F172A] block mb-1">
+              Padecimientos Cronicos / Diagnosticos
+            </span>
+            <p className="text-[#334155]">
+              {profile.chronic_conditions || "Sin registro"}
+            </p>
+          </div>
+
+          <div className="p-3.5 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC]">
+            <span className="text-[12px] font-bold text-[#0F172A] block mb-1">
+              Notas Generales de Cuidado
+            </span>
+            <p className="text-[#334155]">
+              {profile.general_notes || "Sin notas adicionales"}
+            </p>
+          </div>
         </div>
       </section>
 
-      {/* Formulario de Edicion del Expediente */}
-      {editingProfile && (
-        <form
-          onSubmit={handleProfileSubmit}
-          className="clinical-card p-5 space-y-4 border-[#A5F3FC]"
-        >
-          <h3 className="text-[16px] font-bold text-[#0F172A] border-b border-[#E2E8F0] pb-2.5">
-            Actualizar Ficha Clinica del Paciente
+      {/* Adherencia Terapeutica 30 Dias */}
+      <section className="clinical-card p-5 space-y-3">
+        <div className="flex items-center gap-2">
+          <Activity className="w-5 h-5 text-[#0E7490]" aria-hidden="true" />
+          <h3 className="text-[17px] font-bold text-[#0F172A]">
+            Adherencia Terapeutica (Ultimos 30 Dias)
           </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Nombre completo del paciente *
+        </div>
+
+        {snapshot.adherence_30d.length === 0 ? (
+          <p className="text-[14px] text-[#475569]">
+            Sin registros de tomas en los ultimos 30 dias.
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {snapshot.adherence_30d.map((item) => (
+              <div
+                key={item.medication_id}
+                className="p-3.5 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC] space-y-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-bold text-[14px] text-[#0F172A] truncate">
+                    {item.medication_name}
+                  </span>
+                  <StatusBadge
+                    label={`${item.adherence_pct}%`}
+                    tone={
+                      item.adherence_pct >= 85
+                        ? "ok"
+                        : item.adherence_pct >= 65
+                        ? "warn"
+                        : "crit"
+                    }
+                  />
+                </div>
+                <div className="h-2 rounded-full bg-[#E2E8F0] overflow-hidden">
+                  <div
+                    className={cn(
+                      "h-full",
+                      item.adherence_pct >= 85
+                        ? "bg-[#059669]"
+                        : item.adherence_pct >= 65
+                        ? "bg-[#D97706]"
+                        : "bg-[#DC2626]"
+                    )}
+                    style={{ width: `${Math.min(100, item.adherence_pct)}%` }}
+                  />
+                </div>
+                <p className="font-mono text-[12px] text-[#475569] tabular-nums">
+                  Tomadas: {item.taken_count} | Pospuestas: {item.delayed_count}{" "}
+                  | Omitidas: {item.skipped_count}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* Directorio de Especialistas */}
+      <section className="clinical-card p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Stethoscope
+              className="w-5 h-5 text-[#0E7490]"
+              aria-hidden="true"
+            />
+            <h3 className="text-[17px] font-bold text-[#0F172A]">
+              Directorio de Medicos y Especialistas ({snapshot.care_providers.length})
+            </h3>
+          </div>
+          <IconActionButton
+            icon={Plus}
+            label="Agregar medico o especialista al directorio"
+            shortLabel="Nuevo Especialista"
+            tone="primary"
+            onClick={openCreateProvider}
+          />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+          {snapshot.care_providers.map((pr) => {
+            const isConfirmDel = confirmDeleteProviderId === pr.id;
+            return (
+              <article
+                key={pr.id}
+                className="p-4 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC] flex items-start justify-between gap-3"
+              >
+                <div className="space-y-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h4 className="font-bold text-[15px] text-[#0F172A]">
+                      {pr.name}
+                    </h4>
+                    <StatusBadge label={`[${pr.specialty}]`} tone="info" />
+                  </div>
+                  <p className="text-[13px] text-[#334155]">
+                    {[pr.clinic_or_center, pr.city].filter(Boolean).join(" | ")}
+                  </p>
+                  {pr.phone && (
+                    <p className="text-[13px] text-[#0E7490] font-mono inline-flex items-center gap-1">
+                      <Phone className="w-3.5 h-3.5" aria-hidden="true" />
+                      {pr.phone}
+                    </p>
+                  )}
+                  {pr.consultation_fee !== null && (
+                    <p className="text-[13px] text-[#475569] font-mono">
+                      Consulta: {formatCurrencyMxn(pr.consultation_fee)}
+                    </p>
+                  )}
+                  {pr.notes && (
+                    <p className="text-[12px] text-[#64748B]">{pr.notes}</p>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <IconActionButton
+                    icon={Edit3}
+                    label={`Editar especialista ${pr.name}`}
+                    tone="neutral"
+                    onClick={() => openEditProvider(pr)}
+                  />
+                  {isAdmin &&
+                    (isConfirmDel ? (
+                      <div className="inline-flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={busyKey === `del-pr:${pr.id}`}
+                          onClick={async () => {
+                            setBusyKey(`del-pr:${pr.id}`);
+                            try {
+                              await onDeleteProvider(pr.id);
+                              setConfirmDeleteProviderId(null);
+                            } catch {
+                              // Toast
+                            } finally {
+                              setBusyKey(null);
+                            }
+                          }}
+                          className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[12px] font-bold"
+                        >
+                          Confirmar
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteProviderId(null)}
+                          className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[#334155] text-[12px]"
+                        >
+                          No
+                        </button>
+                      </div>
+                    ) : (
+                      <IconActionButton
+                        icon={Trash2}
+                        label={`Eliminar especialista ${pr.name}`}
+                        tone="danger"
+                        onClick={() => setConfirmDeleteProviderId(pr.id)}
+                      />
+                    ))}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* SECCIONES EXCLUSIVAS DE ADMINISTRADOR (Ocultas en modo sigiloso para Paciente) */}
+      {isAdmin && (
+        <>
+          {/* 1. Control de Versiones y Cambios en Medicamentos */}
+          <section className="clinical-card p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <History
+                  className="w-5 h-5 text-[#0E7490]"
+                  aria-hidden="true"
+                />
+                <div>
+                  <h3 className="text-[17px] font-bold text-[#0F172A]">
+                    Control de Cambios y Versiones en Medicamentos
+                  </h3>
+                  <p className="text-[13px] text-[#475569]">
+                    Revision y restauracion de ediciones o restocks realizados
+                    por el paciente o administradores.
+                  </p>
+                </div>
+              </div>
+              {unreviewedVersionsCount > 0 && (
+                <StatusBadge
+                  label={`[${unreviewedVersionsCount} CAMBIOS DEL PACIENTE POR REVISAR]`}
+                  tone="crit"
+                />
+              )}
+            </div>
+
+            {snapshot.medication_versions.length === 0 ? (
+              <p className="text-[14px] text-[#475569]">
+                No hay cambios registrados todavia.
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {snapshot.medication_versions.slice(0, 12).map((ver) => {
+                  const med = allMedsById.get(ver.medication_id) ?? null;
+                  const unreviewed =
+                    ver.changed_by_role === "PATIENT" && !ver.reviewed_by_admin;
+                  return (
+                    <div
+                      key={ver.id}
+                      className={cn(
+                        "p-3.5 rounded-[6px] border flex flex-wrap items-center justify-between gap-3",
+                        unreviewed
+                          ? "border-[#F59E0B] bg-[#FFFBEB]"
+                          : "border-[#E2E8F0] bg-[#F8FAFC]"
+                      )}
+                    >
+                      <div className="space-y-1 min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-[12px] font-bold px-2 py-0.5 rounded-[4px] bg-white border border-[#CBD5E1] text-[#0F172A]">
+                            v{ver.version_number}
+                          </span>
+                          <span className="font-bold text-[14px] text-[#0F172A]">
+                            {ver.medication_name ??
+                              med?.name ??
+                              ver.snapshot_json.name}
+                          </span>
+                          <span className="text-[13px] text-[#334155]">
+                            ({VERSION_ACTION_LABEL[ver.change_action] ??
+                              ver.change_action})
+                          </span>
+                          <StatusBadge
+                            label={
+                              ver.changed_by_role === "PATIENT"
+                                ? "[PACIENTE]"
+                                : "[ADMIN]"
+                            }
+                            tone={
+                              ver.changed_by_role === "PATIENT"
+                                ? "warn"
+                                : "info"
+                            }
+                          />
+                          {unreviewed && (
+                            <StatusBadge
+                              label="[PENDIENTE REVISION]"
+                              tone="crit"
+                            />
+                          )}
+                        </div>
+                        <p className="text-[13px] text-[#334155]">
+                          {ver.change_summary}
+                        </p>
+                        <p className="text-[12px] text-[#64748B] font-mono tabular-nums">
+                          {formatDateTimeEs(ver.created_at)} | Actor:{" "}
+                          {ver.changed_by_actor}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        {unreviewed && (
+                          <IconActionButton
+                            icon={Check}
+                            label="Marcar cambio como revisado"
+                            shortLabel="Revisado"
+                            tone="success"
+                            loading={busyKey === `rev:${ver.id}`}
+                            onClick={async () => {
+                              setBusyKey(`rev:${ver.id}`);
+                              try {
+                                await onMarkVersionReviewed(ver.id);
+                              } catch {
+                                // Toast
+                              } finally {
+                                setBusyKey(null);
+                              }
+                            }}
+                          />
+                        )}
+                        {med && (
+                          <IconActionButton
+                            icon={History}
+                            label={`Abrir historial y restaurar version de ${med.name}`}
+                            shortLabel="Versiones"
+                            tone="neutral"
+                            onClick={() => setVersionsTarget(med)}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          {/* 2. Cuentas de Acceso (Paciente y Administrador) */}
+          <section className="clinical-card p-5 space-y-4">
+            <div className="flex items-center gap-2">
+              <KeyRound className="w-5 h-5 text-[#0E7490]" aria-hidden="true" />
+              <div>
+                <h3 className="text-[17px] font-bold text-[#0F172A]">
+                  Cuentas de Acceso al Sistema
+                </h3>
+                <p className="text-[13px] text-[#475569]">
+                  Administra los usuarios y contrasenas de inicio de sesion para
+                  el Paciente y el Administrador.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+              {snapshot.auth_users.map((user) => (
+                <div
+                  key={user.id}
+                  className="p-4 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC] flex items-center justify-between gap-3"
+                >
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-[15px] text-[#0F172A]">
+                        {user.display_name}
+                      </span>
+                      <StatusBadge
+                        label={
+                          user.role === "ADMIN"
+                            ? "[ADMINISTRADOR]"
+                            : "[PACIENTE]"
+                        }
+                        tone={user.role === "ADMIN" ? "info" : "ok"}
+                      />
+                    </div>
+                    <p className="text-[13px] text-[#475569] font-mono">
+                      Usuario: <strong>{user.username}</strong>
+                    </p>
+                  </div>
+
+                  <IconActionButton
+                    icon={Edit3}
+                    label={`Cambiar usuario o contrasena de ${user.display_name}`}
+                    shortLabel="Cambiar Clave"
+                    tone="neutral"
+                    onClick={() => openEditAuthUser(user)}
+                  />
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {/* 3. Bitacora de Auditoria */}
+          <section className="clinical-card p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <ShieldCheck
+                className="w-5 h-5 text-[#0E7490]"
+                aria-hidden="true"
+              />
+              <h3 className="text-[17px] font-bold text-[#0F172A]">
+                Bitacora de Gobernanza y Auditoria ({snapshot.recent_audit_logs.length})
+              </h3>
+            </div>
+
+            <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
+              {snapshot.recent_audit_logs.map((log) => (
+                <div
+                  key={log.id}
+                  className="p-3 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-center justify-between gap-2 text-[13px]"
+                >
+                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                    <StatusBadge
+                      label={AUDIT_ACTION_TAG[log.action] ?? `[${log.action}]`}
+                      tone="neutral"
+                    />
+                    <span className="font-semibold text-[#0F172A]">
+                      {log.entity_label}
+                    </span>
+                    <span className="text-[#334155]">{log.summary}</span>
+                  </div>
+                  <span className="font-mono text-[12px] text-[#64748B] tabular-nums">
+                    {log.actor} | {formatDateTimeEs(log.created_at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
+
+      {/* Modal: Editar Ficha Clinica */}
+      <ClinicalModal
+        open={profileOpen}
+        onClose={() => !savingProfile && setProfileOpen(false)}
+        title="Editar Expediente Clinico del Paciente"
+        maxWidthClass="max-w-3xl"
+      >
+        <form onSubmit={handleProfileSubmit} className="space-y-4">
+          {profileError && (
+            <div
+              role="alert"
+              className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px] flex items-center gap-2"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>{profileError}</span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+            <div className="sm:col-span-2">
+              <label
+                htmlFor="pf-name"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Nombre completo *
               </label>
               <input
+                id="pf-name"
                 type="text"
                 required
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
+                value={pFullName}
+                onChange={(e) => setPFullName(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
+              <label
+                htmlFor="pf-birth"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
                 Fecha de nacimiento
               </label>
               <input
+                id="pf-birth"
                 type="date"
-                value={birthDate}
-                onChange={(e) => setBirthDate(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
+                value={pBirthDate}
+                onChange={(e) => setPBirthDate(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
+              <label
+                htmlFor="pf-blood"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
                 Tipo de sangre
               </label>
               <input
+                id="pf-blood"
                 type="text"
+                value={pBloodType}
+                onChange={(e) => setPBloodType(e.target.value)}
                 placeholder="Ej. O+"
-                value={bloodType}
-                onChange={(e) => setBloodType(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
+              <label
+                htmlFor="pf-weight"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
                 Peso (kg)
               </label>
               <input
+                id="pf-weight"
                 type="number"
                 step="0.1"
                 min="1"
-                value={weightKg}
-                onChange={(e) => setWeightKg(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
+                value={pWeight}
+                onChange={(e) => setPWeight(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
+              <label
+                htmlFor="pf-height"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
                 Estatura (cm)
               </label>
               <input
+                id="pf-height"
                 type="number"
-                step="0.5"
+                step="0.1"
                 min="30"
-                value={heightCm}
-                onChange={(e) => setHeightCm(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
+                value={pHeight}
+                onChange={(e) => setPHeight(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Alergias a medicamentos / alimentos
+              <label
+                htmlFor="pf-ins"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Aseguradora / Institucion
               </label>
               <input
+                id="pf-ins"
                 type="text"
-                placeholder="Ej. Penicilina / Ninguna conocida"
-                value={allergies}
-                onChange={(e) => setAllergies(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-              />
-            </div>
-
-            <div className="md:col-span-3">
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Diagnosticos y padecimientos cronicos
-              </label>
-              <textarea
-                rows={2}
-                value={conditions}
-                onChange={(e) => setConditions(e.target.value)}
-                className="w-full p-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
+                value={pInsurance}
+                onChange={(e) => setPInsurance(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Aseguradora / Seguridad Social
+              <label
+                htmlFor="pf-pol"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Poliza / Afiliacion
               </label>
               <input
+                id="pf-pol"
                 type="text"
-                value={insProvider}
-                onChange={(e) => setInsProvider(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
+                value={pPolicy}
+                onChange={(e) => setPPolicy(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Numero de poliza / NSS
+              <label
+                htmlFor="pf-em-name"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Contacto emergencia
               </label>
               <input
+                id="pf-em-name"
                 type="text"
-                value={insPolicy}
-                onChange={(e) => setInsPolicy(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
+                value={pEmName}
+                onChange={(e) => setPEmName(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Contacto de emergencia (Nombre)
+              <label
+                htmlFor="pf-em-phone"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Telefono emergencia
               </label>
               <input
-                type="text"
-                value={emergName}
-                onChange={(e) => setEmergName(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
+                id="pf-em-phone"
+                type="tel"
+                value={pEmPhone}
+                onChange={(e) => setPEmPhone(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
 
             <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Telefono de emergencia
+              <label
+                htmlFor="pf-em-rel"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Parentesco
               </label>
               <input
+                id="pf-em-rel"
                 type="text"
-                value={emergPhone}
-                onChange={(e) => setEmergPhone(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-              />
-            </div>
-
-            <div>
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Parentesco / Relacion
-              </label>
-              <input
-                type="text"
-                value={emergRelation}
-                onChange={(e) => setEmergRelation(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-              />
-            </div>
-
-            <div className="md:col-span-3">
-              <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                Notas clinicas generales
-              </label>
-              <input
-                type="text"
-                value={generalNotes}
-                onChange={(e) => setGeneralNotes(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
+                value={pEmRelation}
+                onChange={(e) => setPEmRelation(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
               />
             </div>
           </div>
 
-          <div className="flex justify-end gap-3">
+          <div>
+            <label
+              htmlFor="pf-allergies"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Alergias
+            </label>
+            <input
+              id="pf-allergies"
+              type="text"
+              value={pAllergies}
+              onChange={(e) => setPAllergies(e.target.value)}
+              className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+            />
+          </div>
+
+          <div>
+            <label
+              htmlFor="pf-conditions"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Padecimientos cronicos y diagnosticos
+            </label>
+            <textarea
+              id="pf-conditions"
+              rows={2}
+              value={pConditions}
+              onChange={(e) => setPConditions(e.target.value)}
+              className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]"
+            />
+          </div>
+
+          <div>
+            <label
+              htmlFor="pf-notes"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Notas generales de cuidado
+            </label>
+            <textarea
+              id="pf-notes"
+              rows={2}
+              value={pNotes}
+              onChange={(e) => setPNotes(e.target.value)}
+              className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
             <button
               type="button"
-              onClick={() => setEditingProfile(false)}
+              onClick={() => setProfileOpen(false)}
               className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
             >
               Cancelar
@@ -601,392 +1076,288 @@ export function PatientDossierView({
             <button
               type="submit"
               disabled={savingProfile}
-              className="clinical-btn px-5 bg-[#0E7490] text-white text-[14px] font-bold"
+              className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold"
             >
-              {savingProfile ? "Guardando..." : "Guardar Ficha"}
+              {savingProfile ? "Guardando..." : "Guardar Expediente"}
             </button>
           </div>
         </form>
-      )}
+      </ClinicalModal>
 
-      {/* Adherencia ultimos 30 dias */}
-      <section className="clinical-card p-5 space-y-3">
-        <div className="flex items-center gap-2 border-b border-[#E2E8F0] pb-2.5">
-          <Activity
-            className="w-4 h-4 text-[#0E7490]"
-            strokeWidth={1.75}
-            aria-hidden="true"
-          />
-          <h3 className="text-[16px] font-bold text-[#0F172A]">
-            Adherencia Farmacologica (Ultimos 30 Dias)
-          </h3>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          {snapshot.adherence_30d.map((ad) => (
+      {/* Modal: Especialista */}
+      <ClinicalModal
+        open={providerOpen}
+        onClose={() => !savingProvider && setProviderOpen(false)}
+        title={
+          editingProvider
+            ? `Editar Especialista: ${editingProvider.name}`
+            : "Agregar Especialista al Directorio"
+        }
+        maxWidthClass="max-w-2xl"
+      >
+        <form onSubmit={handleProviderSubmit} className="space-y-4">
+          {providerError && (
             <div
-              key={ad.medication_id}
-              className="border border-[#E2E8F0] rounded-[6px] p-3 bg-[#F8FAFC] space-y-1.5"
+              role="alert"
+              className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]"
             >
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-bold text-[14px] text-[#0F172A] truncate">
-                  {ad.medication_name}
-                </span>
-                <span className="font-mono text-[14px] font-bold text-[#0E7490] tabular-nums">
-                  {ad.adherence_pct}%
-                </span>
-              </div>
-              <div className="h-2 w-full bg-[#E2E8F0] rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[#0E7490]"
-                  style={{ width: `${Math.min(100, ad.adherence_pct)}%` }}
-                />
-              </div>
-              <p className="font-mono text-[12px] text-[#475569] tabular-nums">
-                Tomadas: {ad.taken_count}/{ad.total_count} | Posp:{" "}
-                {ad.delayed_count} | Omit: {ad.skipped_count}
-              </p>
+              {providerError}
             </div>
-          ))}
-        </div>
-      </section>
+          )}
 
-      {/* Directorio de Medicos, Laboratorios y Farmacias (CRUD) */}
-      <section className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <Stethoscope
-              className="w-5 h-5 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            <h3 className="text-[18px] font-bold text-[#0F172A]">
-              Directorio de Especialistas, Laboratorios y Farmacias (
-              {snapshot.care_providers.length})
-            </h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div>
+              <label
+                htmlFor="pr-name"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Nombre del medico *
+              </label>
+              <input
+                id="pr-name"
+                type="text"
+                required
+                value={prName}
+                onChange={(e) => setPrName(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="pr-spec"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Especialidad *
+              </label>
+              <input
+                id="pr-spec"
+                type="text"
+                required
+                value={prSpecialty}
+                onChange={(e) => setPrSpecialty(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="pr-clinic"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Clinica / Hospital
+              </label>
+              <input
+                id="pr-clinic"
+                type="text"
+                value={prClinic}
+                onChange={(e) => setPrClinic(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="pr-city"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Ciudad
+              </label>
+              <input
+                id="pr-city"
+                type="text"
+                value={prCity}
+                onChange={(e) => setPrCity(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="pr-phone"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Telefono
+              </label>
+              <input
+                id="pr-phone"
+                type="tel"
+                value={prPhone}
+                onChange={(e) => setPrPhone(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="pr-fee"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Costo de consulta (MXN)
+              </label>
+              <input
+                id="pr-fee"
+                type="number"
+                step="0.01"
+                min="0"
+                value={prFee}
+                onChange={(e) => setPrFee(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
           </div>
 
-          <button
-            type="button"
-            onClick={() => {
-              if (showProviderForm && !editingProviderId) {
-                setShowProviderForm(false);
-              } else {
-                resetProviderForm();
-                setShowProviderForm(true);
-              }
-            }}
-            className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] text-white text-[14px] font-bold"
-          >
-            <Plus className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
-            {showProviderForm ? "Cerrar" : "Agregar Especialista / Centro"}
-          </button>
-        </div>
+          <div>
+            <label
+              htmlFor="pr-addr"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Direccion del consultorio
+            </label>
+            <input
+              id="pr-addr"
+              type="text"
+              value={prAddress}
+              onChange={(e) => setPrAddress(e.target.value)}
+              className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+            />
+          </div>
 
-        {showProviderForm && (
-          <form
-            onSubmit={handleProviderSubmit}
-            className="clinical-card p-5 space-y-4 border-[#A5F3FC]"
-          >
-            <h4 className="text-[16px] font-bold text-[#0F172A]">
-              {editingProviderId
-                ? `Editar Proveedor: ${provName}`
-                : "Nuevo Especialista, Laboratorio o Farmacia"}
-            </h4>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Nombre del medico o centro *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={provName}
-                  onChange={(e) => setProvName(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-                />
+          <div>
+            <label
+              htmlFor="pr-notes"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Notas
+            </label>
+            <textarea
+              id="pr-notes"
+              rows={2}
+              value={prNotes}
+              onChange={(e) => setPrNotes(e.target.value)}
+              className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button
+              type="button"
+              onClick={() => setProviderOpen(false)}
+              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={savingProvider}
+              className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold"
+            >
+              {savingProvider ? "Guardando..." : "Guardar Especialista"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
+
+      {/* Modal: Cuentas de Acceso (Solo Admin) */}
+      {isAdmin && (
+        <ClinicalModal
+          open={Boolean(editingUser)}
+          onClose={() => !savingUser && setEditingUser(null)}
+          title={`Credenciales de Acceso: ${editingUser?.display_name ?? ""}`}
+          subtitle="Actualiza el nombre de usuario o asigna una nueva contrasena."
+          maxWidthClass="max-w-md"
+        >
+          <form onSubmit={handleAuthUserSubmit} className="space-y-4">
+            {userError && (
+              <div
+                role="alert"
+                className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]"
+              >
+                {userError}
               </div>
-              <div>
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Especialidad / Tipo *
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="Ej. Reumatologia / Farmacia"
-                  value={provSpecialty}
-                  onChange={(e) => setProvSpecialty(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-                />
-              </div>
-              <div>
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Clinica / Hospital
-                </label>
-                <input
-                  type="text"
-                  value={provClinic}
-                  onChange={(e) => setProvClinic(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-                />
-              </div>
-              <div>
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Ciudad
-                </label>
-                <input
-                  type="text"
-                  value={provCity}
-                  onChange={(e) => setProvCity(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-                />
-              </div>
-              <div>
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Telefono
-                </label>
-                <input
-                  type="text"
-                  value={provPhone}
-                  onChange={(e) => setProvPhone(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-                />
-              </div>
-              <div>
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Costo de consulta / estudio (MXN)
-                </label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  value={provFee}
-                  onChange={(e) => setProvFee(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-                />
-              </div>
-              <div className="md:col-span-3">
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Direccion
-                </label>
-                <input
-                  type="text"
-                  value={provAddress}
-                  onChange={(e) => setProvAddress(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-                />
-              </div>
-              <div className="md:col-span-3">
-                <label className="block text-[13px] font-medium text-[#0F172A] mb-1">
-                  Notas y horarios de atencion
-                </label>
-                <input
-                  type="text"
-                  value={provNotes}
-                  onChange={(e) => setProvNotes(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-                />
-              </div>
+            )}
+
+            <div>
+              <label
+                htmlFor="au-user"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Usuario de acceso *
+              </label>
+              <input
+                id="au-user"
+                type="text"
+                required
+                value={uUsername}
+                onChange={(e) => setUUsername(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
             </div>
 
-            <div className="flex justify-end gap-3">
+            <div>
+              <label
+                htmlFor="au-display"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Nombre visible *
+              </label>
+              <input
+                id="au-display"
+                type="text"
+                required
+                value={uDisplayName}
+                onChange={(e) => setUDisplayName(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="au-pass"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Nueva contrasena (dejar en blanco para conservar la actual)
+              </label>
+              <input
+                id="au-pass"
+                type="password"
+                value={uPassword}
+                onChange={(e) => setUPassword(e.target.value)}
+                placeholder="Minimo 6 caracteres"
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
               <button
                 type="button"
-                onClick={() => {
-                  setShowProviderForm(false);
-                  resetProviderForm();
-                }}
+                onClick={() => setEditingUser(null)}
                 className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
               >
                 Cancelar
               </button>
               <button
                 type="submit"
-                disabled={savingProvider}
-                className="clinical-btn px-5 bg-[#0E7490] text-white text-[14px] font-bold"
+                disabled={savingUser}
+                className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold"
               >
-                {savingProvider
-                  ? "Guardando..."
-                  : editingProviderId
-                  ? "Actualizar Especialista"
-                  : "Guardar Especialista"}
+                {savingUser ? "Guardando..." : "Actualizar Credenciales"}
               </button>
             </div>
           </form>
-        )}
+        </ClinicalModal>
+      )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {snapshot.care_providers.map((prov) => (
-            <article
-              key={prov.id}
-              className="clinical-card p-4 flex flex-col justify-between gap-3"
-            >
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <StatusBadge label={prov.specialty} tone="info" />
-                  {prov.consultation_fee !== null && (
-                    <span className="font-mono font-bold text-[14px] text-[#0F172A] tabular-nums">
-                      {formatCurrencyMxn(prov.consultation_fee)}
-                    </span>
-                  )}
-                </div>
-                <h4 className="text-[16px] font-bold text-[#0F172A]">
-                  {prov.name}
-                </h4>
-                {(prov.clinic_or_center || prov.city) && (
-                  <p className="text-[13px] text-[#475569]">
-                    {[prov.clinic_or_center, prov.city]
-                      .filter(Boolean)
-                      .join(" | ")}
-                  </p>
-                )}
-                {prov.phone && (
-                  <p className="inline-flex items-center gap-1.5 font-mono text-[13px] text-[#0E7490]">
-                    <Phone
-                      className="w-3.5 h-3.5"
-                      strokeWidth={1.75}
-                      aria-hidden="true"
-                    />
-                    {prov.phone}
-                  </p>
-                )}
-                {prov.notes && (
-                  <p className="text-[13px] text-[#64748B]">{prov.notes}</p>
-                )}
-              </div>
-
-              <div className="flex justify-end gap-2 pt-2 border-t border-[#F1F5F9]">
-                <button
-                  type="button"
-                  onClick={() => startEditProvider(prov)}
-                  className="clinical-btn inline-flex items-center gap-1 px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[13px]"
-                >
-                  <Edit3
-                    className="w-3.5 h-3.5"
-                    strokeWidth={1.75}
-                    aria-hidden="true"
-                  />
-                  Editar
-                </button>
-                {confirmDeleteProvId === prov.id ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        await onDeleteProvider(prov.id);
-                        setConfirmDeleteProvId(null);
-                      }}
-                      className="clinical-btn px-3 bg-[#991B1B] text-white text-[13px] font-bold"
-                    >
-                      Confirmar
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDeleteProvId(null)}
-                      className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white text-[13px]"
-                    >
-                      No
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => setConfirmDeleteProvId(prov.id)}
-                    className="clinical-btn px-2.5 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
-                    aria-label={`Eliminar proveedor ${prov.name}`}
-                  >
-                    <Trash2
-                      className="w-3.5 h-3.5"
-                      strokeWidth={1.75}
-                      aria-hidden="true"
-                    />
-                  </button>
-                )}
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      {/* Bitacora de Auditoria y Gobernanza */}
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <History
-              className="w-5 h-5 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            <h3 className="text-[18px] font-bold text-[#0F172A]">
-              Bitacora de Auditoria y Gobernanza ({filteredAudit.length})
-            </h3>
-          </div>
-
-          <select
-            aria-label="Filtrar auditoria por modulo"
-            value={auditFilter}
-            onChange={(e) => setAuditFilter(e.target.value)}
-            className="h-[42px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-          >
-            <option value="ALL">Todos los modulos</option>
-            <option value="MEDICATION">Medicamentos</option>
-            <option value="INTAKE_CLUSTER">Bloques Horarios</option>
-            <option value="INTAKE_LOG">Registros de Toma</option>
-            <option value="CLINICAL_EVENT">Eventos Clinicos</option>
-            <option value="FOLLOW_UP_TOPIC">Temas de Seguimiento</option>
-            <option value="EXPENSE">Gastos Medicos</option>
-            <option value="FINANCIAL_SETTINGS">Config. Quincenal</option>
-            <option value="PATIENT_PROFILE">Ficha del Paciente</option>
-            <option value="CARE_PROVIDER">Especialistas</option>
-            <option value="TELEGRAM_RECIPIENT">Telegram</option>
-          </select>
-        </div>
-
-        <div className="clinical-card overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[13px] font-semibold text-[#475569]">
-                  <th className="py-2.5 px-4">Fecha / Hora</th>
-                  <th className="py-2.5 px-3">Accion / Modulo</th>
-                  <th className="py-2.5 px-3">Entidad</th>
-                  <th className="py-2.5 px-3">Resumen de Gobernanza</th>
-                  <th className="py-2.5 px-4">Actor</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#E2E8F0]">
-                {filteredAudit.map((log) => (
-                  <tr key={log.id} className="bg-white text-[13px]">
-                    <td className="py-2.5 px-4 font-mono text-[#475569] tabular-nums whitespace-nowrap">
-                      {formatDateTimeEs(log.created_at)}
-                    </td>
-                    <td className="py-2.5 px-3 whitespace-nowrap">
-                      <StatusBadge
-                        label={AUDIT_ACTION_TAG[log.action] ?? `[${log.action}]`}
-                        tone={
-                          log.action === "DELETE" || log.action === "ARCHIVE"
-                            ? "crit"
-                            : log.action === "CREATE" ||
-                              log.action === "PURCHASE_EXECUTED"
-                            ? "ok"
-                            : "info"
-                        }
-                      />
-                    </td>
-                    <td className="py-2.5 px-3 font-semibold text-[#0F172A]">
-                      {log.entity_label}
-                    </td>
-                    <td className="py-2.5 px-3 text-[#334155]">{log.summary}</td>
-                    <td className="py-2.5 px-4 font-mono text-[#64748B]">
-                      {log.actor}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
+      {/* Modal: Historial de Versiones de Medicamento (Solo Admin) */}
+      {isAdmin && (
+        <MedicationVersionsModal
+          medication={versionsTarget}
+          versions={snapshot.medication_versions}
+          onClose={() => setVersionsTarget(null)}
+          onRestoreVersion={onRestoreVersion}
+          onMarkReviewed={onMarkVersionReviewed}
+        />
+      )}
     </div>
   );
 }

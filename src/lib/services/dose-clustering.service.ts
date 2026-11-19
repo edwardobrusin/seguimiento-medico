@@ -1,5 +1,11 @@
 import { query, withTransaction } from "@/lib/db/client";
 import { INTAKE_RULE_LABEL } from "@/lib/clinical-labels";
+import {
+  calculateEffectiveDailyRate,
+  isDateActiveForMedication,
+  normalizeActiveDays,
+} from "@/lib/periodicity";
+import { getClinicalDateParts } from "@/lib/utils";
 import type {
   IntakeCluster,
   IntakeConstraint,
@@ -10,6 +16,10 @@ import type {
 } from "@/lib/types/clinical";
 import { inferQuincenaLabel } from "./financial-planner.service";
 import { GovernanceAuditService } from "./governance-audit.service";
+import {
+  MedicationVersionService,
+  type VersionActorContext,
+} from "./medication-version.service";
 
 export interface CreateMedicationInput {
   id?: string;
@@ -24,15 +34,19 @@ export interface CreateMedicationInput {
   frequency_value: number;
   tolerance_window_mins: number;
   intake_rule: IntakeConstraint;
+  active_days?: number[] | null;
+  schedule_start_date?: string | null;
   preferred_pharmacy?: string | null;
   purchase_priority?: number;
   safety_buffer_days?: number;
   clinical_notes?: string | null;
   ideal_times?: string[];
+  event_linked_only?: boolean;
 }
 
 export interface RestockOptions {
   origin?: "WEB" | "TELEGRAM";
+  role?: "ADMIN" | "PATIENT" | "SYSTEM";
   package_price?: number | null;
   units_per_package?: number | null;
   expense_amount?: number | null;
@@ -54,9 +68,29 @@ const MEDICATION_RETURNING = `
   package_price::float8 AS package_price,
   dose_amount::float8 AS dose_amount,
   current_stock::float8 AS current_stock,
+  schedule_start_date::text AS schedule_start_date,
   daily_consumption_rate::float8 AS daily_consumption_rate,
   days_of_supply_remaining::float8 AS days_of_supply_remaining
 `;
+
+function resolveContext(
+  actorOrCtx?: string | VersionActorContext
+): VersionActorContext {
+  if (!actorOrCtx) {
+    return { role: "ADMIN", actor: "Consola Clinica Web" };
+  }
+  if (typeof actorOrCtx === "string") {
+    return { role: "ADMIN", actor: actorOrCtx };
+  }
+  return actorOrCtx;
+}
+
+function normalizeMedicationRow(med: Medication): Medication {
+  return {
+    ...med,
+    active_days: normalizeActiveDays(med.active_days),
+  };
+}
 
 function parseTimeToMinutes(timeStr: string): number {
   const parts = timeStr.trim().split(":");
@@ -105,8 +139,8 @@ function defaultIdealTimesForFrequency(
   if (frequencyType === "DAILY_SLOTS") {
     if (frequencyValue <= 1) return ["08:00:00"];
     if (frequencyValue === 2) return ["08:00:00", "21:00:00"];
-    if (frequencyValue === 3) return ["08:00:00", "16:00:00", "21:00:00"];
-    return ["07:00:00", "12:00:00", "17:00:00", "22:00:00"].slice(
+    if (frequencyValue === 3) return ["08:00:00", "15:00:00", "21:00:00"];
+    return ["08:00:00", "12:00:00", "16:00:00", "21:00:00"].slice(
       0,
       frequencyValue
     );
@@ -118,19 +152,15 @@ export class DoseClusteringService {
   static calculateDailyConsumptionRate(
     doseAmount: number,
     frequencyType: MedFrequencyType,
-    frequencyValue: number
+    frequencyValue: number,
+    activeDays?: number[] | null
   ): number {
-    const safeVal = Math.max(1, frequencyValue);
-    switch (frequencyType) {
-      case "FIXED_HOURS":
-        return Number(((24 / safeVal) * doseAmount).toFixed(4));
-      case "DAILY_SLOTS":
-        return Number((safeVal * doseAmount).toFixed(4));
-      case "INTERVAL_DAYS":
-        return Number((doseAmount / safeVal).toFixed(4));
-      case "INTERVAL_WEEKS":
-        return Number((doseAmount / (safeVal * 7)).toFixed(4));
-    }
+    return calculateEffectiveDailyRate(
+      doseAmount,
+      frequencyType,
+      frequencyValue,
+      activeDays
+    );
   }
 
   static areConstraintsCompatible(
@@ -164,12 +194,17 @@ export class DoseClusteringService {
 
   static async createOrUpdateMedication(
     input: CreateMedicationInput,
-    actor = "Consola Clinica Web"
+    actorOrCtx: string | VersionActorContext = "Consola Clinica Web"
   ): Promise<Medication> {
+    const ctx = resolveContext(actorOrCtx);
+    const activeDays = normalizeActiveDays(input.active_days);
+    const scheduleStartDate = input.schedule_start_date?.trim() || null;
+
     const dailyRate = this.calculateDailyConsumptionRate(
       input.dose_amount,
       input.frequency_type,
-      input.frequency_value
+      input.frequency_value,
+      activeDays
     );
 
     const unitsPerPkg =
@@ -196,6 +231,19 @@ export class DoseClusteringService {
     const purchasePriority = input.purchase_priority ?? 2;
     const safetyBufferDays = input.safety_buffer_days ?? 7;
 
+    let beforeSnap = null;
+    if (input.id) {
+      beforeSnap = await MedicationVersionService.buildMedicationSnapshot(
+        input.id
+      );
+      if (beforeSnap) {
+        await MedicationVersionService.ensureBaselineVersion(
+          input.id,
+          beforeSnap
+        );
+      }
+    }
+
     const medResult = await query<Medication>(
       input.id
         ? `UPDATE medications
@@ -210,24 +258,28 @@ export class DoseClusteringService {
                frequency_value = $10,
                tolerance_window_mins = $11,
                intake_rule = $12::intake_constraint,
-               daily_consumption_rate = $13,
-               preferred_pharmacy = $14,
-               purchase_priority = $15,
-               safety_buffer_days = $16,
-               clinical_notes = $17,
+               active_days = $13::jsonb,
+               schedule_start_date = $14::date,
+               daily_consumption_rate = $15,
+               preferred_pharmacy = $16,
+               purchase_priority = $17,
+               safety_buffer_days = $18,
+               clinical_notes = $19,
                updated_at = NOW()
            WHERE id = $1::uuid
            RETURNING ${MEDICATION_RETURNING}`
         : `INSERT INTO medications (
              name, active_ingredient, presentation, units_per_package, package_price,
              dose_amount, current_stock, frequency_type, frequency_value,
-             tolerance_window_mins, intake_rule, daily_consumption_rate,
-             preferred_pharmacy, purchase_priority, safety_buffer_days, clinical_notes
+             tolerance_window_mins, intake_rule, active_days, schedule_start_date,
+             daily_consumption_rate, preferred_pharmacy, purchase_priority,
+             safety_buffer_days, clinical_notes
            ) VALUES (
              $1, $2, $3, $4, $5,
              $6, $7, $8::med_frequency_type, $9,
-             $10, $11::intake_constraint, $12,
-             $13, $14, $15, $16
+             $10, $11::intake_constraint, $12::jsonb, $13::date,
+             $14, $15, $16,
+             $17, $18
            )
            RETURNING ${MEDICATION_RETURNING}`,
       input.id
@@ -244,6 +296,8 @@ export class DoseClusteringService {
             input.frequency_value,
             input.tolerance_window_mins,
             input.intake_rule,
+            activeDays ? JSON.stringify(activeDays) : null,
+            scheduleStartDate,
             dailyRate,
             input.preferred_pharmacy?.trim() || null,
             purchasePriority,
@@ -262,6 +316,8 @@ export class DoseClusteringService {
             input.frequency_value,
             input.tolerance_window_mins,
             input.intake_rule,
+            activeDays ? JSON.stringify(activeDays) : null,
+            scheduleStartDate,
             dailyRate,
             input.preferred_pharmacy?.trim() || null,
             purchasePriority,
@@ -270,33 +326,51 @@ export class DoseClusteringService {
           ]
     );
 
-    const medication = medResult.rows[0];
-    if (!medication) {
+    const medicationRow = medResult.rows[0];
+    if (!medicationRow) {
       throw new Error("No se pudo guardar el medicamento solicitado.");
     }
+    const medication = normalizeMedicationRow(medicationRow);
 
-    await this.optimizeMedicationSchedules(medication.id, input.ideal_times);
+    await this.optimizeMedicationSchedules(medication.id, input.ideal_times, {
+      eventLinkedOnly: input.event_linked_only,
+    });
 
     if (input.id) {
-      // Limpiar tomas PENDING de hoy para que reflejen inmediatamente horarios y dosis editadas
-      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayStr = getClinicalDateParts("America/Mexico_City").dateStr;
       await query(
         `DELETE FROM intake_logs
          WHERE medication_id = $1::uuid
            AND status = 'PENDING'
-           AND (scheduled_for AT TIME ZONE 'UTC')::date = $2::date`,
+           AND (scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $2::date`,
         [medication.id, todayStr]
       );
     }
 
     await this.generateDailyIntakeLogsAndAlerts();
 
+    const afterSnap = await MedicationVersionService.buildMedicationSnapshot(
+      medication.id
+    );
+    if (afterSnap) {
+      await MedicationVersionService.recordMedicationVersion({
+        medicationId: medication.id,
+        action: input.id ? "UPDATE" : "CREATE",
+        context: ctx,
+        summary: input.id
+          ? `Medicamento "${medication.name}" actualizado (dosis ${medication.dose_amount} ${medication.presentation}, tasa ${medication.daily_consumption_rate}/dia).`
+          : `Medicamento "${medication.name}" registrado en catalogo clinico.`,
+        beforeSnapshot: beforeSnap,
+        afterSnapshot: afterSnap,
+      });
+    }
+
     await GovernanceAuditService.log({
       entity_type: "MEDICATION",
       entity_id: medication.id,
       entity_label: medication.name,
       action: input.id ? "UPDATE" : "CREATE",
-      actor,
+      actor: ctx.actor,
       summary: input.id
         ? `Medicamento "${medication.name}" actualizado (dosis ${medication.dose_amount} ${medication.presentation}, tasa ${medication.daily_consumption_rate}/dia).`
         : `Medicamento "${medication.name}" registrado en catalogo clinico.`,
@@ -307,8 +381,19 @@ export class DoseClusteringService {
 
   static async optimizeMedicationSchedules(
     medicationId: string,
-    baseIdealTimes?: string[]
+    baseIdealTimes?: string[],
+    options?: { eventLinkedOnly?: boolean }
   ): Promise<MedicationScheduleSummary[]> {
+    if (options?.eventLinkedOnly) {
+      await query(
+        `UPDATE medication_schedules
+         SET is_active = FALSE
+         WHERE medication_id = $1::uuid`,
+        [medicationId]
+      );
+      return [];
+    }
+
     const medRes = await query<Medication>(
       `SELECT ${MEDICATION_RETURNING} FROM medications WHERE id = $1::uuid`,
       [medicationId]
@@ -503,7 +588,8 @@ export class DoseClusteringService {
   static async generateDailyIntakeLogsAndAlerts(
     targetDateStr?: string
   ): Promise<{ createdLogs: number; queuedNotifications: number }> {
-    const dateStr = targetDateStr ?? new Date().toISOString().slice(0, 10);
+    const dateStr =
+      targetDateStr ?? getClinicalDateParts("America/Mexico_City").dateStr;
 
     const schedulesRes = await query<{
       schedule_id: string;
@@ -513,6 +599,8 @@ export class DoseClusteringService {
       dose_amount: number;
       frequency_type: MedFrequencyType;
       frequency_value: number;
+      active_days: unknown;
+      schedule_start_date: string | null;
       created_date: string;
       has_active_event: boolean;
     }>(
@@ -524,7 +612,9 @@ export class DoseClusteringService {
          m.dose_amount::float8 AS dose_amount,
          m.frequency_type,
          m.frequency_value,
-         (m.created_at AT TIME ZONE 'UTC')::date::text AS created_date,
+         m.active_days,
+         m.schedule_start_date::text AS schedule_start_date,
+         (m.created_at AT TIME ZONE 'America/Mexico_City')::date::text AS created_date,
          EXISTS (
            SELECT 1 FROM clinical_events ce
            WHERE ce.medication_id = m.id AND ce.is_completed = FALSE
@@ -539,44 +629,52 @@ export class DoseClusteringService {
 
     for (const row of schedulesRes.rows) {
       if (
-        row.frequency_type === "INTERVAL_DAYS" ||
-        row.frequency_type === "INTERVAL_WEEKS"
+        (row.frequency_type === "INTERVAL_DAYS" ||
+          row.frequency_type === "INTERVAL_WEEKS") &&
+        row.has_active_event
       ) {
-        if (row.has_active_event) {
-          continue;
-        }
-        const intervalDays =
-          row.frequency_type === "INTERVAL_WEEKS"
-            ? row.frequency_value * 7
-            : row.frequency_value;
-        const createdMs = new Date(`${row.created_date}T00:00:00Z`).getTime();
-        const targetMs = new Date(`${dateStr}T00:00:00Z`).getTime();
-        const diffDays = Math.floor((targetMs - createdMs) / 86400000);
-        if (diffDays < 0 || diffDays % Math.max(1, intervalDays) !== 0) {
-          continue;
-        }
+        continue;
+      }
+
+      if (
+        !isDateActiveForMedication(
+          {
+            frequency_type: row.frequency_type,
+            frequency_value: row.frequency_value,
+            active_days: row.active_days as number[] | null,
+            schedule_start_date: row.schedule_start_date,
+            created_date: row.created_date,
+          },
+          dateStr
+        )
+      ) {
+        continue;
       }
 
       const existsRes = await query<{ id: string }>(
         `SELECT id FROM intake_logs
          WHERE medication_id = $1::uuid
            AND schedule_id = $2::uuid
-           AND (scheduled_for AT TIME ZONE 'UTC')::date = $3::date
+           AND (scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $3::date
          LIMIT 1`,
         [row.medication_id, row.schedule_id, dateStr]
       );
 
       if (existsRes.rows.length === 0) {
-        const scheduledIso = `${dateStr} ${row.effective_clustered_time}+00`;
+        const localTimestampStr = `${dateStr} ${row.effective_clustered_time}`;
         await query(
           `INSERT INTO intake_logs (
              medication_id, schedule_id, cluster_id, scheduled_for, status, quantity_deducted
-           ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::timestamptz, 'PENDING', $5)`,
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid,
+             (($4::text)::timestamp AT TIME ZONE 'America/Mexico_City'),
+             'PENDING', $5
+           )`,
           [
             row.medication_id,
             row.schedule_id,
             row.cluster_id,
-            scheduledIso,
+            localTimestampStr,
             row.dose_amount,
           ]
         );
@@ -604,7 +702,7 @@ export class DoseClusteringService {
        FROM intake_logs il
        JOIN intake_clusters ic ON ic.id = il.cluster_id
        JOIN medications m ON m.id = il.medication_id
-       WHERE (il.scheduled_for AT TIME ZONE 'UTC')::date = $1::date
+       WHERE (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $1::date
          AND il.status = 'PENDING'
          AND m.is_active = TRUE
        ORDER BY ic.anchor_time ASC, m.name ASC`,
@@ -652,15 +750,16 @@ export class DoseClusteringService {
 
       const idempotencyKey = `CLUSTER_${clusterId}_${dateStr}`;
       const callbackPayload = `ack_cluster:${clusterId}:${dateStr}`;
-      const triggerAt = `${dateStr} ${data.anchor_time}+00`;
+      const triggerLocalStr = `${dateStr} ${data.anchor_time}`;
 
       const insRes = await query<{ id: string }>(
         `INSERT INTO notification_queue (
            source_type, source_id, stage, trigger_at, status,
            title, message, callback_action_payload, idempotency_key
          ) VALUES (
-           'MEDICATION_INTAKE', $1::uuid, 'EXACT_TIME', $2::timestamptz, 'QUEUED',
-           $3, $4, $5, $6
+           'MEDICATION_INTAKE', $1::uuid, 'EXACT_TIME',
+           (($2::text)::timestamp AT TIME ZONE 'America/Mexico_City'),
+           'QUEUED', $3, $4, $5, $6
          )
          ON CONFLICT (idempotency_key) DO UPDATE
          SET message = CASE
@@ -670,7 +769,7 @@ export class DoseClusteringService {
          RETURNING id`,
         [
           clusterId,
-          triggerAt,
+          triggerLocalStr,
           `[BLOQUE DE MEDICACION - ${hhmm}] ${data.label}`,
           message,
           callbackPayload,
@@ -698,7 +797,7 @@ export class DoseClusteringService {
              taken_at = NOW(),
              recorded_by = $3
          WHERE cluster_id = $1::uuid
-           AND (scheduled_for AT TIME ZONE 'UTC')::date = $2::date
+           AND (scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $2::date
            AND status = 'PENDING'
          RETURNING medication_id`,
         [clusterId, dateStr, recordedBy]
@@ -709,11 +808,14 @@ export class DoseClusteringService {
          SET status = 'ACKNOWLEDGED',
              acknowledged_at = NOW(),
              acknowledged_by_chat_id = $3
-         WHERE source_type = 'MEDICATION_INTAKE'
-           AND source_id = $1::uuid
-           AND idempotency_key = $2
+         WHERE idempotency_key IN ($2, $4)
            AND status != 'ACKNOWLEDGED'`,
-        [clusterId, `CLUSTER_${clusterId}_${dateStr}`, recordedBy]
+        [
+          clusterId,
+          `CLUSTER_${clusterId}_${dateStr}`,
+          recordedBy,
+          `MISSED_CLUSTER_${clusterId}_${dateStr}`,
+        ]
       );
 
       const medIds = Array.from(
@@ -775,11 +877,33 @@ export class DoseClusteringService {
            recorded_by = $3,
            observations = CASE WHEN $5::boolean THEN $4 ELSE observations END
        WHERE id = $1::uuid
-       RETURNING cluster_id, (scheduled_for AT TIME ZONE 'UTC')::date::text AS date_str, medication_id`,
+       RETURNING cluster_id, (scheduled_for AT TIME ZONE 'America/Mexico_City')::date::text AS date_str, medication_id`,
       [intakeLogId, status, recordedBy, observations ?? null, hasObservations]
     );
 
     const row = res.rows[0];
+    if (row?.cluster_id && row?.date_str && status !== "PENDING") {
+      const pendingRemRes = await query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c
+         FROM intake_logs
+         WHERE cluster_id = $1::uuid
+           AND (scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $2::date
+           AND status = 'PENDING'`,
+        [row.cluster_id, row.date_str]
+      );
+      if (Number(pendingRemRes.rows[0]?.c ?? "0") === 0) {
+        await query(
+          `UPDATE notification_queue
+           SET status = 'ACKNOWLEDGED',
+               acknowledged_at = NOW(),
+               acknowledged_by_chat_id = $2
+           WHERE idempotency_key = $1
+             AND status != 'ACKNOWLEDGED'`,
+          [`MISSED_CLUSTER_${row.cluster_id}_${row.date_str}`, recordedBy]
+        );
+      }
+    }
+
     if (options?.origin !== "TELEGRAM" && row?.cluster_id && row?.date_str) {
       const { TelegramNotificationService } = await import(
         "./telegram-notification.service"
@@ -809,7 +933,7 @@ export class DoseClusteringService {
     }>(
       `DELETE FROM intake_logs
        WHERE id = $1::uuid
-       RETURNING id, cluster_id, (scheduled_for AT TIME ZONE 'UTC')::date::text AS date_str, medication_id, status`,
+       RETURNING id, cluster_id, (scheduled_for AT TIME ZONE 'America/Mexico_City')::date::text AS date_str, medication_id, status`,
       [intakeLogId]
     );
     const deleted = res.rows[0];
@@ -849,7 +973,23 @@ export class DoseClusteringService {
     recordedBy = "RESTOCK_WEB",
     options?: RestockOptions
   ): Promise<Medication> {
+    const actorRole: "ADMIN" | "PATIENT" | "SYSTEM" =
+      options?.role ?? "ADMIN";
+
     const { med, sentNotifications } = await withTransaction(async (tx) => {
+      const beforeSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (!beforeSnap) {
+        throw new Error("Medicamento no encontrado para restock.");
+      }
+      await MedicationVersionService.ensureBaselineVersion(
+        medicationId,
+        beforeSnap,
+        tx
+      );
+
       const res = await tx.query<Medication>(
         `UPDATE medications
          SET current_stock = COALESCE(current_stock, 0) + $2,
@@ -868,10 +1008,7 @@ export class DoseClusteringService {
         ]
       );
 
-      const updatedMed = res.rows[0];
-      if (!updatedMed) {
-        throw new Error("Medicamento no encontrado para restock.");
-      }
+      const updatedMed = normalizeMedicationRow(res.rows[0]);
 
       const notifRes = await tx.query<{
         id: string;
@@ -903,7 +1040,7 @@ export class DoseClusteringService {
         options.expense_amount !== null &&
         options.expense_amount >= 0
       ) {
-        const todayIso = new Date().toISOString().slice(0, 10);
+        const todayIso = getClinicalDateParts("America/Mexico_City").dateStr;
         const pkgs =
           updatedMed.units_per_package && updatedMed.units_per_package > 0
             ? Number((quantityToAdd / updatedMed.units_per_package).toFixed(2))
@@ -927,6 +1064,24 @@ export class DoseClusteringService {
             options.provider_or_pharmacy?.trim() || updatedMed.preferred_pharmacy || null,
             options.payment_method?.trim() || null,
           ]
+        );
+      }
+
+      const afterSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (afterSnap) {
+        await MedicationVersionService.recordMedicationVersion(
+          {
+            medicationId,
+            action: "RESTOCK",
+            context: { role: actorRole, actor: recordedBy },
+            summary: `Restock de +${quantityToAdd} ${updatedMed.presentation} en "${updatedMed.name}". Stock resultante: ${updatedMed.current_stock}.`,
+            beforeSnapshot: beforeSnap,
+            afterSnapshot: afterSnap,
+          },
+          tx
         );
       }
 
@@ -971,9 +1126,24 @@ export class DoseClusteringService {
     medicationId: string,
     exactStock: number | null,
     reason: string,
-    actor = "Consola Clinica Web"
+    actorOrCtx: string | VersionActorContext = "Consola Clinica Web"
   ): Promise<Medication> {
+    const ctx = resolveContext(actorOrCtx);
+
     const { med, sentNotifications } = await withTransaction(async (tx) => {
+      const beforeSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (!beforeSnap) {
+        throw new Error("Medicamento no encontrado para ajustar stock.");
+      }
+      await MedicationVersionService.ensureBaselineVersion(
+        medicationId,
+        beforeSnap,
+        tx
+      );
+
       const res = await tx.query<Medication>(
         `UPDATE medications
          SET current_stock = $2,
@@ -982,10 +1152,7 @@ export class DoseClusteringService {
          RETURNING ${MEDICATION_RETURNING}`,
         [medicationId, exactStock]
       );
-      const updated = res.rows[0];
-      if (!updated) {
-        throw new Error("Medicamento no encontrado para ajustar stock.");
-      }
+      const updated = normalizeMedicationRow(res.rows[0]);
 
       let closedSent: Array<{
         id: string;
@@ -1020,10 +1187,11 @@ export class DoseClusteringService {
            FROM prev
            WHERE nq.id = prev.id
            RETURNING prev.id, prev.title, prev.message, prev.status, prev.telegram_message_ids`,
-          [medicationId, actor]
+          [medicationId, ctx.actor]
         );
         closedSent = notifRes.rows.filter((n) => n.status === "SENT");
       } else if (updated.days_of_supply_remaining <= 7) {
+        const todayStr = getClinicalDateParts("America/Mexico_City").dateStr;
         await tx.query(
           `INSERT INTO notification_queue (
              source_type, source_id, stage, trigger_at, title, message, callback_action_payload, idempotency_key
@@ -1036,8 +1204,26 @@ export class DoseClusteringService {
             `[ALERTA DE RESTOCK CRITICO] ${updated.name}`,
             `Inventario ajustado: ${updated.current_stock} (${updated.presentation}). Cobertura estimada: ${updated.days_of_supply_remaining} dias.`,
             `ack_restock:${updated.id}`,
-            `RESTOCK_${updated.id}_${new Date().toISOString().slice(0, 10)}`,
+            `RESTOCK_${updated.id}_${todayStr}`,
           ]
+        );
+      }
+
+      const afterSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (afterSnap) {
+        await MedicationVersionService.recordMedicationVersion(
+          {
+            medicationId,
+            action: "STOCK_ADJUST",
+            context: ctx,
+            summary: `Stock de "${updated.name}" ajustado a ${exactStock === null ? "PENDIENTE" : exactStock}. Motivo: ${reason || "Conteo fisico"}.`,
+            beforeSnapshot: beforeSnap,
+            afterSnapshot: afterSnap,
+          },
+          tx
         );
       }
 
@@ -1047,7 +1233,7 @@ export class DoseClusteringService {
           entity_id: updated.id,
           entity_label: updated.name,
           action: "STOCK_ADJUST",
-          actor,
+          actor: ctx.actor,
           summary: `Stock de "${updated.name}" ajustado a ${exactStock === null ? "PENDIENTE" : exactStock}. Motivo: ${reason || "Conteo fisico"}.`,
         },
         tx
@@ -1078,9 +1264,23 @@ export class DoseClusteringService {
   static async archiveMedication(
     medicationId: string,
     reason: string | null,
-    actor = "Consola Clinica Web"
+    actorOrCtx: string | VersionActorContext = "Consola Clinica Web"
   ): Promise<Medication> {
+    const ctx = resolveContext(actorOrCtx);
     return withTransaction(async (tx) => {
+      const beforeSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (!beforeSnap) {
+        throw new Error("Medicamento no encontrado para archivar.");
+      }
+      await MedicationVersionService.ensureBaselineVersion(
+        medicationId,
+        beforeSnap,
+        tx
+      );
+
       const res = await tx.query<Medication>(
         `UPDATE medications
          SET is_active = FALSE,
@@ -1091,17 +1291,14 @@ export class DoseClusteringService {
          RETURNING ${MEDICATION_RETURNING}`,
         [medicationId, reason?.trim() || null]
       );
-      const med = res.rows[0];
-      if (!med) {
-        throw new Error("Medicamento no encontrado para archivar.");
-      }
+      const med = normalizeMedicationRow(res.rows[0]);
 
-      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayStr = getClinicalDateParts("America/Mexico_City").dateStr;
       await tx.query(
         `DELETE FROM intake_logs
          WHERE medication_id = $1::uuid
            AND status = 'PENDING'
-           AND (scheduled_for AT TIME ZONE 'UTC')::date = $2::date`,
+           AND (scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $2::date`,
         [medicationId, todayStr]
       );
 
@@ -1113,8 +1310,26 @@ export class DoseClusteringService {
          WHERE source_type = 'RESTOCK_ALERT'
            AND source_id = $1::uuid
            AND status != 'ACKNOWLEDGED'`,
-        [medicationId, actor]
+        [medicationId, ctx.actor]
       );
+
+      const afterSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (afterSnap) {
+        await MedicationVersionService.recordMedicationVersion(
+          {
+            medicationId,
+            action: "ARCHIVE",
+            context: ctx,
+            summary: `Medicamento "${med.name}" suspendido/archivado. Motivo: ${reason?.trim() || "Suspension clinica"}.`,
+            beforeSnapshot: beforeSnap,
+            afterSnapshot: afterSnap,
+          },
+          tx
+        );
+      }
 
       await GovernanceAuditService.log(
         {
@@ -1122,7 +1337,7 @@ export class DoseClusteringService {
           entity_id: med.id,
           entity_label: med.name,
           action: "ARCHIVE",
-          actor,
+          actor: ctx.actor,
           summary: `Medicamento "${med.name}" suspendido/archivado. Motivo: ${reason?.trim() || "Suspension clinica"}.`,
         },
         tx
@@ -1134,9 +1349,23 @@ export class DoseClusteringService {
 
   static async restoreMedication(
     medicationId: string,
-    actor = "Consola Clinica Web"
+    actorOrCtx: string | VersionActorContext = "Consola Clinica Web"
   ): Promise<Medication> {
+    const ctx = resolveContext(actorOrCtx);
     const med = await withTransaction(async (tx) => {
+      const beforeSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (!beforeSnap) {
+        throw new Error("Medicamento no encontrado para restaurar.");
+      }
+      await MedicationVersionService.ensureBaselineVersion(
+        medicationId,
+        beforeSnap,
+        tx
+      );
+
       const res = await tx.query<Medication>(
         `UPDATE medications
          SET is_active = TRUE,
@@ -1147,9 +1376,24 @@ export class DoseClusteringService {
          RETURNING ${MEDICATION_RETURNING}`,
         [medicationId]
       );
-      const restored = res.rows[0];
-      if (!restored) {
-        throw new Error("Medicamento no encontrado para restaurar.");
+      const restored = normalizeMedicationRow(res.rows[0]);
+
+      const afterSnap = await MedicationVersionService.buildMedicationSnapshot(
+        medicationId,
+        tx
+      );
+      if (afterSnap) {
+        await MedicationVersionService.recordMedicationVersion(
+          {
+            medicationId,
+            action: "RESTORE",
+            context: ctx,
+            summary: `Medicamento "${restored.name}" reactivado en catalogo operativo.`,
+            beforeSnapshot: beforeSnap,
+            afterSnapshot: afterSnap,
+          },
+          tx
+        );
       }
 
       await GovernanceAuditService.log(
@@ -1158,7 +1402,7 @@ export class DoseClusteringService {
           entity_id: restored.id,
           entity_label: restored.name,
           action: "RESTORE",
-          actor,
+          actor: ctx.actor,
           summary: `Medicamento "${restored.name}" reactivado en catalogo operativo.`,
         },
         tx
@@ -1178,7 +1422,7 @@ export class DoseClusteringService {
     return withTransaction(async (tx) => {
       await tx.query(
         `DELETE FROM notification_queue
-         WHERE source_type = 'RESTOCK_ALERT'
+         WHERE source_type IN ('RESTOCK_ALERT', 'PATIENT_CHANGE_ALERT')
            AND source_id = $1::uuid`,
         [medicationId]
       );
@@ -1194,17 +1438,14 @@ export class DoseClusteringService {
         throw new Error("Medicamento no encontrado para eliminar.");
       }
 
-      await GovernanceAuditService.log(
-        {
-          entity_type: "MEDICATION",
-          entity_id: deleted.id,
-          entity_label: deleted.name,
-          action: "DELETE",
-          actor,
-          summary: `Medicamento "${deleted.name}" eliminado permanentemente del sistema.`,
-        },
-        tx
-      );
+      await GovernanceAuditService.log({
+        entity_type: "MEDICATION",
+        entity_id: deleted.id,
+        entity_label: deleted.name,
+        action: "DELETE",
+        actor,
+        summary: `Medicamento "${deleted.name}" eliminado permanentemente del sistema.`,
+      }, tx);
 
       return { deletedId: deleted.id };
     });
@@ -1282,13 +1523,13 @@ export class DoseClusteringService {
         [clusterId, pgTime]
       );
 
-      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayStr = getClinicalDateParts("America/Mexico_City").dateStr;
       await tx.query(
         `UPDATE intake_logs
-         SET scheduled_for = ($2 || ' ' || $3)::timestamptz
+         SET scheduled_for = ((($2 || ' ' || $3)::timestamp) AT TIME ZONE 'America/Mexico_City')
          WHERE cluster_id = $1::uuid
            AND status = 'PENDING'
-           AND (scheduled_for AT TIME ZONE 'UTC')::date = $2::date`,
+           AND (scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $2::date`,
         [clusterId, todayStr, pgTime]
       );
 

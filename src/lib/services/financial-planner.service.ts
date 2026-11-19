@@ -15,6 +15,10 @@ import type {
   ReserveAlertItem,
 } from "@/lib/types/clinical";
 import { GovernanceAuditService } from "./governance-audit.service";
+import {
+  MedicationVersionService,
+  type VersionActorContext,
+} from "./medication-version.service";
 
 const MONTH_ABBR = [
   "Ene",
@@ -466,12 +470,18 @@ export class FinancialPlannerService {
 
   static async executePlannedPurchase(
     input: ExecutePlannedPurchaseInput,
-    actor = "Consola Clinica Web"
+    actorOrCtx: string | VersionActorContext = "Consola Clinica Web"
   ): Promise<{
     medication: Medication;
     expense: MedicalExpense;
     unitsAdded: number;
   }> {
+    const ctx: VersionActorContext =
+      typeof actorOrCtx === "string"
+        ? { role: "ADMIN", actor: actorOrCtx }
+        : actorOrCtx;
+    const actor = ctx.actor;
+
     const result = await withTransaction(async (tx) => {
       const medPrevRes = await tx.query<Medication>(
         `SELECT *,
@@ -479,6 +489,7 @@ export class FinancialPlannerService {
            package_price::float8 AS package_price,
            dose_amount::float8 AS dose_amount,
            current_stock::float8 AS current_stock,
+           schedule_start_date::text AS schedule_start_date,
            daily_consumption_rate::float8 AS daily_consumption_rate,
            days_of_supply_remaining::float8 AS days_of_supply_remaining
          FROM medications
@@ -488,6 +499,18 @@ export class FinancialPlannerService {
       const medPrev = medPrevRes.rows[0];
       if (!medPrev) {
         throw new Error("Medicamento no encontrado para registrar compra.");
+      }
+
+      const beforeSnap = await MedicationVersionService.buildMedicationSnapshot(
+        input.medication_id,
+        tx
+      );
+      if (beforeSnap) {
+        await MedicationVersionService.ensureBaselineVersion(
+          input.medication_id,
+          beforeSnap,
+          tx
+        );
       }
 
       const unitsPerPkg = medPrev.units_per_package ?? 30;
@@ -584,6 +607,25 @@ export class FinancialPlannerService {
       );
 
       const expense = expRes.rows[0];
+
+      const afterSnap = await MedicationVersionService.buildMedicationSnapshot(
+        updatedMed.id,
+        tx
+      );
+      if (afterSnap) {
+        await MedicationVersionService.recordMedicationVersion(
+          {
+            medicationId: updatedMed.id,
+            action: "RESTOCK",
+            context: ctx,
+            summary: `Compra quincenal ejecutada (+${unitsAdded} ${updatedMed.presentation}, $${expense.amount.toFixed(2)} MXN).`,
+            beforeSnapshot: beforeSnap,
+            afterSnapshot: afterSnap,
+          },
+          tx
+        );
+      }
+
       await GovernanceAuditService.log(
         {
           entity_type: "MEDICATION",

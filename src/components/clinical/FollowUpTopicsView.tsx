@@ -2,10 +2,13 @@
 
 import { useState, type FormEvent } from "react";
 import {
-  CalendarCheck2,
-  ClipboardPlus,
+  AlertCircle,
+  CalendarPlus,
+  Check,
   Edit3,
   MessageSquarePlus,
+  Plus,
+  RotateCcw,
   Trash2,
 } from "lucide-react";
 import type {
@@ -17,16 +20,27 @@ import type {
   TopicAnnotation,
 } from "@/lib/types/clinical";
 import {
+  EVENT_CATEGORY_LABEL,
   NOTE_TYPE_TAG,
   PRIORITY_TAG,
+  TASK_STATUS_LABEL,
   TASK_STATUS_TAG,
 } from "@/lib/clinical-labels";
-import { formatCurrencyMxn, formatDateTimeEs } from "@/lib/utils";
+import {
+  cn,
+  formatCurrencyMxn,
+  formatDateTimeEs,
+  getDaysUntil,
+  toLocalDateTimeInput,
+} from "@/lib/utils";
 import { CascadeTimeline } from "./CascadeTimeline";
+import { ClinicalModal } from "./ClinicalModal";
+import { IconActionButton } from "./IconActionButton";
 import { StatusBadge } from "./StatusBadge";
 
 interface FollowUpTopicsViewProps {
   snapshot: CommandCenterSnapshot;
+  isAdmin: boolean;
   onCreateTopic: (payload: {
     title: string;
     description: string;
@@ -81,8 +95,31 @@ interface FollowUpTopicsViewProps {
   }) => Promise<void>;
 }
 
+const PROGRESS_PRESETS = [0, 10, 20, 25, 40, 50, 60, 75, 80, 90, 100];
+const STATUS_OPTIONS: TaskStatus[] = [
+  "PENDING",
+  "IN_PROGRESS",
+  "WAITING_RESPONSE",
+  "COMPLETED",
+];
+const NOTE_TYPES: NoteType[] = ["PROPOSAL", "CONTACT", "UPDATE", "QUOTE"];
+
+function parseOptionalNonNeg(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function progressOptionsFor(current: number): number[] {
+  const set = new Set<number>(PROGRESS_PRESETS);
+  if (Number.isFinite(current)) set.add(Math.round(current));
+  return Array.from(set).sort((a, b) => a - b);
+}
+
 export function FollowUpTopicsView({
   snapshot,
+  isAdmin,
   onCreateTopic,
   onUpdateTopic,
   onDeleteTopic,
@@ -91,946 +128,876 @@ export function FollowUpTopicsView({
   onDeleteAnnotation,
   onConvertToEvent,
 }: FollowUpTopicsViewProps) {
-  // Crear / Editar tema
-  const [showTopicForm, setShowTopicForm] = useState(false);
-  const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [priority, setPriority] = useState("1");
-  const [estimatedBudget, setEstimatedBudget] = useState("");
-  const [deadlineAt, setDeadlineAt] = useState(() => {
-    const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    return d.toISOString().slice(0, 16);
-  });
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [confirmDeleteKey, setConfirmDeleteKey] = useState<string | null>(null);
+  const [showCompleted, setShowCompleted] = useState(false);
+
+  // Topic modal
+  const [topicModalOpen, setTopicModalOpen] = useState(false);
+  const [editingTopic, setEditingTopic] = useState<FollowUpTopicItem | null>(
+    null
+  );
+  const [topicTitle, setTopicTitle] = useState("");
+  const [topicDescription, setTopicDescription] = useState("");
+  const [topicPriority, setTopicPriority] = useState("2");
+  const [topicDeadline, setTopicDeadline] = useState("");
+  const [topicBudget, setTopicBudget] = useState("");
   const [topicError, setTopicError] = useState<string | null>(null);
   const [savingTopic, setSavingTopic] = useState(false);
 
-  // Anotaciones (Crear / Editar)
-  const [activeNoteTopicId, setActiveNoteTopicId] = useState<string | null>(
-    null
-  );
-  const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(
-    null
-  );
-  const [author, setAuthor] = useState("Cuidador Principal");
-  const [noteType, setNoteType] = useState<NoteType>("PROPOSAL");
-  const [contactName, setContactName] = useState("");
-  const [contactPhone, setContactPhone] = useState("");
-  const [estimatedCost, setEstimatedCost] = useState("");
-  const [noteContent, setNoteContent] = useState("");
-  const [savingNote, setSavingNote] = useState(false);
+  // Annotation modal
+  const [annTopic, setAnnTopic] = useState<FollowUpTopicItem | null>(null);
+  const [editingAnn, setEditingAnn] = useState<TopicAnnotation | null>(null);
+  const [annAuthor, setAnnAuthor] = useState("");
+  const [annType, setAnnType] = useState<NoteType>("UPDATE");
+  const [annContactName, setAnnContactName] = useState("");
+  const [annContactPhone, setAnnContactPhone] = useState("");
+  const [annCost, setAnnCost] = useState("");
+  const [annContent, setAnnContent] = useState("");
+  const [annError, setAnnError] = useState<string | null>(null);
+  const [savingAnn, setSavingAnn] = useState(false);
 
-  // Convertir tema en evento clinico
-  const [convertingTopicId, setConvertingTopicId] = useState<string | null>(
+  // Convert modal
+  const [convertTopic, setConvertTopic] = useState<FollowUpTopicItem | null>(
     null
   );
-  const [evtTitle, setEvtTitle] = useState("");
-  const [evtCategory, setEvtCategory] = useState<EventCategory>("APPOINTMENT");
-  const [evtSpecialist, setEvtSpecialist] = useState("");
-  const [evtDatetime, setEvtDatetime] = useState(() => {
-    const d = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
-    return d.toISOString().slice(0, 16);
-  });
-  const [evtCost, setEvtCost] = useState("");
-  const [evtMarkDone, setEvtMarkDone] = useState(true);
-  const [convertingBusy, setConvertingBusy] = useState(false);
+  const [cvTitle, setCvTitle] = useState("");
+  const [cvCategory, setCvCategory] = useState<EventCategory>("APPOINTMENT");
+  const [cvSpecialist, setCvSpecialist] = useState("");
+  const [cvLocation, setCvLocation] = useState("");
+  const [cvDatetime, setCvDatetime] = useState("");
+  const [cvCost, setCvCost] = useState("");
+  const [cvPrep, setCvPrep] = useState("");
+  const [cvMarkCompleted, setCvMarkCompleted] = useState(true);
+  const [cvError, setCvError] = useState<string | null>(null);
+  const [savingCv, setSavingCv] = useState(false);
 
-  // Confirmaciones de borrado
-  const [confirmDeleteTopicId, setConfirmDeleteTopicId] = useState<
-    string | null
-  >(null);
-  const [confirmDeleteAnnId, setConfirmDeleteAnnId] = useState<string | null>(
-    null
-  );
-
-  function resetTopicForm() {
-    setEditingTopicId(null);
-    setTitle("");
-    setDescription("");
-    setPriority("1");
-    setEstimatedBudget("");
-    const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    setDeadlineAt(d.toISOString().slice(0, 16));
-    setTopicError(null);
+  async function runBusy(key: string, fn: () => Promise<void>) {
+    setBusyKey(key);
+    try {
+      await fn();
+    } catch {
+      // El toast global de ClinicalShell muestra el error
+    } finally {
+      setBusyKey(null);
+    }
   }
 
-  function startEditTopic(topic: FollowUpTopicItem) {
-    setEditingTopicId(topic.id);
-    setTitle(topic.title);
-    setDescription(topic.description ?? "");
-    setPriority(String(topic.priority));
-    setEstimatedBudget(
-      topic.estimated_budget !== null ? String(topic.estimated_budget) : ""
+  function openCreateTopic() {
+    setEditingTopic(null);
+    setTopicTitle("");
+    setTopicDescription("");
+    setTopicPriority("2");
+    setTopicDeadline(
+      toLocalDateTimeInput(new Date(Date.now() + 14 * 86400000).toISOString())
     );
-    setDeadlineAt(new Date(topic.deadline_at).toISOString().slice(0, 16));
+    setTopicBudget("");
     setTopicError(null);
-    setShowTopicForm(true);
+    setTopicModalOpen(true);
   }
 
-  async function handleSaveTopic(e: FormEvent) {
+  function openEditTopic(topic: FollowUpTopicItem) {
+    setEditingTopic(topic);
+    setTopicTitle(topic.title);
+    setTopicDescription(topic.description ?? "");
+    setTopicPriority(String(topic.priority));
+    setTopicDeadline(toLocalDateTimeInput(topic.deadline_at));
+    setTopicBudget(
+      topic.estimated_budget === null ? "" : String(topic.estimated_budget)
+    );
+    setTopicError(null);
+    setTopicModalOpen(true);
+  }
+
+  async function handleTopicSubmit(e: FormEvent) {
     e.preventDefault();
     setTopicError(null);
-    if (!title.trim()) {
-      setTopicError("Escribe el titulo del tema de seguimiento.");
+    if (!topicTitle.trim()) {
+      setTopicError("Ingresa el titulo del tema.");
       return;
     }
-    const parsedBudget =
-      estimatedBudget.trim() !== "" && Number.isFinite(Number(estimatedBudget))
-        ? Number(estimatedBudget)
-        : null;
+    const deadline = new Date(topicDeadline);
+    if (Number.isNaN(deadline.getTime())) {
+      setTopicError("Selecciona una fecha limite valida.");
+      return;
+    }
+    const priority = Math.max(
+      1,
+      Math.min(3, Number.parseInt(topicPriority, 10) || 2)
+    );
+    const budget = parseOptionalNonNeg(topicBudget);
 
     setSavingTopic(true);
     try {
-      if (editingTopicId) {
-        await onUpdateTopic(editingTopicId, {
-          title: title.trim(),
-          description: description.trim() || null,
-          priority: Number(priority),
-          deadline_at: new Date(deadlineAt).toISOString(),
-          estimated_budget: parsedBudget,
+      if (editingTopic) {
+        await onUpdateTopic(editingTopic.id, {
+          title: topicTitle.trim(),
+          description: topicDescription.trim() || null,
+          priority,
+          deadline_at: deadline.toISOString(),
+          estimated_budget: budget,
         });
       } else {
         await onCreateTopic({
-          title: title.trim(),
-          description: description.trim(),
-          priority: Number(priority),
-          deadline_at: new Date(deadlineAt).toISOString(),
-          estimated_budget: parsedBudget,
+          title: topicTitle.trim(),
+          description: topicDescription.trim(),
+          priority,
+          deadline_at: deadline.toISOString(),
+          estimated_budget: budget,
         });
       }
-      resetTopicForm();
-      setShowTopicForm(false);
+      setTopicModalOpen(false);
     } catch (err) {
       setTopicError(
-        err instanceof Error ? err.message : "Error al guardar tema."
+        err instanceof Error ? err.message : "No se pudo guardar el tema."
       );
     } finally {
       setSavingTopic(false);
     }
   }
 
-  function startEditAnnotation(topicId: string, ann: TopicAnnotation) {
-    setActiveNoteTopicId(topicId);
-    setEditingAnnotationId(ann.id);
-    setAuthor(ann.author ?? "Cuidador Principal");
-    setNoteType(ann.note_type);
-    setContactName(ann.contact_name ?? "");
-    setContactPhone(ann.contact_phone ?? "");
-    setEstimatedCost(
-      ann.estimated_cost !== null ? String(ann.estimated_cost) : ""
-    );
-    setNoteContent(ann.content);
+  function openAddAnnotation(topic: FollowUpTopicItem) {
+    setAnnTopic(topic);
+    setEditingAnn(null);
+    setAnnAuthor("");
+    setAnnType("UPDATE");
+    setAnnContactName("");
+    setAnnContactPhone("");
+    setAnnCost("");
+    setAnnContent("");
+    setAnnError(null);
   }
 
-  function resetAnnotationForm() {
-    setEditingAnnotationId(null);
-    setContactName("");
-    setContactPhone("");
-    setEstimatedCost("");
-    setNoteContent("");
-    setActiveNoteTopicId(null);
+  function openEditAnnotation(topic: FollowUpTopicItem, ann: TopicAnnotation) {
+    setAnnTopic(topic);
+    setEditingAnn(ann);
+    setAnnAuthor(ann.author ?? "");
+    setAnnType(ann.note_type);
+    setAnnContactName(ann.contact_name ?? "");
+    setAnnContactPhone(ann.contact_phone ?? "");
+    setAnnCost(ann.estimated_cost === null ? "" : String(ann.estimated_cost));
+    setAnnContent(ann.content);
+    setAnnError(null);
   }
 
-  async function handleSaveAnnotation(e: FormEvent, topicId: string) {
+  async function handleAnnotationSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!noteContent.trim()) return;
-    setSavingNote(true);
+    if (!annTopic) return;
+    setAnnError(null);
+    if (!annContent.trim()) {
+      setAnnError("Escribe el contenido de la anotacion.");
+      return;
+    }
+    const payload = {
+      author: annAuthor.trim(),
+      note_type: annType,
+      contact_name: annContactName.trim(),
+      contact_phone: annContactPhone.trim(),
+      estimated_cost: parseOptionalNonNeg(annCost),
+      content: annContent.trim(),
+    };
+    setSavingAnn(true);
     try {
-      const parsedCost =
-        estimatedCost.trim() !== "" && Number.isFinite(Number(estimatedCost))
-          ? Number(estimatedCost)
-          : null;
-      if (editingAnnotationId) {
-        await onUpdateAnnotation(editingAnnotationId, {
-          author: author.trim() || "Cuidador",
-          note_type: noteType,
-          contact_name: contactName.trim(),
-          contact_phone: contactPhone.trim(),
-          estimated_cost: parsedCost,
-          content: noteContent.trim(),
-        });
+      if (editingAnn) {
+        await onUpdateAnnotation(editingAnn.id, payload);
       } else {
-        await onAddAnnotation({
-          topic_id: topicId,
-          author: author.trim() || "Cuidador",
-          note_type: noteType,
-          contact_name: contactName.trim(),
-          contact_phone: contactPhone.trim(),
-          estimated_cost: parsedCost,
-          content: noteContent.trim(),
-        });
+        await onAddAnnotation({ topic_id: annTopic.id, ...payload });
       }
-      resetAnnotationForm();
+      setAnnTopic(null);
+      setEditingAnn(null);
+    } catch (err) {
+      setAnnError(
+        err instanceof Error ? err.message : "No se pudo guardar la anotacion."
+      );
     } finally {
-      setSavingNote(false);
+      setSavingAnn(false);
     }
   }
 
-  function startConvertToEvent(topic: FollowUpTopicItem) {
-    setConvertingTopicId(topic.id);
-    setEvtTitle(topic.title.replace(/^Valorar\s+/i, ""));
-    setEvtCategory("APPOINTMENT");
-    setEvtSpecialist("");
-    setEvtCost(
-      topic.estimated_budget !== null ? String(topic.estimated_budget) : ""
+  function openConvert(topic: FollowUpTopicItem) {
+    setConvertTopic(topic);
+    setCvTitle(topic.title);
+    setCvCategory("APPOINTMENT");
+    setCvSpecialist("");
+    setCvLocation("");
+    setCvDatetime(toLocalDateTimeInput(topic.deadline_at));
+    setCvCost(
+      topic.estimated_budget === null ? "" : String(topic.estimated_budget)
     );
-    setEvtMarkDone(true);
+    setCvPrep("");
+    setCvMarkCompleted(true);
+    setCvError(null);
   }
 
-  async function handleConvertSubmit(e: FormEvent, topic: FollowUpTopicItem) {
+  async function handleConvertSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!evtTitle.trim()) return;
-    setConvertingBusy(true);
+    if (!convertTopic) return;
+    setCvError(null);
+    if (!cvTitle.trim()) {
+      setCvError("Ingresa el titulo del evento.");
+      return;
+    }
+    const dt = new Date(cvDatetime);
+    if (Number.isNaN(dt.getTime())) {
+      setCvError("Selecciona una fecha y hora validas.");
+      return;
+    }
+    setSavingCv(true);
     try {
-      const parsedCost =
-        evtCost.trim() !== "" && Number.isFinite(Number(evtCost))
-          ? Number(evtCost)
-          : null;
       await onConvertToEvent({
-        topic_id: topic.id,
-        title: evtTitle.trim(),
-        category: evtCategory,
-        specialist_or_center: evtSpecialist.trim() || null,
-        location_address: null,
-        event_datetime: new Date(evtDatetime).toISOString(),
-        estimated_cost: parsedCost,
-        preparation_instructions: topic.description,
-        mark_topic_completed: evtMarkDone,
+        topic_id: convertTopic.id,
+        title: cvTitle.trim(),
+        category: cvCategory,
+        specialist_or_center: cvSpecialist.trim() || null,
+        location_address: cvLocation.trim() || null,
+        event_datetime: dt.toISOString(),
+        estimated_cost: parseOptionalNonNeg(cvCost),
+        preparation_instructions: cvPrep.trim() || null,
+        mark_topic_completed: cvMarkCompleted,
       });
-      setConvertingTopicId(null);
+      setConvertTopic(null);
+    } catch (err) {
+      setCvError(
+        err instanceof Error ? err.message : "No se pudo agendar el evento."
+      );
     } finally {
-      setConvertingBusy(false);
+      setSavingCv(false);
     }
   }
 
-  function renderTopicCard(topic: FollowUpTopicItem) {
-    const isAddingNote = activeNoteTopicId === topic.id;
-    const isConverting = convertingTopicId === topic.id;
+  function renderDeleteControl(
+    key: string,
+    label: string,
+    onConfirm: () => Promise<void>
+  ) {
+    if (!isAdmin) return null;
+    if (confirmDeleteKey === key) {
+      return (
+        <div className="inline-flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={busyKey === key}
+            onClick={() =>
+              runBusy(key, async () => {
+                await onConfirm();
+                setConfirmDeleteKey(null);
+              })
+            }
+            className="clinical-btn px-3 bg-[#991B1B] text-white text-[12px] font-bold"
+          >
+            Confirmar
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDeleteKey(null)}
+            className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white text-[#334155] text-[12px]"
+          >
+            No
+          </button>
+        </div>
+      );
+    }
     return (
-      <article key={topic.id} className="clinical-card p-5 space-y-4">
-        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-[#E2E8F0] pb-3">
-          <div className="space-y-1.5">
+      <IconActionButton
+        icon={Trash2}
+        label={label}
+        tone="danger"
+        onClick={() => setConfirmDeleteKey(key)}
+      />
+    );
+  }
+
+  function renderTopic(topic: FollowUpTopicItem) {
+    const daysLeft = getDaysUntil(topic.deadline_at);
+    const isCompleted = topic.status === "COMPLETED";
+    const overdue = !isCompleted && daysLeft < 0;
+
+    return (
+      <article
+        key={topic.id}
+        className={cn(
+          "clinical-card p-5 space-y-3",
+          overdue && "border-[#FECACA] bg-[#FEF2F2]/35"
+        )}
+      >
+        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+          <div className="space-y-2 flex-1 min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <StatusBadge
-                label={PRIORITY_TAG[topic.priority] ?? "[NORMAL]"}
-                tone={
-                  topic.priority === 1
-                    ? "crit"
-                    : topic.priority === 2
-                    ? "warn"
-                    : "neutral"
-                }
+                label={PRIORITY_TAG[topic.priority] ?? "[PRIORIDAD]"}
+                tone={topic.priority === 1 ? "crit" : topic.priority === 2 ? "warn" : "neutral"}
               />
               <StatusBadge
                 label={TASK_STATUS_TAG[topic.status]}
-                tone={topic.status === "COMPLETED" ? "ok" : "info"}
+                tone={isCompleted ? "ok" : "info"}
               />
-              {topic.estimated_budget !== null && (
+              {!isCompleted && (
                 <StatusBadge
-                  label={`PRESUPUESTO: ${formatCurrencyMxn(
-                    topic.estimated_budget
-                  )}`}
-                  tone="ok"
+                  label={
+                    overdue
+                      ? `[VENCIDO HACE ${Math.abs(daysLeft)}D]`
+                      : daysLeft === 0
+                      ? "[VENCE HOY]"
+                      : `[FALTAN ${daysLeft}D]`
+                  }
+                  tone={overdue || daysLeft <= 1 ? "crit" : daysLeft <= 7 ? "warn" : "neutral"}
                 />
               )}
             </div>
-            <h3 className="text-[18px] font-bold text-[#0F172A]">
+
+            <h3 className="text-[17px] font-bold text-[#0F172A]">
               {topic.title}
             </h3>
             {topic.description && (
-              <p className="text-[14px] text-[#475569] max-w-[70ch]">
-                {topic.description}
-              </p>
+              <p className="text-[14px] text-[#334155]">{topic.description}</p>
             )}
-            <p className="font-mono text-[13px] text-[#475569] tabular-nums">
-              Creacion: {formatDateTimeEs(topic.created_at)} | Fecha limite:{" "}
-              <strong className="text-[#0F172A]">
-                {formatDateTimeEs(topic.deadline_at)}
-              </strong>
-            </p>
-          </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <label htmlFor={`status-${topic.id}`} className="sr-only">
-              Estado de {topic.title}
-            </label>
-            <select
-              id={`status-${topic.id}`}
-              value={topic.status}
-              onChange={(e) =>
-                onUpdateTopic(topic.id, {
-                  status: e.target.value as TaskStatus,
-                })
-              }
-              className="h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px] bg-white font-medium"
-            >
-              <option value="PENDING">Pendiente</option>
-              <option value="IN_PROGRESS">En Curso</option>
-              <option value="WAITING_RESPONSE">Esperando Respuesta</option>
-              <option value="COMPLETED">Completado</option>
-            </select>
-
-            <label htmlFor={`progress-${topic.id}`} className="sr-only">
-              Progreso de {topic.title}
-            </label>
-            <select
-              id={`progress-${topic.id}`}
-              value={String(topic.progress_percentage)}
-              onChange={(e) =>
-                onUpdateTopic(topic.id, {
-                  progress_percentage: Number(e.target.value),
-                })
-              }
-              className="h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] bg-white tabular-nums"
-            >
-              {[0, 10, 20, 25, 40, 50, 60, 75, 80, 90, 100].map((pct) => (
-                <option key={pct} value={pct}>
-                  Progreso {pct}%
-                </option>
-              ))}
-            </select>
-
-            <button
-              type="button"
-              onClick={() => startEditTopic(topic)}
-              className="clinical-btn inline-flex items-center gap-1 px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px] font-medium"
-            >
-              <Edit3 className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
-              Editar
-            </button>
-
-            <button
-              type="button"
-              onClick={() =>
-                isConverting
-                  ? setConvertingTopicId(null)
-                  : startConvertToEvent(topic)
-              }
-              className="clinical-btn inline-flex items-center gap-1 px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0E7490] text-[13px] font-medium"
-              title="Convertir tema en una cita o estudio en Agenda Clinica"
-            >
-              <CalendarCheck2
-                className="w-3.5 h-3.5"
-                strokeWidth={1.75}
-                aria-hidden="true"
-              />
-              Agendar Cita
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                if (isAddingNote) {
-                  resetAnnotationForm();
-                } else {
-                  setEditingAnnotationId(null);
-                  setNoteContent("");
-                  setActiveNoteTopicId(topic.id);
-                }
-              }}
-              className="clinical-btn inline-flex items-center gap-1.5 px-3.5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[13px] font-bold"
-            >
-              <MessageSquarePlus
-                className="w-4 h-4"
-                strokeWidth={1.75}
-                aria-hidden="true"
-              />
-              {isAddingNote ? "Cerrar Nota" : "Agregar Anotacion"}
-            </button>
-
-            {confirmDeleteTopicId === topic.id ? (
-              <>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await onDeleteTopic(topic.id);
-                    setConfirmDeleteTopicId(null);
-                  }}
-                  className="clinical-btn px-3 bg-[#991B1B] text-white text-[13px] font-bold"
-                >
-                  Confirmar Borrar
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmDeleteTopicId(null)}
-                  className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white text-[13px]"
-                >
-                  No
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setConfirmDeleteTopicId(topic.id)}
-                className="clinical-btn px-2.5 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
-                aria-label={`Eliminar tema ${topic.title}`}
-              >
-                <Trash2
-                  className="w-4 h-4"
-                  strokeWidth={1.75}
-                  aria-hidden="true"
-                />
-              </button>
-            )}
-          </div>
-        </header>
-
-        {/* Barra de progreso */}
-        <div>
-          <div className="flex items-center justify-between text-[13px] font-mono text-[#334155] mb-1 tabular-nums">
-            <span>Avance de resolucion</span>
-            <span className="font-bold">{topic.progress_percentage}%</span>
-          </div>
-          <div className="h-2 w-full bg-[#E2E8F0] rounded-full overflow-hidden">
-            <div
-              className="h-full bg-[#0E7490]"
-              style={{ width: `${topic.progress_percentage}%` }}
-            />
-          </div>
-        </div>
-
-        {/* Recordatorios en cascada */}
-        <div className="space-y-1.5">
-          <span className="block text-[13px] font-medium text-[#475569]">
-            Recordatorios de fecha limite en Telegram (-7d, -3d, -1d, 0d)
-          </span>
-          <CascadeTimeline alerts={topic.cascade_alerts} />
-        </div>
-
-        {/* Convertir tema en evento clinico */}
-        {isConverting && (
-          <form
-            onSubmit={(e) => handleConvertSubmit(e, topic)}
-            className="p-4 bg-[#ECFEFF] border border-[#A5F3FC] rounded-[6px] space-y-3"
-          >
-            <h4 className="text-[15px] font-bold text-[#164E63]">
-              Agendar en Agenda Clinica desde este Tema
-            </h4>
-            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-              <div className="sm:col-span-2">
-                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
-                  Titulo de la cita / estudio *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={evtTitle}
-                  onChange={(e) => setEvtTitle(e.target.value)}
-                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-                />
-              </div>
-              <div>
-                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
-                  Categoria
-                </label>
-                <select
-                  value={evtCategory}
-                  onChange={(e) =>
-                    setEvtCategory(e.target.value as EventCategory)
-                  }
-                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-                >
-                  <option value="APPOINTMENT">Cita Medica</option>
-                  <option value="LAB_TEST">Estudio / Lab</option>
-                  <option value="PROCEDURE">Procedimiento</option>
-                  <option value="OTHER">Otro</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
-                  Costo estimado MXN
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={evtCost}
-                  onChange={(e) => setEvtCost(e.target.value)}
-                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[14px]"
-                />
-              </div>
-              <div className="sm:col-span-2">
-                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
-                  Fecha y hora
-                </label>
-                <input
-                  type="datetime-local"
-                  required
-                  value={evtDatetime}
-                  onChange={(e) => setEvtDatetime(e.target.value)}
-                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[14px]"
-                />
-              </div>
-              <div className="sm:col-span-2">
-                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
-                  Especialista o centro
-                </label>
-                <input
-                  type="text"
-                  value={evtSpecialist}
-                  onChange={(e) => setEvtSpecialist(e.target.value)}
-                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-                />
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <label className="inline-flex items-center gap-2 text-[13px] text-[#164E63] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={evtMarkDone}
-                  onChange={(e) => setEvtMarkDone(e.target.checked)}
-                  className="w-4 h-4 accent-[#0E7490]"
-                />
-                Marcar tema de seguimiento como COMPLETADO al agendar
-              </label>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setConvertingTopicId(null)}
-                  className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
-                >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  disabled={convertingBusy}
-                  className="clinical-btn px-4 bg-[#0E7490] text-white text-[13px] font-bold"
-                >
-                  {convertingBusy ? "Agendando..." : "Crear Evento en Agenda"}
-                </button>
-              </div>
-            </div>
-          </form>
-        )}
-
-        {/* Formulario inline de anotacion (crear / editar) */}
-        {isAddingNote && (
-          <form
-            onSubmit={(e) => handleSaveAnnotation(e, topic.id)}
-            className="p-4 bg-[#F8FAFC] border border-[#A5F3FC] rounded-[6px] space-y-3"
-          >
-            <h4 className="text-[15px] font-bold text-[#0F172A]">
-              {editingAnnotationId
-                ? "Editar Anotacion en Bitacora"
-                : "Registrar Propuesta, Contacto o Cotizacion en Bitacora"}
-            </h4>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-              <div>
-                <label
-                  htmlFor={`note-type-${topic.id}`}
-                  className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                >
-                  Tipo de registro
-                </label>
-                <select
-                  id={`note-type-${topic.id}`}
-                  value={noteType}
-                  onChange={(e) => setNoteType(e.target.value as NoteType)}
-                  className="w-full h-[44px] px-2.5 border border-[#CBD5E1] rounded-[6px] text-[14px] bg-white"
-                >
-                  <option value="PROPOSAL">Propuesta</option>
-                  <option value="CONTACT">Contacto / Clinica</option>
-                  <option value="QUOTE">Cotizacion / Costo</option>
-                  <option value="UPDATE">Actualizacion</option>
-                </select>
-              </div>
-
-              <div>
-                <label
-                  htmlFor={`note-author-${topic.id}`}
-                  className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                >
-                  Autor
-                </label>
-                <input
-                  id={`note-author-${topic.id}`}
-                  type="text"
-                  value={author}
-                  onChange={(e) => setAuthor(e.target.value)}
-                  className="w-full h-[44px] px-2.5 border border-[#CBD5E1] rounded-[6px] text-[14px] bg-white"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor={`note-contact-${topic.id}`}
-                  className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                >
-                  Especialista / Clinica
-                </label>
-                <input
-                  id={`note-contact-${topic.id}`}
-                  type="text"
-                  placeholder="Nombre o institucion"
-                  value={contactName}
-                  onChange={(e) => setContactName(e.target.value)}
-                  className="w-full h-[44px] px-2.5 border border-[#CBD5E1] rounded-[6px] text-[14px] bg-white"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor={`note-phone-${topic.id}`}
-                  className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                >
-                  Telefono
-                </label>
-                <input
-                  id={`note-phone-${topic.id}`}
-                  type="text"
-                  placeholder="+52 55 ..."
-                  value={contactPhone}
-                  onChange={(e) => setContactPhone(e.target.value)}
-                  className="w-full h-[44px] px-2.5 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] bg-white"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor={`note-cost-${topic.id}`}
-                  className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                >
-                  Costo estimado (MXN)
-                </label>
-                <input
-                  id={`note-cost-${topic.id}`}
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  placeholder="0.00"
-                  value={estimatedCost}
-                  onChange={(e) => setEstimatedCost(e.target.value)}
-                  className="w-full h-[44px] px-2.5 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] bg-white tabular-nums"
-                />
-              </div>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[13px] text-[#475569]">
+              <span>
+                Fecha limite:{" "}
+                <strong className="font-mono text-[#0F172A] tabular-nums">
+                  {formatDateTimeEs(topic.deadline_at)}
+                </strong>
+              </span>
+              {topic.estimated_budget !== null && (
+                <span>
+                  Presupuesto:{" "}
+                  <strong className="font-mono text-[#0F172A] tabular-nums">
+                    {formatCurrencyMxn(topic.estimated_budget)}
+                  </strong>
+                </span>
+              )}
             </div>
 
-            <div>
-              <label
-                htmlFor={`note-content-${topic.id}`}
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Detalle y notas de seguimiento
-              </label>
-              <textarea
-                id={`note-content-${topic.id}`}
-                rows={2}
-                required
-                placeholder="Resumen de llamada, condiciones, disponibilidad o acuerdos"
-                value={noteContent}
-                onChange={(e) => setNoteContent(e.target.value)}
-                className="w-full p-2.5 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
-              />
-            </div>
+            {/* Estado y avance inline */}
+            {!isCompleted && (
+              <div className="flex flex-wrap items-end gap-3 pt-1">
+                <div>
+                  <label
+                    htmlFor={`topic-status-${topic.id}`}
+                    className="block text-[12px] text-[#475569] mb-1"
+                  >
+                    Estado
+                  </label>
+                  <select
+                    id={`topic-status-${topic.id}`}
+                    value={topic.status}
+                    disabled={busyKey === `status:${topic.id}`}
+                    onChange={(e) =>
+                      runBusy(`status:${topic.id}`, () =>
+                        onUpdateTopic(topic.id, {
+                          status: e.target.value as TaskStatus,
+                        })
+                      )
+                    }
+                    className="clinical-input border border-[#CBD5E1] px-3 text-[13px] bg-white"
+                  >
+                    {STATUS_OPTIONS.map((s) => (
+                      <option key={s} value={s}>
+                        {TASK_STATUS_LABEL[s]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={resetAnnotationForm}
-                className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
-              >
-                Cancelar
-              </button>
-              <button
-                type="submit"
-                disabled={savingNote}
-                className="clinical-btn px-4 bg-[#0E7490] text-white text-[14px] font-bold"
-              >
-                {savingNote
-                  ? "Guardando..."
-                  : editingAnnotationId
-                  ? "Actualizar Anotacion"
-                  : "Guardar en Bitacora"}
-              </button>
-            </div>
-          </form>
-        )}
+                <div>
+                  <label
+                    htmlFor={`topic-progress-${topic.id}`}
+                    className="block text-[12px] text-[#475569] mb-1"
+                  >
+                    Avance
+                  </label>
+                  <select
+                    id={`topic-progress-${topic.id}`}
+                    value={Math.round(topic.progress_percentage)}
+                    disabled={busyKey === `progress:${topic.id}`}
+                    onChange={(e) =>
+                      runBusy(`progress:${topic.id}`, () =>
+                        onUpdateTopic(topic.id, {
+                          progress_percentage: Number(e.target.value),
+                        })
+                      )
+                    }
+                    className="clinical-input border border-[#CBD5E1] px-3 font-mono text-[13px] bg-white"
+                  >
+                    {progressOptionsFor(topic.progress_percentage).map((p) => (
+                      <option key={p} value={p}>
+                        {p}%
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-        {/* Bitacora Cronologica */}
-        <div className="space-y-2.5">
-          <h4 className="text-[14px] font-bold text-[#0F172A]">
-            Bitacora Cronologica ({topic.annotations.length})
-          </h4>
-          {topic.annotations.length === 0 ? (
-            <p className="text-[14px] text-[#64748B]">
-              Sin anotaciones registradas todavia.
-            </p>
-          ) : (
-            <div className="divide-y divide-[#E2E8F0] border border-[#E2E8F0] rounded-[6px] bg-[#F8FAFC]">
-              {topic.annotations.map((ann) => (
-                <div key={ann.id} className="p-3.5 space-y-1.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <StatusBadge
-                        label={NOTE_TYPE_TAG[ann.note_type]}
-                        tone="info"
-                      />
-                      {ann.contact_name && (
-                        <span className="font-bold text-[14px] text-[#0F172A]">
-                          {ann.contact_name}
-                        </span>
-                      )}
-                      {ann.contact_phone && (
-                        <span className="font-mono text-[13px] text-[#0E7490] tabular-nums">
-                          Tel: {ann.contact_phone}
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 font-mono text-[13px] tabular-nums">
-                      {ann.estimated_cost !== null && (
-                        <span className="font-bold text-[#0F172A]">
-                          Costo: {formatCurrencyMxn(ann.estimated_cost)}
-                        </span>
-                      )}
-                      <span className="text-[#64748B]">
-                        {formatDateTimeEs(ann.created_at)}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => startEditAnnotation(topic.id, ann)}
-                        className="px-2 py-1 border border-[#CBD5E1] bg-white rounded-[4px] text-[12px] font-sans"
-                      >
-                        Editar
-                      </button>
-                      {confirmDeleteAnnId === ann.id ? (
-                        <>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              await onDeleteAnnotation(ann.id);
-                              setConfirmDeleteAnnId(null);
-                            }}
-                            className="px-2 py-1 bg-[#991B1B] text-white rounded-[4px] text-[12px] font-sans font-bold"
-                          >
-                            Confirmar
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDeleteAnnId(null)}
-                            className="px-2 py-1 border border-[#CBD5E1] bg-white rounded-[4px] text-[12px] font-sans"
-                          >
-                            No
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDeleteAnnId(ann.id)}
-                          className="px-2 py-1 border border-[#FECACA] bg-white text-[#991B1B] rounded-[4px] text-[12px] font-sans"
-                        >
-                          Borrar
-                        </button>
-                      )}
-                    </div>
+                <div className="flex-1 min-w-[140px] pb-3">
+                  <div
+                    className="h-2 rounded-full bg-[#E2E8F0] overflow-hidden"
+                    role="progressbar"
+                    aria-valuenow={topic.progress_percentage}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label={`Avance de ${topic.title}`}
+                  >
+                    <div
+                      className="h-full bg-[#0E7490]"
+                      style={{ width: `${Math.min(100, Math.max(0, topic.progress_percentage))}%` }}
+                    />
                   </div>
-                  <p className="text-[14px] text-[#1E293B]">{ann.content}</p>
-                  {ann.author && (
-                    <p className="text-[13px] text-[#64748B]">
-                      Registrado por: {ann.author}
+                </div>
+              </div>
+            )}
+
+            {!isCompleted && topic.cascade_alerts.length > 0 && (
+              <div className="pt-1">
+                <p className="text-[12px] font-semibold text-[#475569] mb-1">
+                  {isAdmin
+                    ? "Recordatorios de fecha limite en Telegram (-7d, -3d, -1d, 0d)"
+                    : "Recordatorios programados (-7d, -3d, -1d, 0d)"}
+                </p>
+                <CascadeTimeline alerts={topic.cascade_alerts} />
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {isCompleted ? (
+              <IconActionButton
+                icon={RotateCcw}
+                label={`Reabrir tema ${topic.title}`}
+                tone="info"
+                loading={busyKey === `reopen:${topic.id}`}
+                onClick={() =>
+                  runBusy(`reopen:${topic.id}`, () =>
+                    onUpdateTopic(topic.id, { status: "IN_PROGRESS" })
+                  )
+                }
+              />
+            ) : (
+              <>
+                <IconActionButton
+                  icon={Check}
+                  label={`Marcar tema como completado: ${topic.title}`}
+                  tone="success"
+                  loading={busyKey === `done:${topic.id}`}
+                  onClick={() =>
+                    runBusy(`done:${topic.id}`, () =>
+                      onUpdateTopic(topic.id, {
+                        status: "COMPLETED",
+                        progress_percentage: 100,
+                      })
+                    )
+                  }
+                />
+                <IconActionButton
+                  icon={CalendarPlus}
+                  label={`Convertir en cita de la agenda: ${topic.title}`}
+                  tone="info"
+                  onClick={() => openConvert(topic)}
+                />
+              </>
+            )}
+            <IconActionButton
+              icon={MessageSquarePlus}
+              label={`Agregar anotacion a ${topic.title}`}
+              tone="neutral"
+              onClick={() => openAddAnnotation(topic)}
+            />
+            <IconActionButton
+              icon={Edit3}
+              label={`Editar tema ${topic.title}`}
+              tone="neutral"
+              onClick={() => openEditTopic(topic)}
+            />
+            {renderDeleteControl(
+              `topic:${topic.id}`,
+              `Eliminar tema ${topic.title}`,
+              () => onDeleteTopic(topic.id)
+            )}
+          </div>
+        </div>
+
+        {/* Bitacora de anotaciones */}
+        {topic.annotations.length > 0 && (
+          <div className="pt-3 border-t border-[#E2E8F0] space-y-2">
+            <p className="text-[12px] font-semibold text-[#475569]">
+              Bitacora ({topic.annotations.length})
+            </p>
+            {topic.annotations.map((ann) => (
+              <div
+                key={ann.id}
+                className="p-3 rounded-[6px] bg-[#F8FAFC] border border-[#E2E8F0] flex flex-wrap items-start justify-between gap-3"
+              >
+                <div className="space-y-1 flex-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#475569]">
+                    <StatusBadge label={NOTE_TYPE_TAG[ann.note_type]} tone="neutral" />
+                    <span className="font-mono tabular-nums">
+                      {formatDateTimeEs(ann.created_at)}
+                    </span>
+                    {ann.author && <span>por {ann.author}</span>}
+                  </div>
+                  <p className="text-[14px] text-[#0F172A] whitespace-pre-wrap break-words">
+                    {ann.content}
+                  </p>
+                  {(ann.contact_name || ann.contact_phone || ann.estimated_cost !== null) && (
+                    <p className="text-[12px] text-[#475569]">
+                      {ann.contact_name ? `Contacto: ${ann.contact_name} ` : ""}
+                      {ann.contact_phone ? `| Tel: ${ann.contact_phone} ` : ""}
+                      {ann.estimated_cost !== null
+                        ? `| Costo: ${formatCurrencyMxn(ann.estimated_cost)}`
+                        : ""}
                     </p>
                   )}
                 </div>
-              ))}
-            </div>
-          )}
-        </div>
+                <div className="flex items-center gap-2">
+                  <IconActionButton
+                    icon={Edit3}
+                    label="Editar anotacion"
+                    tone="neutral"
+                    onClick={() => openEditAnnotation(topic, ann)}
+                  />
+                  {renderDeleteControl(
+                    `ann:${ann.id}`,
+                    "Eliminar anotacion",
+                    () => onDeleteAnnotation(ann.id)
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </article>
     );
   }
 
   return (
-    <div className="space-y-6 clinical-enter">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 className="text-[20px] font-bold text-[#0F172A]">
-            Gestor de Temas de Seguimiento y Valoraciones
-          </h2>
-          <p className="text-[14px] text-[#475569]">
-            Casos abiertos, cotizaciones, contactos, conversion a cita medica y
-            gobernanza completa de bitacora.
-          </p>
+    <div className="space-y-5 clinical-enter">
+      <section className="clinical-card p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-[20px] font-bold text-[#0F172A]">
+              Temas de Seguimiento y Pendientes Medicos
+            </h2>
+            <p className="mt-1 text-[14px] text-[#475569]">
+              Tramites, cotizaciones, segundas opiniones y pendientes con fecha
+              limite, avance y bitacora de contactos.
+            </p>
+          </div>
+          <IconActionButton
+            icon={Plus}
+            label="Crear nuevo tema de seguimiento"
+            shortLabel="Nuevo Tema"
+            tone="primary"
+            onClick={openCreateTopic}
+          />
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            if (showTopicForm && !editingTopicId) {
-              setShowTopicForm(false);
-            } else {
-              resetTopicForm();
-              setShowTopicForm(true);
-            }
-          }}
-          className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
+        <div
+          aria-label="Guia visual de acciones"
+          className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12px] text-[#475569] bg-[#F8FAFC] border border-[#E2E8F0] px-3 py-2 rounded-[6px] w-fit"
         >
-          <ClipboardPlus
-            className="w-4 h-4"
-            strokeWidth={1.75}
-            aria-hidden="true"
-          />
-          {showTopicForm ? "Cerrar Formulario" : "Nuevo Tema de Seguimiento"}
-        </button>
-      </div>
+          <span className="font-semibold text-[#0F172A]">Simbolos:</span>
+          <span className="inline-flex items-center gap-1">
+            <Check className="w-3.5 h-3.5 text-[#065F46]" aria-hidden="true" />
+            Completar
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <CalendarPlus className="w-3.5 h-3.5 text-[#0E7490]" aria-hidden="true" />
+            Convertir en cita
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <MessageSquarePlus className="w-3.5 h-3.5 text-[#334155]" aria-hidden="true" />
+            Anotar
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Edit3 className="w-3.5 h-3.5 text-[#334155]" aria-hidden="true" />
+            Editar
+          </span>
+          {isAdmin && (
+            <span className="inline-flex items-center gap-1">
+              <Trash2 className="w-3.5 h-3.5 text-[#991B1B]" aria-hidden="true" />
+              Eliminar
+            </span>
+          )}
+        </div>
+      </section>
 
-      {showTopicForm && (
-        <form
-          onSubmit={handleSaveTopic}
-          className="clinical-card p-5 space-y-4 border-[#A5F3FC]"
-        >
-          <h3 className="text-[16px] font-bold text-[#0F172A]">
-            {editingTopicId
-              ? `Editar Tema: ${title}`
-              : "Crear Caso o Pendiente Medico-Administrativo"}
-          </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="md:col-span-2">
-              <label
-                htmlFor="topic-title"
-                className="block text-[14px] font-medium text-[#0F172A] mb-1"
-              >
-                Titulo del tema *
-              </label>
-              <input
-                id="topic-title"
-                type="text"
-                required
-                placeholder="Ej. Valorar Consulta Psiquiatria CDMX"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
-              />
+      <section aria-label="Temas abiertos" className="space-y-3">
+        {snapshot.open_topics.length === 0 ? (
+          <div className="clinical-card p-8 text-center text-[14px] text-[#475569]">
+            No hay temas de seguimiento abiertos.
+          </div>
+        ) : (
+          snapshot.open_topics.map(renderTopic)
+        )}
+      </section>
+
+      {snapshot.completed_topics.length > 0 && (
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-[16px] font-bold text-[#0F172A]">
+              Temas Completados ({snapshot.completed_topics.length})
+            </h3>
+            <button
+              type="button"
+              onClick={() => setShowCompleted((v) => !v)}
+              className="text-[13px] font-semibold text-[#0E7490] hover:underline cursor-pointer"
+            >
+              {showCompleted ? "Ocultar" : "Mostrar"}
+            </button>
+          </div>
+          {showCompleted && snapshot.completed_topics.map(renderTopic)}
+        </section>
+      )}
+
+      {/* Modal Tema */}
+      <ClinicalModal
+        open={topicModalOpen}
+        onClose={() => !savingTopic && setTopicModalOpen(false)}
+        title={editingTopic ? `Editar Tema: ${editingTopic.title}` : "Nuevo Tema de Seguimiento"}
+        maxWidthClass="max-w-2xl"
+      >
+        <form onSubmit={handleTopicSubmit} className="space-y-4">
+          {topicError && (
+            <div role="alert" className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px] flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>{topicError}</span>
             </div>
-
+          )}
+          <div>
+            <label htmlFor="topic-title" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Titulo *
+            </label>
+            <input
+              id="topic-title"
+              type="text"
+              required
+              value={topicTitle}
+              onChange={(e) => setTopicTitle(e.target.value)}
+              className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+            />
+          </div>
+          <div>
+            <label htmlFor="topic-desc" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Descripcion
+            </label>
+            <textarea
+              id="topic-desc"
+              rows={3}
+              value={topicDescription}
+              onChange={(e) => setTopicDescription(e.target.value)}
+              className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]"
+            />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
             <div>
-              <label
-                htmlFor="topic-priority"
-                className="block text-[14px] font-medium text-[#0F172A] mb-1"
-              >
+              <label htmlFor="topic-priority" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
                 Prioridad
               </label>
               <select
                 id="topic-priority"
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
+                value={topicPriority}
+                onChange={(e) => setTopicPriority(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
               >
                 <option value="1">1 - Critica</option>
                 <option value="2">2 - Alta</option>
                 <option value="3">3 - Normal</option>
               </select>
             </div>
-
             <div>
-              <label
-                htmlFor="topic-deadline"
-                className="block text-[14px] font-medium text-[#0F172A] mb-1"
-              >
-                Fecha limite (alertas -7d/-3d/-1d/0d)
+              <label htmlFor="topic-deadline" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Fecha limite *
               </label>
               <input
                 id="topic-deadline"
                 type="datetime-local"
                 required
-                value={deadlineAt}
-                onChange={(e) => setDeadlineAt(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] tabular-nums"
+                value={topicDeadline}
+                onChange={(e) => setTopicDeadline(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
-
             <div>
-              <label
-                htmlFor="topic-budget"
-                className="block text-[14px] font-medium text-[#0F172A] mb-1"
-              >
-                Presupuesto de referencia (MXN opc.)
+              <label htmlFor="topic-budget" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Presupuesto (MXN)
               </label>
               <input
                 id="topic-budget"
                 type="number"
                 step="0.01"
                 min="0"
-                placeholder="Ej. 3000"
-                value={estimatedBudget}
-                onChange={(e) => setEstimatedBudget(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px]"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="topic-desc"
-                className="block text-[14px] font-medium text-[#0F172A] mb-1"
-              >
-                Descripcion y objetivos
-              </label>
-              <input
-                id="topic-desc"
-                type="text"
-                placeholder="Requisitos, ubicacion o documentos"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
+                value={topicBudget}
+                onChange={(e) => setTopicBudget(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
               />
             </div>
           </div>
-
-          {topicError && (
-            <p className="text-[14px] font-medium text-[#991B1B]" role="alert">
-              {topicError}
-            </p>
-          )}
-
-          <div className="flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={() => {
-                setShowTopicForm(false);
-                resetTopicForm();
-              }}
-              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
-            >
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button type="button" onClick={() => setTopicModalOpen(false)} className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]">
               Cancelar
             </button>
-            <button
-              type="submit"
-              disabled={savingTopic}
-              className="clinical-btn px-5 bg-[#0E7490] text-white text-[15px] font-bold"
-            >
-              {savingTopic
-                ? "Guardando..."
-                : editingTopicId
-                ? "Guardar Cambios"
-                : "Crear Tema y Programar Alertas"}
+            <button type="submit" disabled={savingTopic} className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold">
+              {savingTopic ? "Guardando..." : editingTopic ? "Guardar Cambios" : "Crear Tema"}
             </button>
           </div>
         </form>
-      )}
+      </ClinicalModal>
 
-      <section aria-label="Temas abiertos" className="space-y-4">
-        <h3 className="text-[16px] font-bold text-[#0F172A]">
-          Casos Activos ({snapshot.open_topics.length})
-        </h3>
-        {snapshot.open_topics.length === 0 ? (
-          <div className="clinical-card p-6 text-center text-[#475569]">
-            No hay temas abiertos en este momento.
+      {/* Modal Anotacion */}
+      <ClinicalModal
+        open={Boolean(annTopic)}
+        onClose={() => {
+          if (!savingAnn) {
+            setAnnTopic(null);
+            setEditingAnn(null);
+          }
+        }}
+        title={editingAnn ? "Editar Anotacion" : `Nueva Anotacion: ${annTopic?.title ?? ""}`}
+        maxWidthClass="max-w-xl"
+      >
+        <form onSubmit={handleAnnotationSubmit} className="space-y-4">
+          {annError && (
+            <div role="alert" className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]">
+              {annError}
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div>
+              <label htmlFor="ann-type" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Tipo
+              </label>
+              <select
+                id="ann-type"
+                value={annType}
+                onChange={(e) => setAnnType(e.target.value as NoteType)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
+              >
+                {NOTE_TYPES.map((t) => (
+                  <option key={t} value={t}>
+                    {NOTE_TYPE_TAG[t]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="ann-author" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Autor
+              </label>
+              <input id="ann-author" type="text" value={annAuthor} onChange={(e) => setAnnAuthor(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ann-contact" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Nombre de contacto
+              </label>
+              <input id="ann-contact" type="text" value={annContactName} onChange={(e) => setAnnContactName(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ann-phone" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Telefono
+              </label>
+              <input id="ann-phone" type="tel" value={annContactPhone} onChange={(e) => setAnnContactPhone(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ann-cost" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Costo cotizado (MXN)
+              </label>
+              <input id="ann-cost" type="number" step="0.01" min="0" value={annCost} onChange={(e) => setAnnCost(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
           </div>
-        ) : (
-          <div className="space-y-4">
-            {snapshot.open_topics.map(renderTopicCard)}
+          <div>
+            <label htmlFor="ann-content" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Contenido *
+            </label>
+            <textarea id="ann-content" rows={3} required value={annContent} onChange={(e) => setAnnContent(e.target.value)} className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]" />
           </div>
-        )}
-      </section>
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button type="button" onClick={() => { setAnnTopic(null); setEditingAnn(null); }} className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]">
+              Cancelar
+            </button>
+            <button type="submit" disabled={savingAnn} className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold">
+              {savingAnn ? "Guardando..." : "Guardar Anotacion"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
 
-      {snapshot.completed_topics.length > 0 && (
-        <section aria-label="Temas resueltos" className="space-y-4">
-          <h3 className="text-[16px] font-bold text-[#475569]">
-            Casos Resueltos ({snapshot.completed_topics.length})
-          </h3>
-          <div className="space-y-4">
-            {snapshot.completed_topics.map(renderTopicCard)}
+      {/* Modal Convertir a Evento */}
+      <ClinicalModal
+        open={Boolean(convertTopic)}
+        onClose={() => !savingCv && setConvertTopic(null)}
+        title={`Agendar en Agenda Clinica: ${convertTopic?.title ?? ""}`}
+        subtitle="Crea una cita formal con recordatorios a partir de este tema."
+        maxWidthClass="max-w-2xl"
+      >
+        <form onSubmit={handleConvertSubmit} className="space-y-4">
+          {cvError && (
+            <div role="alert" className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]">
+              {cvError}
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div className="sm:col-span-2">
+              <label htmlFor="cv-title" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Titulo *
+              </label>
+              <input id="cv-title" type="text" required value={cvTitle} onChange={(e) => setCvTitle(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="cv-category" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Categoria
+              </label>
+              <select id="cv-category" value={cvCategory} onChange={(e) => setCvCategory(e.target.value as EventCategory)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white">
+                {(["APPOINTMENT", "INJECTION", "LAB_TEST", "PROCEDURE", "OTHER"] as EventCategory[]).map((c) => (
+                  <option key={c} value={c}>
+                    {EVENT_CATEGORY_LABEL[c]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="cv-datetime" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Fecha y hora local *
+              </label>
+              <input id="cv-datetime" type="datetime-local" required value={cvDatetime} onChange={(e) => setCvDatetime(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="cv-specialist" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Especialista / Clinica
+              </label>
+              <input id="cv-specialist" type="text" value={cvSpecialist} onChange={(e) => setCvSpecialist(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="cv-location" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Direccion
+              </label>
+              <input id="cv-location" type="text" value={cvLocation} onChange={(e) => setCvLocation(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="cv-cost" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Costo estimado (MXN)
+              </label>
+              <input id="cv-cost" type="number" step="0.01" min="0" value={cvCost} onChange={(e) => setCvCost(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
           </div>
-        </section>
-      )}
+          <div>
+            <label htmlFor="cv-prep" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Instrucciones de preparacion
+            </label>
+            <textarea id="cv-prep" rows={2} value={cvPrep} onChange={(e) => setCvPrep(e.target.value)} className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]" />
+          </div>
+          <label className="flex items-center gap-2 text-[13px] font-medium text-[#0F172A] cursor-pointer">
+            <input type="checkbox" checked={cvMarkCompleted} onChange={(e) => setCvMarkCompleted(e.target.checked)} className="w-4 h-4 accent-[#0E7490]" />
+            Marcar el tema como completado al agendar
+          </label>
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button type="button" onClick={() => setConvertTopic(null)} className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]">
+              Cancelar
+            </button>
+            <button type="submit" disabled={savingCv} className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold">
+              {savingCv ? "Agendando..." : "Agendar Evento"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
     </div>
   );
 }

@@ -4,13 +4,19 @@ import { useState } from "react";
 import {
   AlertTriangle,
   CalendarClock,
+  Check,
   CheckCircle2,
   ClipboardList,
   Clock,
+  Clock3,
   FileWarning,
+  MessageSquarePlus,
+  MessageSquareText,
   PackagePlus,
+  RefreshCw,
   RotateCcw,
   Send,
+  SkipForward,
   Trash2,
   Wallet,
 } from "lucide-react";
@@ -33,11 +39,14 @@ import {
   formatDateTimeEs,
   formatShortTime,
   getDaysUntil,
+  getLocalDateIso,
 } from "@/lib/utils";
+import { IconActionButton } from "./IconActionButton";
 import { StatusBadge } from "./StatusBadge";
 
 interface CommandCenterViewProps {
   snapshot: CommandCenterSnapshot;
+  isAdmin: boolean;
   onSelectDate: (dateStr: string) => Promise<void>;
   onConfirmCluster: (clusterId: string, dateStr: string) => Promise<void>;
   onUpdateIntakeLog: (
@@ -55,18 +64,21 @@ interface CommandCenterViewProps {
       log_expense?: boolean;
     }
   ) => Promise<void>;
+  onGenerateTodayLogs: (dateStr?: string) => Promise<void>;
   onNavigateTab: (
-    tab: "inventory" | "finances" | "events" | "topics" | "dossier" | "telegram"
+    tab: "inventory" | "finances" | "events" | "topics" | "dossier"
   ) => void;
 }
 
 export function CommandCenterView({
   snapshot,
+  isAdmin,
   onSelectDate,
   onConfirmCluster,
   onUpdateIntakeLog,
   onDeleteIntakeLog,
   onRestockMedication,
+  onGenerateTodayLogs,
   onNavigateTab,
 }: CommandCenterViewProps) {
   const [restockTargetId, setRestockTargetId] = useState<string | null>(null);
@@ -81,8 +93,8 @@ export function CommandCenterView({
   );
   const [busyKey, setBusyKey] = useState<string | null>(null);
 
-  const todayIso = new Date().toISOString().slice(0, 10);
-  const yesterdayIso = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const todayIso = getLocalDateIso();
+  const yesterdayIso = getLocalDateIso(new Date(Date.now() - 86400000));
 
   const allItems = [
     ...snapshot.today_clusters.flatMap((c) => c.items),
@@ -105,6 +117,20 @@ export function CommandCenterView({
     }
   }
 
+  async function handleSingleStatusChange(
+    intakeLogId: string,
+    status: IntakeStatus
+  ) {
+    setBusyKey(`intake:${intakeLogId}`);
+    try {
+      await onUpdateIntakeLog(intakeLogId, status);
+    } catch {
+      // El toast global en ClinicalShell muestra el error
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
   async function handleRestockSubmit(medId: string) {
     const qty = Number(restockQty);
     if (!Number.isFinite(qty) || qty <= 0) return;
@@ -120,6 +146,8 @@ export function CommandCenterView({
       });
       setRestockTargetId(null);
       setRestockCost("");
+    } catch {
+      // El toast global muestra el error
     } finally {
       setBusyKey(null);
     }
@@ -131,6 +159,8 @@ export function CommandCenterView({
       await onUpdateIntakeLog(item.intake_log_id, item.status, obsText.trim());
       setEditingObsLogId(null);
       setObsText("");
+    } catch {
+      // Toast global muestra el error
     } finally {
       setBusyKey(null);
     }
@@ -139,6 +169,9 @@ export function CommandCenterView({
   function renderIntakeRow(item: ClusterIntakeItem) {
     const isEditingObs = editingObsLogId === item.intake_log_id;
     const isConfirmDelete = confirmDeleteLogId === item.intake_log_id;
+    const isRowBusy = busyKey === `intake:${item.intake_log_id}`;
+    const hasObs = Boolean(item.observations?.trim());
+
     return (
       <tr key={item.intake_log_id} className="bg-white hover:bg-[#F8FAFC]">
         <td className="py-3 px-4 align-top">
@@ -150,32 +183,35 @@ export function CommandCenterView({
               {item.active_ingredient}
             </div>
           )}
-          {item.observations && !isEditingObs && (
+          {hasObs && !isEditingObs && (
             <p className="mt-1 text-[13px] text-[#164E63] bg-[#ECFEFF] border border-[#A5F3FC] rounded-[4px] px-2 py-0.5 inline-block">
               Nota: {item.observations}
             </p>
           )}
           {isEditingObs && (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <div className="mt-2 flex flex-wrap items-center gap-2">
               <input
                 type="text"
-                placeholder="Motivo o observacion clinica"
+                placeholder="Motivo u observacion clinica"
+                aria-label={`Observacion para ${item.medication_name}`}
                 value={obsText}
                 onChange={(e) => setObsText(e.target.value)}
-                className="h-[38px] px-2.5 border border-[#CBD5E1] rounded-[6px] text-[13px] min-w-[200px]"
+                className="h-[42px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px] min-w-[200px] bg-white"
               />
               <button
                 type="button"
                 disabled={busyKey === `obs:${item.intake_log_id}`}
                 onClick={() => handleSaveObservation(item)}
-                className="px-2.5 h-[38px] rounded-[6px] bg-[#0E7490] text-white text-[13px] font-medium"
+                className="clinical-btn px-3 bg-[#0E7490] text-white text-[13px] font-semibold"
               >
-                Guardar
+                {busyKey === `obs:${item.intake_log_id}`
+                  ? "Guardando..."
+                  : "Guardar"}
               </button>
               <button
                 type="button"
                 onClick={() => setEditingObsLogId(null)}
-                className="px-2.5 h-[38px] rounded-[6px] border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
+                className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
               >
                 Cancelar
               </button>
@@ -220,7 +256,7 @@ export function CommandCenterView({
           )}
         </td>
         <td className="py-3 px-4 align-top text-right">
-          <div className="flex flex-wrap items-center justify-end gap-1.5">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <StatusBadge
               label={INTAKE_STATUS_TAG[item.status]}
               tone={
@@ -231,94 +267,101 @@ export function CommandCenterView({
                   : "neutral"
               }
             />
+
             {item.status === "PENDING" ? (
               <>
-                <button
-                  type="button"
+                <IconActionButton
+                  icon={Check}
+                  label={`Marcar ${item.medication_name} como tomado`}
+                  tone="primary"
+                  loading={isRowBusy}
                   onClick={() =>
-                    onUpdateIntakeLog(item.intake_log_id, "TAKEN")
+                    handleSingleStatusChange(item.intake_log_id, "TAKEN")
                   }
-                  className="clinical-btn px-2.5 text-[13px] font-bold border border-[#0E7490] bg-[#0E7490] hover:bg-[#155E75] text-white"
-                  aria-label={`Marcar ${item.medication_name} como tomado`}
-                >
-                  Tomado
-                </button>
-                <button
-                  type="button"
+                />
+                <IconActionButton
+                  icon={Clock3}
+                  label={`Posponer ${item.medication_name}`}
+                  tone="warn"
+                  loading={isRowBusy}
                   onClick={() =>
-                    onUpdateIntakeLog(item.intake_log_id, "DELAYED")
+                    handleSingleStatusChange(item.intake_log_id, "DELAYED")
                   }
-                  className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155]"
-                >
-                  Posponer
-                </button>
-                <button
-                  type="button"
+                />
+                <IconActionButton
+                  icon={SkipForward}
+                  label={`Omitir ${item.medication_name}`}
+                  tone="neutral"
+                  loading={isRowBusy}
                   onClick={() =>
-                    onUpdateIntakeLog(item.intake_log_id, "SKIPPED")
+                    handleSingleStatusChange(item.intake_log_id, "SKIPPED")
                   }
-                  className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155]"
-                >
-                  Omitir
-                </button>
+                />
               </>
             ) : (
-              <button
-                type="button"
+              <IconActionButton
+                icon={RotateCcw}
+                label={`Revertir ${item.medication_name} a pendiente (reembolsa stock)`}
+                tone="info"
+                loading={isRowBusy}
                 onClick={() =>
-                  onUpdateIntakeLog(item.intake_log_id, "PENDING")
+                  handleSingleStatusChange(item.intake_log_id, "PENDING")
                 }
-                className="clinical-btn inline-flex items-center gap-1 px-2.5 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A]"
-                title="Revertir a pendiente (reembolsa stock si estaba tomado)"
-              >
-                <RotateCcw
-                  className="w-3.5 h-3.5 text-[#0E7490]"
-                  strokeWidth={1.75}
-                  aria-hidden="true"
-                />
-                Revertir
-              </button>
+              />
             )}
-            <button
-              type="button"
+
+            <IconActionButton
+              icon={hasObs ? MessageSquareText : MessageSquarePlus}
+              label={
+                hasObs
+                  ? `Editar nota clinica (${item.medication_name})`
+                  : `Agregar nota clinica (${item.medication_name})`
+              }
+              tone="neutral"
+              active={isEditingObs || hasObs}
               onClick={() => {
                 setEditingObsLogId(isEditingObs ? null : item.intake_log_id);
                 setObsText(item.observations ?? "");
               }}
-              className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#475569]"
-            >
-              Nota
-            </button>
-            {isConfirmDelete ? (
-              <>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await onDeleteIntakeLog(item.intake_log_id);
-                    setConfirmDeleteLogId(null);
-                  }}
-                  className="clinical-btn px-2 text-[13px] bg-[#991B1B] text-white font-bold"
-                >
-                  Confirmar Borrar
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmDeleteLogId(null)}
-                  className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white text-[#334155]"
-                >
-                  No
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setConfirmDeleteLogId(item.intake_log_id)}
-                className="clinical-btn px-2 border border-[#E2E8F0] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
-                aria-label={`Eliminar registro de toma ${item.medication_name}`}
-              >
-                <Trash2 className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
-              </button>
-            )}
+            />
+
+            {isAdmin &&
+              (isConfirmDelete ? (
+                <div className="inline-flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={busyKey === `del:${item.intake_log_id}`}
+                    onClick={async () => {
+                      setBusyKey(`del:${item.intake_log_id}`);
+                      try {
+                        await onDeleteIntakeLog(item.intake_log_id);
+                        setConfirmDeleteLogId(null);
+                      } catch {
+                        // Toast global muestra error
+                      } finally {
+                        setBusyKey(null);
+                      }
+                    }}
+                    className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[12px] font-bold"
+                  >
+                    Confirmar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteLogId(null)}
+                    className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[#334155] text-[12px]"
+                  >
+                    No
+                  </button>
+                </div>
+              ) : (
+                <IconActionButton
+                  icon={Trash2}
+                  label={`Eliminar registro de toma ${item.medication_name}`}
+                  tone="danger"
+                  onClick={() => setConfirmDeleteLogId(item.intake_log_id)}
+                />
+              ))}
           </div>
         </td>
       </tr>
@@ -335,7 +378,7 @@ export function CommandCenterView({
         <div className="clinical-card p-4">
           <div className="flex items-center justify-between">
             <span className="text-[13px] font-medium text-[#475569]">
-              Adherencia ({snapshot.target_date})
+              Tomas de hoy ({snapshot.target_date})
             </span>
             <CheckCircle2
               className="w-4 h-4 text-[#0E7490]"
@@ -473,7 +516,7 @@ export function CommandCenterView({
             {snapshot.open_topics.length}
           </p>
           <p className="mt-1.5 text-[13px] text-[#475569]">
-            Casos abiertos con bitacora
+            Pendientes con bitacora
           </p>
         </button>
       </section>
@@ -503,7 +546,7 @@ export function CommandCenterView({
                 Pendientes:{" "}
                 {snapshot.incomplete_medications.map((m) => m.name).join(", ")}.
                 Sus tomas diarias funcionan con normalidad y podras integrarlos al
-                optimizador quincenal al completar estos datos.
+                plan quincenal al completar estos datos.
               </p>
             </div>
           </div>
@@ -512,7 +555,7 @@ export function CommandCenterView({
             onClick={() => onNavigateTab("inventory")}
             className="clinical-btn px-3.5 bg-white border border-[#F59E0B] text-[#92400E] hover:bg-[#FEF3C7] text-[14px] font-bold"
           >
-            Completar en Inventario
+            Completar en Medicamentos
           </button>
         </section>
       )}
@@ -538,8 +581,7 @@ export function CommandCenterView({
                   [ALERTA DE RESTOCK CRITICO] Cobertura igual o menor a 7 dias
                 </h2>
                 <p className="text-[14px] text-[#7F1D1D]">
-                  El umbral automatico en PostgreSQL detecto farmacos con menos
-                  de una semana de autonomia.
+                  Medicamentos con menos de una semana de autonomia restante.
                 </p>
               </div>
             </div>
@@ -596,8 +638,8 @@ export function CommandCenterView({
                           <input
                             id={`cmd-restock-${med.id}`}
                             type="number"
-                            min="1"
-                            step="1"
+                            min="0.01"
+                            step="any"
                             value={restockQty}
                             onChange={(e) => setRestockQty(e.target.value)}
                             className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] tabular-nums bg-white"
@@ -614,7 +656,7 @@ export function CommandCenterView({
                             id={`cmd-cost-${med.id}`}
                             type="number"
                             min="0"
-                            step="0.01"
+                            step="any"
                             placeholder={
                               med.package_price !== null
                                 ? String(med.package_price)
@@ -655,8 +697,11 @@ export function CommandCenterView({
                     </div>
                   ) : (
                     <div className="flex justify-end">
-                      <button
-                        type="button"
+                      <IconActionButton
+                        icon={PackagePlus}
+                        shortLabel="Restock"
+                        label={`Registrar restock de ${med.name}`}
+                        tone="danger"
                         onClick={() => {
                           setRestockTargetId(med.id);
                           setRestockQty(String(med.units_per_package ?? 30));
@@ -666,15 +711,7 @@ export function CommandCenterView({
                               : ""
                           );
                         }}
-                        className="clinical-btn inline-flex items-center gap-2 px-3 bg-[#991B1B] hover:bg-[#7F1D1D] text-white text-[14px] font-medium"
-                      >
-                        <PackagePlus
-                          className="w-4 h-4"
-                          strokeWidth={1.75}
-                          aria-hidden="true"
-                        />
-                        Registrar Restock
-                      </button>
+                      />
                     </div>
                   )}
                 </div>
@@ -699,8 +736,7 @@ export function CommandCenterView({
                 Bloques Horarios de Medicacion ({snapshot.target_date})
               </h2>
               <p className="text-[14px] text-[#475569]">
-                Confirmar, posponer, omitir, revertir tomas (con reembolso de stock)
-                o consultar dias anteriores.
+                Control rapido por simbolos para confirmar, posponer o anotar cada toma.
               </p>
             </div>
 
@@ -744,18 +780,74 @@ export function CommandCenterView({
             </div>
           </div>
 
+          {/* Leyenda de simbolos accesible en movil y escritorio */}
+          <div
+            aria-label="Guia de simbolos de control de toma"
+            className="clinical-card px-3.5 py-2.5 flex flex-wrap items-center gap-x-4 gap-y-2 text-[12px] text-[#334155] bg-white"
+          >
+            <span className="font-semibold text-[#0F172A]">Simbolos:</span>
+            <span className="inline-flex items-center gap-1.5">
+              <Check className="w-3.5 h-3.5 text-[#0E7490]" strokeWidth={2} aria-hidden="true" />
+              Tomado
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <Clock3 className="w-3.5 h-3.5 text-[#92400E]" strokeWidth={2} aria-hidden="true" />
+              Posponer
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <SkipForward className="w-3.5 h-3.5 text-[#475569]" strokeWidth={2} aria-hidden="true" />
+              Omitir
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <RotateCcw className="w-3.5 h-3.5 text-[#164E63]" strokeWidth={2} aria-hidden="true" />
+              Revertir
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <MessageSquarePlus className="w-3.5 h-3.5 text-[#334155]" strokeWidth={2} aria-hidden="true" />
+              Nota
+            </span>
+            {isAdmin && (
+              <span className="inline-flex items-center gap-1.5">
+                <Trash2 className="w-3.5 h-3.5 text-[#991B1B]" strokeWidth={2} aria-hidden="true" />
+                Eliminar
+              </span>
+            )}
+          </div>
+
+          {snapshot.resting_medications_today.length > 0 && (
+            <div className="px-4 py-2.5 rounded-[6px] border border-[#CBD5E1] bg-[#F1F5F9] text-[13px] text-[#334155] flex flex-wrap items-center gap-2">
+              <span className="font-bold text-[#0F172A]">
+                Sin toma programada para {snapshot.target_date}:
+              </span>
+              {snapshot.resting_medications_today.map((rm) => (
+                <StatusBadge
+                  key={rm.medication_id}
+                  label={`${rm.name} (${rm.active_days_label})`}
+                  tone="neutral"
+                />
+              ))}
+            </div>
+          )}
+
           {snapshot.today_clusters.length === 0 &&
           snapshot.unclustered_today_intakes.length === 0 ? (
-            <div className="clinical-card p-6 text-center text-[#475569]">
-              No hay tomas registradas para {snapshot.target_date}. Puedes
-              generar las tomas del dia desde Inventario Farmacologico.
+            <div className="clinical-card p-6 text-center space-y-3 text-[#475569]">
+              <p>No hay tomas registradas para {snapshot.target_date}.</p>
+              <button
+                type="button"
+                onClick={() => onGenerateTodayLogs(snapshot.target_date)}
+                className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
+              >
+                <RefreshCw className="w-4 h-4" strokeWidth={1.85} aria-hidden="true" />
+                Generar tomas para {snapshot.target_date}
+              </button>
             </div>
           ) : (
             <div className="space-y-4">
               {snapshot.today_clusters.map((block) => {
                 const isTaken = block.block_status === "TAKEN";
                 const isConfirming = busyKey === `cluster:${block.cluster_id}`;
-                const tg = block.telegram_notification;
+                const tg = isAdmin ? block.telegram_notification : null;
 
                 return (
                   <article
@@ -812,8 +904,8 @@ export function CommandCenterView({
                         />
                       </div>
 
-                      <div className="flex items-center gap-2">
-                        {tg && (
+                      {isAdmin && tg && (
+                        <div className="flex items-center gap-2">
                           <span className="inline-flex items-center gap-1.5 font-mono text-[13px] text-[#334155]">
                             <Send
                               className="w-3.5 h-3.5 text-[#0E7490]"
@@ -826,8 +918,8 @@ export function CommandCenterView({
                               ? "[TELEGRAM ENVIADO]"
                               : "[TELEGRAM EN COLA]"}
                           </span>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </header>
 
                     <div className="overflow-x-auto">
@@ -839,7 +931,7 @@ export function CommandCenterView({
                             <th className="py-2.5 px-3">Regla / Horario</th>
                             <th className="py-2.5 px-3">Stock Restante</th>
                             <th className="py-2.5 px-4 text-right">
-                              Estado y Gobernanza
+                              Estado y Control
                             </th>
                           </tr>
                         </thead>
@@ -909,7 +1001,7 @@ export function CommandCenterView({
                           <th className="py-2.5 px-3">Regla / Horario</th>
                           <th className="py-2.5 px-3">Stock Restante</th>
                           <th className="py-2.5 px-4 text-right">
-                            Estado y Gobernanza
+                            Estado y Control
                           </th>
                         </tr>
                       </thead>

@@ -8,8 +8,8 @@
     "start": "next start",
     "lint": "next lint",
     "verify": "tsx scripts/verify-system.ts",
-    "db:init": "tsx scripts/init-neon.ts",
-    "db:reset-seed": "tsx scripts/reset-and-seed.ts"
+    "db:init": "tsx --env-file-if-exists=.env.local scripts/init-neon.ts",
+    "db:reset-seed": "tsx --env-file-if-exists=.env.local scripts/reset-and-seed.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.14",

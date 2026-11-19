@@ -101,9 +101,10 @@ export const ALERT_STATUS_TAG: Record<AlertStatus, string> = {
 
 export const RECIPIENT_ROLE_TAG: Record<string, string> = {
   PATIENT: "[PACIENTE]",
-  PRIMARY_CAREGIVER: "[CUIDADOR PRINCIPAL]",
-  FAMILY_MEMBER: "[FAMILIAR]",
-  CAREGIVER: "[CUIDADOR]",
+  ADMIN: "[ADMINISTRADOR]",
+  PRIMARY_CAREGIVER: "[CUIDADOR ADMIN]",
+  FAMILY_MEMBER: "[FAMILIAR ADMIN]",
+  CAREGIVER: "[CUIDADOR ADMIN]",
 };
 
 export const EXPENSE_CATEGORY_LABEL: Record<ExpenseCategory, string> = {
@@ -152,6 +153,7 @@ export const AUDIT_ACTION_TAG: Record<string, string> = {
   UPDATE: "[EDICION]",
   ARCHIVE: "[ARCHIVADO]",
   RESTORE: "[RESTAURADO]",
+  VERSION_RESTORE: "[VERSION RESTAURADA]",
   DELETE: "[ELIMINADO]",
   RESTOCK: "[RESTOCK]",
   STOCK_ADJUST: "[AJUSTE STOCK]",
@@ -163,4 +165,15 @@ export const AUDIT_ACTION_TAG: Record<string, string> = {
   CONVERT_EVENT: "[CONVERTIDO A CITA]",
   RETRY: "[REINTENTO]",
   CANCEL: "[CANCELADO]",
+};
+
+export const VERSION_ACTION_LABEL: Record<string, string> = {
+  INITIAL_BASELINE: "Version base inicial",
+  CREATE: "Registro inicial",
+  UPDATE: "Edicion de esquema/datos",
+  RESTOCK: "Restock de inventario",
+  STOCK_ADJUST: "Ajuste manual de stock",
+  ARCHIVE: "Tratamiento archivado",
+  RESTORE: "Tratamiento reactivado",
+  VERSION_RESTORE: "Version restaurada por administrador",
 };

@@ -6,8 +6,9 @@ import {
   PRIORITY_TAG,
   TASK_STATUS_TAG,
 } from "@/lib/clinical-labels";
-import { GovernanceAuditService } from "./governance-audit.service";
+import { getClinicalDateParts } from "@/lib/utils";
 import type {
+  AlertMonitoringSettings,
   AlertStage,
   AlertStatus,
   EventCategory,
@@ -16,6 +17,7 @@ import type {
   TaskStatus,
   TelegramRecipient,
 } from "@/lib/types/clinical";
+import { GovernanceAuditService } from "./governance-audit.service";
 
 export const PATIENT_PERSISTENT_KEYBOARD = {
   keyboard: [
@@ -25,6 +27,23 @@ export const PATIENT_PERSISTENT_KEYBOARD = {
   resize_keyboard: true,
   is_persistent: true,
 };
+
+export const ADMIN_PERSISTENT_KEYBOARD = {
+  keyboard: [
+    [{ text: "[ Estado General ]" }, { text: "[ Reporte Semanal ]" }],
+    [{ text: "[ Proximas Citas ]" }, { text: "[ Cambios Recientes ]" }],
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+export function isPatientTelegramRole(role: string | null | undefined): boolean {
+  return (role ?? "").trim().toUpperCase() === "PATIENT";
+}
+
+export function isAdminTelegramRole(role: string | null | undefined): boolean {
+  return !isPatientTelegramRole(role);
+}
 
 export interface TelegramUpdatePayload {
   update_id?: number;
@@ -67,6 +86,9 @@ export interface UpsertRecipientInput {
   receive_restock_alerts?: boolean;
   receive_event_reminders?: boolean;
   receive_topic_reminders?: boolean;
+  receive_missed_block_alerts?: boolean;
+  receive_weekly_report?: boolean;
+  receive_change_alerts?: boolean;
   is_active?: boolean;
 }
 
@@ -75,7 +97,20 @@ export type RecipientToggleField =
   | "receive_restock_alerts"
   | "receive_event_reminders"
   | "receive_topic_reminders"
+  | "receive_missed_block_alerts"
+  | "receive_weekly_report"
+  | "receive_change_alerts"
   | "is_active";
+
+export type UpdateMonitoringSettingsInput = {
+  timezone: string;
+  missed_block_grace_mins: number;
+  missed_block_alerts_enabled: boolean;
+  weekly_report_enabled: boolean;
+  weekly_report_day: number;
+  weekly_report_hour: number;
+  notify_admin_on_patient_change: boolean;
+};
 
 type QueryExecutor = Pick<DbExecutor, "query">;
 
@@ -85,7 +120,7 @@ type QueuedNotificationRow = {
   source_id: string;
   stage: AlertStage;
   trigger_at: string;
-  trigger_date_utc: string;
+  trigger_date_local: string;
   status: AlertStatus;
   title: string;
   message: string;
@@ -109,7 +144,8 @@ interface InlineKeyboardMarkup {
 
 type TelegramReplyMarkup =
   | InlineKeyboardMarkup
-  | typeof PATIENT_PERSISTENT_KEYBOARD;
+  | typeof PATIENT_PERSISTENT_KEYBOARD
+  | typeof ADMIN_PERSISTENT_KEYBOARD;
 
 interface ClusterStateItem {
   name: string;
@@ -138,11 +174,28 @@ const UUID_REGEX =
 
 const DATE_STR_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
+const WEEKLY_REPORT_SOURCE_UUID = "00000000-0000-0000-0000-000000000001";
+
+const DEFAULT_MONITORING_SETTINGS: AlertMonitoringSettings = {
+  id: 1,
+  timezone: "America/Mexico_City",
+  missed_block_grace_mins: 60,
+  missed_block_alerts_enabled: true,
+  weekly_report_enabled: true,
+  weekly_report_day: 0,
+  weekly_report_hour: 20,
+  notify_admin_on_patient_change: true,
+  updated_at: new Date().toISOString(),
+};
+
 const TOGGLEABLE_COLUMNS: Record<RecipientToggleField, string> = {
   receive_med_reminders: "receive_med_reminders",
   receive_restock_alerts: "receive_restock_alerts",
   receive_event_reminders: "receive_event_reminders",
   receive_topic_reminders: "receive_topic_reminders",
+  receive_missed_block_alerts: "receive_missed_block_alerts",
+  receive_weekly_report: "receive_weekly_report",
+  receive_change_alerts: "receive_change_alerts",
   is_active: "is_active",
 };
 
@@ -167,10 +220,9 @@ function truncateCallbackData(raw: string, maxBytes = 64): string {
   return out;
 }
 
-function formatUtcHHMM(date = new Date()): string {
-  const hh = String(date.getUTCHours()).padStart(2, "0");
-  const mm = String(date.getUTCMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+function formatLocalHHMM(date = new Date()): string {
+  const parts = getClinicalDateParts("America/Mexico_City", date);
+  return `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
 }
 
 function getBotToken(): string | null {
@@ -190,21 +242,28 @@ function normalizeHttpOrigin(raw: string): string {
   return `https://${raw}`;
 }
 
-function recipientMatchesSourceType(
+export function recipientMatchesSourceType(
   recipient: TelegramRecipient,
   sourceType: string
 ): boolean {
+  const isAdmin = isAdminTelegramRole(recipient.role);
   switch (sourceType) {
     case "MEDICATION_INTAKE":
-      return recipient.receive_med_reminders;
+      return Boolean(recipient.receive_med_reminders);
     case "RESTOCK_ALERT":
-      return recipient.receive_restock_alerts;
+      return isAdmin && Boolean(recipient.receive_restock_alerts);
     case "CLINICAL_EVENT":
-      return recipient.receive_event_reminders;
+      return Boolean(recipient.receive_event_reminders);
     case "FOLLOW_UP_DEADLINE":
-      return recipient.receive_topic_reminders;
+      return isAdmin && Boolean(recipient.receive_topic_reminders);
+    case "MISSED_INTAKE_ALERT":
+      return isAdmin && Boolean(recipient.receive_missed_block_alerts);
+    case "WEEKLY_REPORT":
+      return isAdmin && Boolean(recipient.receive_weekly_report);
+    case "PATIENT_CHANGE_ALERT":
+      return isAdmin && Boolean(recipient.receive_change_alerts);
     default:
-      return true;
+      return isAdmin;
   }
 }
 
@@ -335,6 +394,64 @@ async function editTelegramMessageSafe(
 }
 
 export class TelegramNotificationService {
+  static async getMonitoringSettings(
+    executor: QueryExecutor = { query }
+  ): Promise<AlertMonitoringSettings> {
+    const res = await executor.query<AlertMonitoringSettings>(
+      `SELECT id, timezone, missed_block_grace_mins, missed_block_alerts_enabled,
+              weekly_report_enabled, weekly_report_day, weekly_report_hour,
+              notify_admin_on_patient_change, updated_at
+       FROM alert_monitoring_settings
+       WHERE id = 1
+       LIMIT 1`
+    );
+    return res.rows[0] ?? DEFAULT_MONITORING_SETTINGS;
+  }
+
+  static async updateMonitoringSettings(
+    input: UpdateMonitoringSettingsInput,
+    actor = "Admin Web"
+  ): Promise<AlertMonitoringSettings> {
+    const res = await query<AlertMonitoringSettings>(
+      `INSERT INTO alert_monitoring_settings (
+         id, timezone, missed_block_grace_mins, missed_block_alerts_enabled,
+         weekly_report_enabled, weekly_report_day, weekly_report_hour,
+         notify_admin_on_patient_change, updated_at
+       ) VALUES (
+         1, $1, $2, $3, $4, $5, $6, $7, NOW()
+       )
+       ON CONFLICT (id) DO UPDATE SET
+         timezone = EXCLUDED.timezone,
+         missed_block_grace_mins = EXCLUDED.missed_block_grace_mins,
+         missed_block_alerts_enabled = EXCLUDED.missed_block_alerts_enabled,
+         weekly_report_enabled = EXCLUDED.weekly_report_enabled,
+         weekly_report_day = EXCLUDED.weekly_report_day,
+         weekly_report_hour = EXCLUDED.weekly_report_hour,
+         notify_admin_on_patient_change = EXCLUDED.notify_admin_on_patient_change,
+         updated_at = NOW()
+       RETURNING *`,
+      [
+        input.timezone.trim() || "America/Mexico_City",
+        input.missed_block_grace_mins,
+        input.missed_block_alerts_enabled,
+        input.weekly_report_enabled,
+        input.weekly_report_day,
+        input.weekly_report_hour,
+        input.notify_admin_on_patient_change,
+      ]
+    );
+    const updated = res.rows[0];
+    await GovernanceAuditService.log({
+      entity_type: "TELEGRAM_MONITORING",
+      entity_id: "1",
+      entity_label: "Monitoreo Admin Telegram",
+      action: "SETTINGS_UPDATE",
+      actor,
+      summary: `Monitoreo actualizado: tolerancia bloque atrasado ${updated.missed_block_grace_mins} min, reporte semanal dia ${updated.weekly_report_day} a las ${updated.weekly_report_hour}:00.`,
+    });
+    return updated;
+  }
+
   static formatClusterMedicationHtml(
     label: string,
     timeHHMM: string,
@@ -516,7 +633,7 @@ export class TelegramNotificationService {
        JOIN medications m ON m.id = il.medication_id
        LEFT JOIN intake_clusters ic ON ic.id = il.cluster_id
        WHERE il.cluster_id = $1::uuid
-         AND (il.scheduled_for AT TIME ZONE 'UTC')::date = $2::date
+         AND (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $2::date
        ORDER BY m.name ASC`,
       [clusterId, dateStr]
     );
@@ -563,11 +680,465 @@ export class TelegramNotificationService {
     };
   }
 
+  /**
+   * Detecta bloques horarios vencidos (+ grace_mins) que siguen PENDING hoy y encola alerta exclusiva para Administradores.
+   */
+  static async evaluateMissedBlockAlerts(
+    now: Date = new Date(),
+    options?: { graceOverrideMins?: number }
+  ): Promise<{ queued: number }> {
+    const settings = await this.getMonitoringSettings();
+    if (!settings.missed_block_alerts_enabled && options?.graceOverrideMins === undefined) {
+      return { queued: 0 };
+    }
+
+    const graceMins =
+      options?.graceOverrideMins ?? settings.missed_block_grace_mins ?? 60;
+    const tz = settings.timezone || "America/Mexico_City";
+    const { dateStr, totalMinutes } = getClinicalDateParts(tz, now);
+
+    const pendingBlocksRes = await query<{
+      cluster_id: string;
+      cluster_label: string;
+      anchor_time: string;
+      med_name: string;
+      dose: string;
+    }>(
+      `SELECT
+         ic.id AS cluster_id,
+         ic.label AS cluster_label,
+         ic.anchor_time::text AS anchor_time,
+         m.name AS med_name,
+         (il.quantity_deducted::float8 || ' ' || m.presentation) AS dose
+       FROM intake_logs il
+       JOIN intake_clusters ic ON ic.id = il.cluster_id
+       JOIN medications m ON m.id = il.medication_id
+       WHERE (il.scheduled_for AT TIME ZONE $2)::date = $1::date
+         AND il.status = 'PENDING'
+         AND ic.is_active = TRUE
+         AND m.is_active = TRUE
+       ORDER BY ic.anchor_time ASC, m.name ASC`,
+      [dateStr, tz]
+    );
+
+    const byCluster = new Map<
+      string,
+      { label: string; anchorTime: string; items: Array<{ name: string; dose: string }> }
+    >();
+    for (const r of pendingBlocksRes.rows) {
+      const existing = byCluster.get(r.cluster_id) ?? {
+        label: r.cluster_label,
+        anchorTime: r.anchor_time,
+        items: [],
+      };
+      existing.items.push({ name: r.med_name, dose: r.dose });
+      byCluster.set(r.cluster_id, existing);
+    }
+
+    let queued = 0;
+
+    for (const [clusterId, block] of byCluster.entries()) {
+      const [hhStr, mmStr] = block.anchorTime.split(":");
+      const anchorMinutes = Number(hhStr) * 60 + Number(mmStr || 0);
+      if (totalMinutes < anchorMinutes + graceMins) {
+        continue;
+      }
+
+      const hhmm = block.anchorTime.slice(0, 5);
+      const idempotencyKey = `MISSED_CLUSTER_${clusterId}_${dateStr}`;
+      const callbackPayload = truncateCallbackData(
+        `ack_missed:${clusterId}:${dateStr}`
+      );
+      const itemLines = block.items
+        .map((it, idx) => `${idx + 1}. <b>${escapeHtml(it.name)}</b> (${escapeHtml(it.dose)})`)
+        .join("\n");
+
+      const message = [
+        `<b>[ALERTA ADMIN - BLOQUE NO MARCADO COMO TOMADO]</b>`,
+        `No se marco como tomado el <b>${escapeHtml(block.label)}</b> (${hhmm}).`,
+        `Tiempo transcurrido desde la hora ancla: >= ${graceMins} minutos.`,
+        "----------------------------------------",
+        itemLines,
+        "----------------------------------------",
+        "Por favor verificar directamente con el paciente.",
+      ].join("\n");
+
+      const insRes = await query<{ id: string }>(
+        `INSERT INTO notification_queue (
+           source_type, source_id, stage, trigger_at, status,
+           title, message, callback_action_payload, idempotency_key
+         ) VALUES (
+           'MISSED_INTAKE_ALERT', $1::uuid, 'EXACT_TIME', NOW(), 'QUEUED',
+           $2, $3, $4, $5
+         )
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING id`,
+        [
+          clusterId,
+          `[NO MARCADO - ${hhmm}] ${block.label}`,
+          message,
+          callbackPayload,
+          idempotencyKey,
+        ]
+      );
+      if (insRes.rowCount > 0) {
+        queued += 1;
+      }
+    }
+
+    return { queued };
+  }
+
+  /**
+   * Programa el reporte semanal automatico si corresponde al dia y hora configurados.
+   */
+  static async evaluateWeeklyReportSchedule(
+    now: Date = new Date(),
+    forceNow = false
+  ): Promise<{ queued: boolean; idempotencyKey?: string }> {
+    const settings = await this.getMonitoringSettings();
+    if (!settings.weekly_report_enabled && !forceNow) {
+      return { queued: false };
+    }
+
+    const tz = settings.timezone || "America/Mexico_City";
+    const parts = getClinicalDateParts(tz, now);
+
+    if (
+      !forceNow &&
+      (parts.dayOfWeek !== settings.weekly_report_day ||
+        parts.hour < settings.weekly_report_hour)
+    ) {
+      return { queued: false };
+    }
+
+    const idempotencyKey = forceNow
+      ? `WEEKLY_REPORT_MANUAL_${Date.now()}`
+      : `WEEKLY_REPORT_${parts.isoWeekKey}`;
+    const callbackPayload = truncateCallbackData(
+      `ack_report:${parts.isoWeekKey}`
+    );
+
+    const existing = await query<{ id: string }>(
+      `SELECT id FROM notification_queue WHERE idempotency_key = $1 LIMIT 1`,
+      [idempotencyKey]
+    );
+    if (existing.rows.length > 0) {
+      return { queued: false };
+    }
+
+    const reportHtml = await this.generateWeeklyBehaviorReportHtml();
+
+    await query(
+      `INSERT INTO notification_queue (
+         source_type, source_id, stage, trigger_at, status,
+         title, message, callback_action_payload, idempotency_key
+       ) VALUES (
+         'WEEKLY_REPORT', $1::uuid, 'DAY_OF', NOW(), 'QUEUED',
+         $2, $3, $4, $5
+       )
+       ON CONFLICT (idempotency_key) DO NOTHING`,
+      [
+        WEEKLY_REPORT_SOURCE_UUID,
+        `[REPORTE SEMANAL DE SEGUIMIENTO - ${parts.isoWeekKey}]`,
+        reportHtml,
+        callbackPayload,
+        idempotencyKey,
+      ]
+    );
+
+    return { queued: true, idempotencyKey };
+  }
+
+  static async queueWeeklyReportNow(actor = "Admin Web"): Promise<{
+    dispatched: number;
+    reportHtml: string;
+  }> {
+    const reportHtml = await this.generateWeeklyBehaviorReportHtml();
+    const parts = getClinicalDateParts("America/Mexico_City");
+    const idempotencyKey = `WEEKLY_REPORT_MANUAL_${Date.now()}`;
+    await query(
+      `INSERT INTO notification_queue (
+         source_type, source_id, stage, trigger_at, status,
+         title, message, callback_action_payload, idempotency_key
+       ) VALUES (
+         'WEEKLY_REPORT', $1::uuid, 'DAY_OF', NOW(), 'QUEUED',
+         $2, $3, $4, $5
+       )`,
+      [
+        WEEKLY_REPORT_SOURCE_UUID,
+        `[REPORTE SEMANAL DE SEGUIMIENTO - ${parts.dateStr}]`,
+        reportHtml,
+        truncateCallbackData(`ack_report:${parts.isoWeekKey}`),
+        idempotencyKey,
+      ]
+    );
+    await GovernanceAuditService.log({
+      entity_type: "WEEKLY_REPORT",
+      entity_id: parts.isoWeekKey,
+      entity_label: "Reporte Semanal Admin",
+      action: "CREATE",
+      actor,
+      summary: `Reporte semanal de comportamiento del paciente generado manualmente por ${actor}.`,
+    });
+    const res = await this.dispatchQueuedNotifications();
+    return { dispatched: res.dispatched, reportHtml };
+  }
+
+  static async generateWeeklyBehaviorReportHtml(): Promise<string> {
+    const parts = getClinicalDateParts("America/Mexico_City");
+    const [
+      globalRes,
+      byClusterRes,
+      byMedRes,
+      patientChangesRes,
+      lowStockRes,
+      eventsRes,
+    ] = await Promise.all([
+      query<{
+        total: number;
+        taken: number;
+        delayed: number;
+        skipped: number;
+        pending: number;
+      }>(
+        `SELECT
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE status = 'TAKEN')::int AS taken,
+           COUNT(*) FILTER (WHERE status = 'DELAYED')::int AS delayed,
+           COUNT(*) FILTER (WHERE status = 'SKIPPED')::int AS skipped,
+           COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending
+         FROM intake_logs
+         WHERE scheduled_for >= NOW() - INTERVAL '7 days'`
+      ),
+      query<{
+        cluster_label: string;
+        anchor_time: string;
+        total: number;
+        taken: number;
+      }>(
+        `SELECT
+           COALESCE(ic.label, 'Horario Dedicado') AS cluster_label,
+           COALESCE(ic.anchor_time::text, '00:00') AS anchor_time,
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE il.status = 'TAKEN')::int AS taken
+         FROM intake_logs il
+         LEFT JOIN intake_clusters ic ON ic.id = il.cluster_id
+         WHERE il.scheduled_for >= NOW() - INTERVAL '7 days'
+         GROUP BY ic.label, ic.anchor_time
+         ORDER BY anchor_time ASC`
+      ),
+      query<{
+        med_name: string;
+        total: number;
+        taken: number;
+        pending_or_missed: number;
+      }>(
+        `SELECT
+           m.name AS med_name,
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE il.status = 'TAKEN')::int AS taken,
+           COUNT(*) FILTER (WHERE il.status IN ('PENDING', 'SKIPPED'))::int AS pending_or_missed
+         FROM intake_logs il
+         JOIN medications m ON m.id = il.medication_id
+         WHERE il.scheduled_for >= NOW() - INTERVAL '7 days'
+         GROUP BY m.name
+         ORDER BY (COUNT(*) FILTER (WHERE il.status = 'TAKEN'))::float / GREATEST(1, COUNT(*)) ASC, m.name ASC`
+      ),
+      query<{
+        med_name: string;
+        version_number: number;
+        change_action: string;
+        change_summary: string;
+        reviewed_by_admin: boolean;
+      }>(
+        `SELECT
+           m.name AS med_name,
+           mv.version_number,
+           mv.change_action,
+           mv.change_summary,
+           mv.reviewed_by_admin
+         FROM medication_versions mv
+         JOIN medications m ON m.id = mv.medication_id
+         WHERE mv.created_at >= NOW() - INTERVAL '7 days'
+           AND mv.changed_by_role = 'PATIENT'
+         ORDER BY mv.created_at DESC
+         LIMIT 10`
+      ),
+      query<{
+        name: string;
+        current_stock: number | null;
+        presentation: string;
+        days_of_supply_remaining: number | null;
+      }>(
+        `SELECT
+           name,
+           current_stock::float8 AS current_stock,
+           presentation,
+           days_of_supply_remaining::float8 AS days_of_supply_remaining
+         FROM medications
+         WHERE is_active = TRUE
+           AND (
+             (days_of_supply_remaining IS NOT NULL AND days_of_supply_remaining <= 7)
+             OR current_stock IS NULL
+           )
+         ORDER BY days_of_supply_remaining ASC NULLS LAST, name ASC`
+      ),
+      query<{
+        title: string;
+        event_datetime: string;
+        date_is_estimated: boolean;
+      }>(
+        `SELECT title, event_datetime::text AS event_datetime, date_is_estimated
+         FROM clinical_events
+         WHERE is_completed = FALSE
+           AND event_datetime <= NOW() + INTERVAL '14 days'
+         ORDER BY event_datetime ASC
+         LIMIT 8`
+      ),
+    ]);
+
+    const g = globalRes.rows[0] ?? {
+      total: 0,
+      taken: 0,
+      delayed: 0,
+      skipped: 0,
+      pending: 0,
+    };
+    const adherencePct =
+      g.total > 0 ? Math.round((g.taken / g.total) * 100) : 100;
+
+    const lines: string[] = [
+      `<b>[REPORTE SEMANAL DE SEGUIMIENTO - ${escapeHtml(parts.dateStr)}]</b>`,
+      "========================================",
+      `<b>1. ADHERENCIA GLOBAL (ULTIMOS 7 DIAS): ${adherencePct}%</b>`,
+      `- Tomas confirmadas: <b>${g.taken}/${g.total}</b>`,
+      `- Pospuestas: ${g.delayed} | Omitidas: ${g.skipped} | Sin marcar: ${g.pending}`,
+      "----------------------------------------",
+      "<b>2. CUMPLIMIENTO POR BLOQUE HORARIO</b>",
+    ];
+
+    if (byClusterRes.rows.length === 0) {
+      lines.push("<code>[SIN REGISTROS] Sin tomas evaluadas en los ultimos 7 dias.</code>");
+    } else {
+      for (const cl of byClusterRes.rows) {
+        const pct = cl.total > 0 ? Math.round((cl.taken / cl.total) * 100) : 100;
+        lines.push(
+          `- <code>[${escapeHtml(cl.anchor_time.slice(0, 5))}]</code> <b>${escapeHtml(cl.cluster_label)}</b>: ${cl.taken}/${cl.total} (${pct}%)`
+        );
+      }
+    }
+
+    lines.push("----------------------------------------");
+    lines.push("<b>3. DETALLE POR MEDICAMENTO (7 DIAS)</b>");
+    for (const m of byMedRes.rows) {
+      const pct = m.total > 0 ? Math.round((m.taken / m.total) * 100) : 100;
+      lines.push(
+        `- <b>${escapeHtml(m.med_name)}</b>: ${m.taken}/${m.total} (${pct}%)`
+      );
+    }
+
+    lines.push("----------------------------------------");
+    lines.push("<b>4. CAMBIOS REALIZADOS POR EL PACIENTE (7 DIAS)</b>");
+    if (patientChangesRes.rows.length === 0) {
+      lines.push("<code>[SIN CAMBIOS] El paciente no edito ni reabastecio medicinas manualmente.</code>");
+    } else {
+      for (const ch of patientChangesRes.rows) {
+        const tag = ch.reviewed_by_admin ? "[REVISADO]" : "[PENDIENTE REVISION]";
+        lines.push(
+          `<code>${tag}</code> <b>${escapeHtml(ch.med_name)} (v${ch.version_number})</b>: ${escapeHtml(ch.change_summary)}`
+        );
+      }
+    }
+
+    lines.push("----------------------------------------");
+    lines.push("<b>5. INVENTARIO CRITICO / PENDIENTE</b>");
+    if (lowStockRes.rows.length === 0) {
+      lines.push("<code>[OK] Cobertura superior a 7 dias en todo el catalogo.</code>");
+    } else {
+      for (const ls of lowStockRes.rows) {
+        lines.push(
+          ls.current_stock === null
+            ? `- <code>[PENDIENTE]</code> <b>${escapeHtml(ls.name)}</b> (stock/precio por completar)`
+            : `- <code>[CRITICO]</code> <b>${escapeHtml(ls.name)}</b>: ${ls.current_stock} ${escapeHtml(ls.presentation)} (${ls.days_of_supply_remaining}d)`
+        );
+      }
+    }
+
+    lines.push("----------------------------------------");
+    lines.push("<b>6. CITAS E INYECCIONES PROXIMOS 14 DIAS</b>");
+    if (eventsRes.rows.length === 0) {
+      lines.push("<code>[SIN EVENTOS] Sin citas programadas en los proximos 14 dias.</code>");
+    } else {
+      for (const ev of eventsRes.rows) {
+        const dt = ev.event_datetime.slice(0, 16).replace("T", " ");
+        const flag = ev.date_is_estimated ? "[ESTIMADA]" : "[OFICIAL]";
+        lines.push(
+          `- <code>${flag}</code> <b>${escapeHtml(ev.title)}</b> | ${escapeHtml(dt)}`
+        );
+      }
+    }
+
+    lines.push("========================================");
+    return lines.join("\n");
+  }
+
+  static async generateRecentChangesHtml(): Promise<string> {
+    const res = await query<{
+      med_name: string;
+      version_number: number;
+      change_action: string;
+      changed_by_role: string;
+      changed_by_actor: string;
+      change_summary: string;
+      reviewed_by_admin: boolean;
+      created_at: string;
+    }>(
+      `SELECT
+         m.name AS med_name,
+         mv.version_number,
+         mv.change_action,
+         mv.changed_by_role,
+         mv.changed_by_actor,
+         mv.change_summary,
+         mv.reviewed_by_admin,
+         mv.created_at::text AS created_at
+       FROM medication_versions mv
+       JOIN medications m ON m.id = mv.medication_id
+       ORDER BY mv.created_at DESC
+       LIMIT 10`
+    );
+
+    const lines: string[] = [
+      "<b>[CONTROL DE CAMBIOS EN MEDICAMENTOS]</b>",
+      "----------------------------------------",
+    ];
+
+    if (res.rows.length === 0) {
+      lines.push("<code>[SIN CAMBIOS] No se han registrado ediciones recientes.</code>");
+    } else {
+      for (const row of res.rows) {
+        const tag = row.reviewed_by_admin ? "[REVISADO]" : "[REVISAR]";
+        lines.push(
+          `<code>${tag}</code> <b>${escapeHtml(row.med_name)} (v${row.version_number})</b> | ${escapeHtml(row.changed_by_actor)}\n  ${escapeHtml(row.change_summary)}`
+        );
+      }
+    }
+
+    lines.push("----------------------------------------");
+    lines.push("Usa Inventario > Historial en el panel web para restaurar cualquier version.");
+    return lines.join("\n");
+  }
+
   static async dispatchQueuedNotifications(): Promise<{
     dispatched: number;
     failed: number;
     mode: "LIVE_TELEGRAM" | "SIMULATED_LOCAL";
   }> {
+    // Evaluar primero bloques no marcados como tomados y calendario de reporte semanal
+    await this.evaluateMissedBlockAlerts().catch(() => {});
+    await this.evaluateWeeklyReportSchedule().catch(() => {});
+
     const botToken = getBotToken();
     const mode: "LIVE_TELEGRAM" | "SIMULATED_LOCAL" = botToken
       ? "LIVE_TELEGRAM"
@@ -576,7 +1147,7 @@ export class TelegramNotificationService {
     return withTransaction(async (tx) => {
       const queueRes = await tx.query<QueuedNotificationRow>(
         `SELECT *,
-           (trigger_at AT TIME ZONE 'UTC')::date::text AS trigger_date_utc
+           (trigger_at AT TIME ZONE 'America/Mexico_City')::date::text AS trigger_date_local
          FROM notification_queue
          WHERE status = 'QUEUED'
            AND trigger_at <= NOW()
@@ -603,13 +1174,19 @@ export class TelegramNotificationService {
       let simOffset = 0;
 
       for (const notif of queueRes.rows) {
-        let htmlBody = `<b>${escapeHtml(notif.title)}</b>\n${notif.message}`;
+        let htmlBody =
+          notif.source_type === "WEEKLY_REPORT" ||
+          notif.source_type === "MISSED_INTAKE_ALERT" ||
+          notif.source_type === "PATIENT_CHANGE_ALERT"
+            ? notif.message
+            : `<b>${escapeHtml(notif.title)}</b>\n${notif.message}`;
         let replyMarkup: InlineKeyboardMarkup;
         let updatedMessageText: string | null = null;
 
         if (notif.source_type === "MEDICATION_INTAKE") {
           const triggerDate =
-            notif.trigger_date_utc || new Date().toISOString().slice(0, 10);
+            notif.trigger_date_local ||
+            getClinicalDateParts("America/Mexico_City").dateStr;
           const clusterState = await this.getClusterStateForDate(
             notif.source_id,
             triggerDate,
@@ -759,7 +1336,7 @@ export class TelegramNotificationService {
   }
 
   static async generateEstadoHtml(): Promise<string> {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = getClinicalDateParts("America/Mexico_City").dateStr;
 
     const [pendingRes, lowStockRes, pendingDataRes, eventsRes, topicsRes] = await Promise.all([
       query<{
@@ -774,7 +1351,7 @@ export class TelegramNotificationService {
         `SELECT
            il.cluster_id,
            ic.label AS cluster_label,
-           COALESCE(ic.anchor_time::text, (il.scheduled_for AT TIME ZONE 'UTC')::time::text) AS anchor_time,
+           COALESCE(ic.anchor_time::text, (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::time::text) AS anchor_time,
            m.name AS med_name,
            il.quantity_deducted::float8 AS quantity_deducted,
            m.presentation,
@@ -782,7 +1359,7 @@ export class TelegramNotificationService {
          FROM intake_logs il
          JOIN medications m ON m.id = il.medication_id
          LEFT JOIN intake_clusters ic ON ic.id = il.cluster_id
-         WHERE (il.scheduled_for AT TIME ZONE 'UTC')::date = $1::date
+         WHERE (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $1::date
            AND il.status = 'PENDING'
            AND m.is_active = TRUE
          ORDER BY anchor_time ASC, m.name ASC`,
@@ -1091,6 +1668,18 @@ export class TelegramNotificationService {
     }
   }
 
+  private static async resolveRecipientByChat(
+    chatOrUserId: string
+  ): Promise<TelegramRecipientRow | null> {
+    const res = await query<TelegramRecipientRow>(
+      `SELECT * FROM telegram_recipients
+       WHERE telegram_chat_id = $1 AND is_active = TRUE
+       LIMIT 1`,
+      [chatOrUserId]
+    );
+    return res.rows[0] ?? null;
+  }
+
   static async handleWebhookUpdate(
     update: TelegramUpdatePayload,
     secretTokenHeader?: string | null,
@@ -1119,6 +1708,12 @@ export class TelegramNotificationService {
       const cq = update.callback_query;
       const data = (cq.data ?? "").trim();
       const fromId = String(cq.from.id);
+      const senderRec = await this.resolveRecipientByChat(fromId);
+      const isAdminSender = senderRec ? isAdminTelegramRole(senderRec.role) : false;
+      const actorDisplay = senderRec
+        ? `${senderRec.full_name} (${isAdminSender ? "Admin Telegram" : "Paciente Telegram"})`
+        : `telegram:${fromId}`;
+
       const parts = data.split(":");
       const prefix = parts[0] ?? "";
       const isSimulatedCallback = cq.id?.startsWith("sim_") ?? false;
@@ -1131,7 +1726,7 @@ export class TelegramNotificationService {
             text,
           });
         } catch {
-          // No interrumpir confirmacion en base de datos si Telegram rechaza respuesta efimera
+          // No interrumpir confirmacion en DB
         }
       };
 
@@ -1175,7 +1770,7 @@ export class TelegramNotificationService {
         const result = await DoseClusteringService.confirmClusterIntake(
           clusterId,
           dateStr,
-          fromId,
+          actorDisplay,
           { origin: "TELEGRAM" }
         );
 
@@ -1186,13 +1781,20 @@ export class TelegramNotificationService {
                acknowledged_by_chat_id = $3
            WHERE (
              (source_type = 'MEDICATION_INTAKE' AND source_id = $1::uuid AND idempotency_key = $2)
+             OR idempotency_key = $5
              OR callback_action_payload = $4
            )
              AND status != 'ACKNOWLEDGED'`,
-          [clusterId, `CLUSTER_${clusterId}_${dateStr}`, fromId, data]
+          [
+            clusterId,
+            `CLUSTER_${clusterId}_${dateStr}`,
+            fromId,
+            data,
+            `MISSED_CLUSTER_${clusterId}_${dateStr}`,
+          ]
         );
 
-        const hhmm = formatUtcHHMM();
+        const hhmm = formatLocalHHMM();
         const clusterState = await this.getClusterStateForDate(
           clusterId,
           dateStr
@@ -1248,8 +1850,8 @@ export class TelegramNotificationService {
                recorded_by = $2
            WHERE id = $1::uuid
              AND status = 'PENDING'
-           RETURNING cluster_id, (scheduled_for AT TIME ZONE 'UTC')::date::text AS date_str`,
-          [intakeLogId, fromId]
+           RETURNING cluster_id, (scheduled_for AT TIME ZONE 'America/Mexico_City')::date::text AS date_str`,
+          [intakeLogId, actorDisplay]
         );
 
         const wasNewlyTaken = updateRes.rows.length > 0;
@@ -1260,7 +1862,7 @@ export class TelegramNotificationService {
             cluster_id: string | null;
             date_str: string;
           }>(
-            `SELECT cluster_id, (scheduled_for AT TIME ZONE 'UTC')::date::text AS date_str
+            `SELECT cluster_id, (scheduled_for AT TIME ZONE 'America/Mexico_City')::date::text AS date_str
              FROM intake_logs
              WHERE id = $1::uuid
              LIMIT 1`,
@@ -1279,7 +1881,7 @@ export class TelegramNotificationService {
         }
 
         if (!logMeta.cluster_id) {
-          const hhmm = formatUtcHHMM();
+          const hhmm = formatLocalHHMM();
           const statusHtml = `<b>[TOMA INDIVIDUAL CONFIRMADA]</b>\n<code>[CONFIRMADO VIA TELEGRAM - ${hhmm}]</code>`;
           await editCurrentMessageSafe(statusHtml, { inline_keyboard: [] });
           await answerSafe(
@@ -1366,7 +1968,7 @@ export class TelegramNotificationService {
           };
         }
 
-        const hhmm = formatUtcHHMM();
+        const hhmm = formatLocalHHMM();
         const statusHtml = `${this.formatClusterStateHtml(
           clusterState.label,
           clusterState.timeHHMM,
@@ -1379,11 +1981,15 @@ export class TelegramNotificationService {
            SET status = 'ACKNOWLEDGED',
                acknowledged_at = NOW(),
                acknowledged_by_chat_id = $3,
-               message = $4
-           WHERE source_type = 'MEDICATION_INTAKE'
-             AND source_id = $1::uuid
-             AND idempotency_key = $2`,
-          [clusterId, idempotencyKey, fromId, statusHtml]
+               message = CASE WHEN idempotency_key = $2 THEN $4 ELSE message END
+           WHERE idempotency_key IN ($2, $5)`,
+          [
+            clusterId,
+            idempotencyKey,
+            fromId,
+            statusHtml,
+            `MISSED_CLUSTER_${clusterId}_${dateStr}`,
+          ]
         );
 
         await editCurrentMessageSafe(statusHtml, { inline_keyboard: [] });
@@ -1502,17 +2108,20 @@ export class TelegramNotificationService {
         const updatedMed = await DoseClusteringService.restockMedication(
           medId,
           qty,
-          `telegram:${fromId}`,
-          { origin: "TELEGRAM" }
+          actorDisplay,
+          {
+            origin: "TELEGRAM",
+            role: isAdminSender ? "ADMIN" : "PATIENT",
+          }
         );
         safeRevalidateHome();
 
-        const hhmm = formatUtcHHMM();
+        const hhmm = formatLocalHHMM();
         const statusHtml = [
           `<b>[RESTOCK CONFIRMADO +${qty}]</b>`,
           `Medicamento: ${escapeHtml(updatedMed.name)}`,
           `Nuevo inventario: ${updatedMed.current_stock} ${escapeHtml(updatedMed.presentation)}`,
-          `Cobertura estimada: ${updatedMed.days_of_supply_remaining} dias`,
+          `Cobertura estimada: ${updatedMed.days_of_supply_remaining ?? "--"} dias`,
           `<code>[CONFIRMADO VIA TELEGRAM - ${hhmm}]</code>`,
         ].join("\n");
 
@@ -1577,9 +2186,15 @@ export class TelegramNotificationService {
         };
       }
 
-      if (prefix === "ack_notif" && parts[1]) {
+      if (
+        (prefix === "ack_notif" ||
+          prefix === "ack_missed" ||
+          prefix === "ack_report" ||
+          prefix === "ack_change") &&
+        parts[1]
+      ) {
         const sourceOrId = parts[1];
-        if (UUID_REGEX.test(sourceOrId)) {
+        if (prefix === "ack_notif" && UUID_REGEX.test(sourceOrId)) {
           await query(
             `UPDATE notification_queue
              SET status = 'ACKNOWLEDGED',
@@ -1601,6 +2216,16 @@ export class TelegramNotificationService {
           );
         }
 
+        if (prefix === "ack_change" && UUID_REGEX.test(parts[1]) && isAdminSender) {
+          await query(
+            `UPDATE medication_versions
+             SET reviewed_by_admin = TRUE,
+                 reviewed_at = COALESCE(reviewed_at, NOW())
+             WHERE id = $1::uuid`,
+            [parts[1]]
+          );
+        }
+
         await answerSafe("[CONFIRMADO] Recepcion registrada.");
         return {
           ok: true,
@@ -1619,40 +2244,137 @@ export class TelegramNotificationService {
 
     const msgText = update.message?.text?.trim() ?? "";
     const chatId = update.message?.chat?.id;
+    const fromId = update.message?.from?.id ?? chatId;
 
     if (chatId !== undefined && msgText) {
+      const senderRec =
+        (await this.resolveRecipientByChat(String(chatId))) ??
+        (fromId !== undefined
+          ? await this.resolveRecipientByChat(String(fromId))
+          : null);
+      const isAdminSender = senderRec
+        ? isAdminTelegramRole(senderRec.role)
+        : false;
+      const defaultKeyboard = isAdminSender
+        ? ADMIN_PERSISTENT_KEYBOARD
+        : PATIENT_PERSISTENT_KEYBOARD;
+
       const normalizedCmd =
         msgText.split(/\s+/)[0]?.split("@")[0]?.toLowerCase() ?? "";
 
       if (normalizedCmd === "/start" || normalizedCmd === "/menu") {
-        const statusHtml = [
-          "<b>[TERMINAL CLINICA DEL PACIENTE]</b>",
-          "----------------------------------------",
-          "Control operativo de medicacion, inventario y citas medicas.",
-          "Utilice el teclado inferior para operar sin escribir:",
-          "- <b>[ Tomas de Hoy ]</b> (/tomas): Confirmar bloques o tomas individuales",
-          "- <b>[ Registrar Restock ]</b> (/restock): Sumar envases o unidades al inventario",
-          "- <b>[ Proximas Citas ]</b> (/citas): Consultar agenda de eventos clinicos",
-          "- <b>[ Estado de Inventario ]</b> (/estado): Reporte clinico consolidado",
-        ].join("\n");
+        const statusHtml = isAdminSender
+          ? [
+              "<b>[CONSOLA ADMINISTRATIVA DE SEGUIMIENTO]</b>",
+              "----------------------------------------",
+              "Supervision de adherencia, reportes semanales, alertas de bloques atrasados y revision de cambios.",
+              "- <b>[ Estado General ]</b> (/estado): Resumen clinico consolidado",
+              "- <b>[ Reporte Semanal ]</b> (/reporte): Adherencia y comportamiento 7d",
+              "- <b>[ Proximas Citas ]</b> (/citas): Agenda de consultas y estudios",
+              "- <b>[ Cambios Recientes ]</b> (/cambios): Historial de cambios en medicinas",
+              "- Comandos de apoyo al paciente: /tomas y /restock",
+            ].join("\n")
+          : [
+              "<b>[TERMINAL CLINICA DEL PACIENTE]</b>",
+              "----------------------------------------",
+              "Control operativo de medicacion, inventario y citas medicas.",
+              "Utilice el teclado inferior para operar sin escribir:",
+              "- <b>[ Tomas de Hoy ]</b> (/tomas): Confirmar bloques o tomas individuales",
+              "- <b>[ Registrar Restock ]</b> (/restock): Sumar envases o unidades al inventario",
+              "- <b>[ Proximas Citas ]</b> (/citas): Consultar agenda de eventos clinicos",
+              "- <b>[ Estado de Inventario ]</b> (/estado): Reporte clinico consolidado",
+            ].join("\n");
 
         await sendTelegramMessageSafe(
           botToken,
           chatId,
           statusHtml,
-          PATIENT_PERSISTENT_KEYBOARD
+          defaultKeyboard
         );
 
         return {
           ok: true,
           action: "menu",
-          message: "[MENU] Teclado persistente de paciente enviado.",
+          message: isAdminSender
+            ? "[MENU ADMIN] Teclado administrativo enviado."
+            : "[MENU] Teclado persistente de paciente enviado.",
+          statusHtml,
+        };
+      }
+
+      // Comandos exclusivos de Administrador (para Paciente, responde menu normal sin revelar funciones)
+      if (msgText === "[ Reporte Semanal ]" || normalizedCmd === "/reporte") {
+        if (!isAdminSender) {
+          const patientHtml = [
+            "<b>[TERMINAL CLINICA DEL PACIENTE]</b>",
+            "Utiliza los botones de Tomas de Hoy, Registrar Restock, Proximas Citas o Estado de Inventario.",
+          ].join("\n");
+          await sendTelegramMessageSafe(
+            botToken,
+            chatId,
+            patientHtml,
+            PATIENT_PERSISTENT_KEYBOARD
+          );
+          return {
+            ok: true,
+            action: "menu",
+            message: "[MENU] Opciones de paciente mostradas.",
+            statusHtml: patientHtml,
+          };
+        }
+
+        const statusHtml = await this.generateWeeklyBehaviorReportHtml();
+        await sendTelegramMessageSafe(
+          botToken,
+          chatId,
+          statusHtml,
+          ADMIN_PERSISTENT_KEYBOARD
+        );
+        return {
+          ok: true,
+          action: "weekly_report",
+          message: "[REPORTE SEMANAL] Resumen de comportamiento 7d generado.",
+          statusHtml,
+        };
+      }
+
+      if (msgText === "[ Cambios Recientes ]" || normalizedCmd === "/cambios") {
+        if (!isAdminSender) {
+          const patientHtml = [
+            "<b>[TERMINAL CLINICA DEL PACIENTE]</b>",
+            "Utiliza los botones de Tomas de Hoy, Registrar Restock, Proximas Citas o Estado de Inventario.",
+          ].join("\n");
+          await sendTelegramMessageSafe(
+            botToken,
+            chatId,
+            patientHtml,
+            PATIENT_PERSISTENT_KEYBOARD
+          );
+          return {
+            ok: true,
+            action: "menu",
+            message: "[MENU] Opciones de paciente mostradas.",
+            statusHtml: patientHtml,
+          };
+        }
+
+        const statusHtml = await this.generateRecentChangesHtml();
+        await sendTelegramMessageSafe(
+          botToken,
+          chatId,
+          statusHtml,
+          ADMIN_PERSISTENT_KEYBOARD
+        );
+        return {
+          ok: true,
+          action: "recent_changes",
+          message: "[CAMBIOS RECIENTES] Historial de versiones en medicamentos enviado.",
           statusHtml,
         };
       }
 
       if (msgText === "[ Tomas de Hoy ]" || normalizedCmd === "/tomas") {
-        const todayStr = new Date().toISOString().slice(0, 10);
+        const todayStr = getClinicalDateParts("America/Mexico_City").dateStr;
 
         const logsRes = await query<{
           intake_log_id: string;
@@ -1678,7 +2400,7 @@ export class TelegramNotificationService {
            FROM intake_logs il
            JOIN intake_clusters ic ON ic.id = il.cluster_id
            JOIN medications m ON m.id = il.medication_id
-           WHERE (il.scheduled_for AT TIME ZONE 'UTC')::date = $1::date
+           WHERE (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $1::date
              AND il.cluster_id IS NOT NULL
            ORDER BY ic.anchor_time ASC, m.name ASC`,
           [todayStr]
@@ -1737,11 +2459,11 @@ export class TelegramNotificationService {
              il.quantity_deducted::float8 AS quantity_deducted,
              m.presentation,
              m.intake_rule,
-             COALESCE(ms.effective_clustered_time::text, (il.scheduled_for AT TIME ZONE 'UTC')::time::text) AS scheduled_time
+             COALESCE(ms.effective_clustered_time::text, (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::time::text) AS scheduled_time
            FROM intake_logs il
            JOIN medications m ON m.id = il.medication_id
            LEFT JOIN medication_schedules ms ON ms.id = il.schedule_id
-           WHERE (il.scheduled_for AT TIME ZONE 'UTC')::date = $1::date
+           WHERE (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = $1::date
              AND il.cluster_id IS NULL
              AND il.status = 'PENDING'
              AND m.is_active = TRUE
@@ -1760,7 +2482,7 @@ export class TelegramNotificationService {
             botToken,
             chatId,
             statusHtml,
-            PATIENT_PERSISTENT_KEYBOARD
+            defaultKeyboard
           );
           return {
             ok: true,
@@ -1822,7 +2544,7 @@ export class TelegramNotificationService {
           const callbackPayload = truncateCallbackData(
             `ack_cluster:${cluster.clusterId}:${todayStr}`
           );
-          const triggerAt = `${todayStr} ${cluster.anchorTime}+00`;
+          const triggerLocalStr = `${todayStr} ${cluster.anchorTime}`;
 
           const upsertRes = await query<{
             id: string;
@@ -1832,8 +2554,9 @@ export class TelegramNotificationService {
                source_type, source_id, stage, trigger_at, status,
                title, message, callback_action_payload, idempotency_key
              ) VALUES (
-               'MEDICATION_INTAKE', $1::uuid, 'EXACT_TIME', $2::timestamptz, 'SENT',
-               $3, $4, $5, $6
+               'MEDICATION_INTAKE', $1::uuid, 'EXACT_TIME',
+               (($2::text)::timestamp AT TIME ZONE 'America/Mexico_City'),
+               'SENT', $3, $4, $5, $6
              )
              ON CONFLICT (idempotency_key) DO UPDATE
              SET message = EXCLUDED.message,
@@ -1844,7 +2567,7 @@ export class TelegramNotificationService {
              RETURNING id, telegram_message_ids`,
             [
               cluster.clusterId,
-              triggerAt,
+              triggerLocalStr,
               `[BLOQUE DE MEDICACION - ${timeHHMM}] ${cluster.label}`,
               blockHtml,
               callbackPayload,
@@ -1921,7 +2644,7 @@ export class TelegramNotificationService {
             botToken,
             chatId,
             statusHtml,
-            PATIENT_PERSISTENT_KEYBOARD
+            defaultKeyboard
           );
           return {
             ok: true,
@@ -1986,11 +2709,13 @@ export class TelegramNotificationService {
           specialist_or_center: string | null;
           location_address: string | null;
           event_datetime: string;
+          date_is_estimated: boolean;
           preparation_instructions: string | null;
         }>(
           `SELECT
              id, title, category, specialist_or_center, location_address,
              event_datetime::text AS event_datetime,
+             date_is_estimated,
              preparation_instructions
            FROM clinical_events
            WHERE is_completed = FALSE
@@ -2011,8 +2736,9 @@ export class TelegramNotificationService {
           for (const evt of eventsRes.rows) {
             const dt = evt.event_datetime.slice(0, 16).replace("T", " ");
             const tag = EVENT_CATEGORY_TAG[evt.category] ?? "[EVENTO]";
+            const flag = evt.date_is_estimated ? "(Estimada)" : "(Oficial)";
             lines.push(
-              `<code>${escapeHtml(tag)}</code> <b>${escapeHtml(evt.title)}</b> | ${escapeHtml(dt)}`
+              `<code>${escapeHtml(tag)}</code> <b>${escapeHtml(evt.title)}</b> | ${escapeHtml(dt)} ${flag}`
             );
             if (evt.specialist_or_center) {
               lines.push(
@@ -2035,7 +2761,7 @@ export class TelegramNotificationService {
           botToken,
           chatId,
           statusHtml,
-          PATIENT_PERSISTENT_KEYBOARD
+          defaultKeyboard
         );
 
         return {
@@ -2048,6 +2774,7 @@ export class TelegramNotificationService {
 
       if (
         msgText === "[ Estado de Inventario ]" ||
+        msgText === "[ Estado General ]" ||
         normalizedCmd === "/estado" ||
         msgText.startsWith("/estado")
       ) {
@@ -2056,7 +2783,7 @@ export class TelegramNotificationService {
           botToken,
           chatId,
           statusHtml,
-          PATIENT_PERSISTENT_KEYBOARD
+          defaultKeyboard
         );
         return {
           ok: true,
@@ -2077,12 +2804,16 @@ export class TelegramNotificationService {
   static async upsertRecipient(
     input: UpsertRecipientInput
   ): Promise<TelegramRecipient> {
+    const roleClean = (input.role ?? "ADMIN").trim();
+    const isAdmin = isAdminTelegramRole(roleClean);
     const res = await query<TelegramRecipientRow>(
       `INSERT INTO telegram_recipients (
          full_name, role, telegram_chat_id,
          receive_med_reminders, receive_restock_alerts,
-         receive_event_reminders, receive_topic_reminders, is_active
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         receive_event_reminders, receive_topic_reminders,
+         receive_missed_block_alerts, receive_weekly_report, receive_change_alerts,
+         is_active
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (telegram_chat_id) DO UPDATE
        SET full_name = EXCLUDED.full_name,
            role = EXCLUDED.role,
@@ -2090,16 +2821,22 @@ export class TelegramNotificationService {
            receive_restock_alerts = EXCLUDED.receive_restock_alerts,
            receive_event_reminders = EXCLUDED.receive_event_reminders,
            receive_topic_reminders = EXCLUDED.receive_topic_reminders,
+           receive_missed_block_alerts = EXCLUDED.receive_missed_block_alerts,
+           receive_weekly_report = EXCLUDED.receive_weekly_report,
+           receive_change_alerts = EXCLUDED.receive_change_alerts,
            is_active = EXCLUDED.is_active
        RETURNING *`,
       [
         input.full_name.trim(),
-        (input.role ?? "CAREGIVER").trim(),
+        roleClean,
         input.telegram_chat_id.trim(),
-        input.receive_med_reminders ?? true,
-        input.receive_restock_alerts ?? true,
+        input.receive_med_reminders ?? !isAdmin,
+        input.receive_restock_alerts ?? isAdmin,
         input.receive_event_reminders ?? true,
-        input.receive_topic_reminders ?? true,
+        input.receive_topic_reminders ?? isAdmin,
+        input.receive_missed_block_alerts ?? isAdmin,
+        input.receive_weekly_report ?? isAdmin,
+        input.receive_change_alerts ?? isAdmin,
         input.is_active ?? true,
       ]
     );
@@ -2322,9 +3059,6 @@ export class TelegramNotificationService {
     }
   }
 
-  /**
-   * Registers or validates the Vercel webhook endpoint with Telegram Bot API.
-   */
   static async registerVercelWebhook(baseUrl?: string): Promise<{
     ok: boolean;
     simulated: boolean;
@@ -2361,14 +3095,13 @@ export class TelegramNotificationService {
       ? cleanedOrigin
       : `${cleanedOrigin}/api/telegram/webhook`;
 
-    let parsedWebhook: URL;
     try {
-      parsedWebhook = new URL(webhookUrl);
+      const parsedWebhook = new URL(webhookUrl);
+      if (!parsedWebhook.hostname) {
+        throw new Error(`URL de webhook sin host valido: ${webhookUrl}`);
+      }
     } catch {
       throw new Error(`URL de webhook invalida: ${webhookUrl}`);
-    }
-    if (!parsedWebhook.hostname) {
-      throw new Error(`URL de webhook sin host valido: ${webhookUrl}`);
     }
 
     const token = getBotToken();

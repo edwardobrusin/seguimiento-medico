@@ -1,15 +1,14 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import {
+  AlertCircle,
   AlertTriangle,
-  CalendarRange,
-  CheckCircle2,
   Edit3,
-  FileWarning,
+  PackagePlus,
   Plus,
-  Settings,
-  ShoppingBag,
+  Settings2,
+  ShoppingCart,
   Trash2,
   TrendingDown,
   Wallet,
@@ -21,19 +20,42 @@ import type {
   MedicalExpense,
   PayScheduleType,
   PlannedMedicationPurchase,
+  QuincenaPlanBucket,
 } from "@/lib/types/clinical";
 import {
-  EVENT_CATEGORY_TAG,
   EXPENSE_CATEGORY_LABEL,
   EXPENSE_CATEGORY_TAG,
   EXPENSE_STATUS_TAG,
+  EVENT_CATEGORY_TAG,
   PAY_SCHEDULE_LABEL,
 } from "@/lib/clinical-labels";
-import { cn, formatCurrencyMxn } from "@/lib/utils";
+import {
+  cn,
+  formatCurrencyMxn,
+  formatDateOnlyEs,
+  getLocalDateIso,
+} from "@/lib/utils";
+import { ClinicalModal } from "./ClinicalModal";
+import { IconActionButton } from "./IconActionButton";
 import { StatusBadge } from "./StatusBadge";
+
+interface ExpensePayload {
+  title: string;
+  category: ExpenseCategory;
+  status: ExpenseStatus;
+  amount: number;
+  expense_date: string;
+  quincena_label: string | null;
+  medication_id: string | null;
+  clinical_event_id: string | null;
+  provider_or_pharmacy: string | null;
+  payment_method: string | null;
+  notes: string | null;
+}
 
 interface FinancialPlannerViewProps {
   snapshot: CommandCenterSnapshot;
+  isAdmin: boolean;
   onUpdateSettings: (payload: {
     currency: string;
     pay_schedule_type: PayScheduleType;
@@ -46,35 +68,8 @@ interface FinancialPlannerViewProps {
     planning_horizon_quincenas: number;
     include_events_in_plan: boolean;
   }) => Promise<void>;
-  onCreateExpense: (payload: {
-    title: string;
-    category: ExpenseCategory;
-    status: ExpenseStatus;
-    amount: number;
-    expense_date: string;
-    quincena_label: string | null;
-    medication_id: string | null;
-    clinical_event_id: string | null;
-    provider_or_pharmacy: string | null;
-    payment_method: string | null;
-    notes: string | null;
-  }) => Promise<void>;
-  onUpdateExpense: (
-    expenseId: string,
-    payload: {
-      title: string;
-      category: ExpenseCategory;
-      status: ExpenseStatus;
-      amount: number;
-      expense_date: string;
-      quincena_label: string | null;
-      medication_id: string | null;
-      clinical_event_id: string | null;
-      provider_or_pharmacy: string | null;
-      payment_method: string | null;
-      notes: string | null;
-    }
-  ) => Promise<void>;
+  onCreateExpense: (payload: ExpensePayload) => Promise<void>;
+  onUpdateExpense: (expenseId: string, payload: ExpensePayload) => Promise<void>;
   onDeleteExpense: (expenseId: string) => Promise<void>;
   onExecutePlannedPurchase: (payload: {
     medication_id: string;
@@ -90,8 +85,33 @@ interface FinancialPlannerViewProps {
   onNavigateToInventory: () => void;
 }
 
+const EXPENSE_CATEGORIES: ExpenseCategory[] = [
+  "MEDICATION",
+  "APPOINTMENT",
+  "LAB_TEST",
+  "IMAGING",
+  "PROCEDURE",
+  "THERAPY",
+  "INSURANCE",
+  "OTHER",
+];
+const PAY_TYPES: PayScheduleType[] = [
+  "QUINCENAL_15_30",
+  "QUINCENAL_1_15",
+  "CUSTOM_DAYS",
+  "CATORCENAL",
+];
+
+function parseOptionalNonNeg(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 export function FinancialPlannerView({
   snapshot,
+  isAdmin,
   onUpdateSettings,
   onCreateExpense,
   onUpdateExpense,
@@ -100,355 +120,372 @@ export function FinancialPlannerView({
   onNavigateToInventory,
 }: FinancialPlannerViewProps) {
   const plan = snapshot.financial_plan;
-  const settings = snapshot.financial_settings;
+  const summary = plan.summary;
 
-  // Configuracion de nomina quincenal
-  const [showSettings, setShowSettings] = useState(false);
-  const [payScheduleType, setPayScheduleType] = useState<PayScheduleType>(
-    settings.pay_schedule_type
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [expenseFilter, setExpenseFilter] = useState<"ALL" | ExpenseStatus>(
+    "ALL"
   );
-  const [payday1, setPayday1] = useState(String(settings.payday_1));
-  const [payday2, setPayday2] = useState(String(settings.payday_2));
-  const [anchorDate, setAnchorDate] = useState(
-    settings.biweekly_anchor_date ?? new Date().toISOString().slice(0, 10)
-  );
-  const [quincenalCap, setQuincenalCap] = useState(
-    settings.quincenal_budget_cap !== null
-      ? String(settings.quincenal_budget_cap)
-      : ""
-  );
-  const [monthlyCap, setMonthlyCap] = useState(
-    settings.monthly_budget_cap !== null ? String(settings.monthly_budget_cap) : ""
-  );
-  const [safetyBuffer, setSafetyBuffer] = useState(
-    String(settings.safety_buffer_days)
-  );
-  const [horizonQuincenas, setHorizonQuincenas] = useState(
-    String(settings.planning_horizon_quincenas)
-  );
-  const [includeEvents, setIncludeEvents] = useState(
-    settings.include_events_in_plan
-  );
+
+  // Settings modal (re-sincronizado al abrir)
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sPayType, setSPayType] = useState<PayScheduleType>("QUINCENAL_15_30");
+  const [sPayday1, setSPayday1] = useState("15");
+  const [sPayday2, setSPayday2] = useState("30");
+  const [sAnchor, setSAnchor] = useState("");
+  const [sQCap, setSQCap] = useState("");
+  const [sMCap, setSMCap] = useState("");
+  const [sBuffer, setSBuffer] = useState("7");
+  const [sHorizon, setSHorizon] = useState("6");
+  const [sIncludeEvents, setSIncludeEvents] = useState(true);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
 
-  // Ejecutar compra planeada desde tarjeta de quincena
-  const [executingPurchaseId, setExecutingPurchaseId] = useState<string | null>(
+  // Expense modal
+  const [expenseOpen, setExpenseOpen] = useState(false);
+  const [editingExpense, setEditingExpense] = useState<MedicalExpense | null>(
     null
   );
-  const [purchaseAmount, setPurchaseAmount] = useState("");
-  const [purchasePackages, setPurchasePackages] = useState("1");
-  const [purchasePharmacy, setPurchasePharmacy] = useState("");
-  const [purchaseMethod, setPurchaseMethod] = useState("Debito / Nomina");
-  const [purchaseBusy, setPurchaseBusy] = useState(false);
-
-  // CRUD de Bitacora de Gastos Reales
-  const [showExpenseForm, setShowExpenseForm] = useState(false);
-  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
-  const [expTitle, setExpTitle] = useState("");
-  const [expCategory, setExpCategory] = useState<ExpenseCategory>("MEDICATION");
-  const [expStatus, setExpStatus] = useState<ExpenseStatus>("PAID");
-  const [expAmount, setExpAmount] = useState("");
-  const [expDate, setExpDate] = useState(() =>
-    new Date().toISOString().slice(0, 10)
-  );
-  const [expMedId, setExpMedId] = useState("");
-  const [expEventId, setExpEventId] = useState("");
-  const [expProvider, setExpProvider] = useState("");
-  const [expMethod, setExpMethod] = useState("Tarjeta / Nomina");
-  const [expNotes, setExpNotes] = useState("");
+  const [eTitle, setETitle] = useState("");
+  const [eCategory, setECategory] = useState<ExpenseCategory>("MEDICATION");
+  const [eStatus, setEStatus] = useState<ExpenseStatus>("PAID");
+  const [eAmount, setEAmount] = useState("");
+  const [eDate, setEDate] = useState(getLocalDateIso());
+  const [eQuincena, setEQuincena] = useState("");
+  const [eMedId, setEMedId] = useState("");
+  const [eEventId, setEEventId] = useState("");
+  const [eProvider, setEProvider] = useState("");
+  const [eMethod, setEMethod] = useState("");
+  const [eNotes, setENotes] = useState("");
+  const [expenseError, setExpenseError] = useState<string | null>(null);
   const [savingExpense, setSavingExpense] = useState(false);
 
-  const [filterCategory, setFilterCategory] = useState<string>("ALL");
-  const [confirmDeleteExpId, setConfirmDeleteExpId] = useState<string | null>(
-    null
+  // Execute purchase modal
+  const [purchaseItem, setPurchaseItem] = useState<{
+    item: PlannedMedicationPurchase;
+    bucket: QuincenaPlanBucket;
+  } | null>(null);
+  const [pPackages, setPPackages] = useState("1");
+  const [pPrice, setPPrice] = useState("");
+  const [pTotal, setPTotal] = useState("");
+  const [pDate, setPDate] = useState(getLocalDateIso());
+  const [pProvider, setPProvider] = useState("");
+  const [pMethod, setPMethod] = useState("Tarjeta");
+  const [pNotes, setPNotes] = useState("");
+  const [purchaseError, setPurchaseError] = useState<string | null>(null);
+  const [savingPurchase, setSavingPurchase] = useState(false);
+
+  const filteredExpenses = useMemo(
+    () =>
+      snapshot.recent_expenses.filter(
+        (e) => expenseFilter === "ALL" || e.status === expenseFilter
+      ),
+    [snapshot.recent_expenses, expenseFilter]
   );
 
-  async function handleSaveSettings(e: FormEvent) {
+  const peakBucket = useMemo(() => {
+    let max = 0;
+    for (const b of plan.buckets) max = Math.max(max, b.total_cost);
+    return max;
+  }, [plan.buckets]);
+
+  function openSettings() {
+    const s = snapshot.financial_settings;
+    setSPayType(s.pay_schedule_type);
+    setSPayday1(String(s.payday_1));
+    setSPayday2(String(s.payday_2));
+    setSAnchor(s.biweekly_anchor_date ? s.biweekly_anchor_date.slice(0, 10) : "");
+    setSQCap(s.quincenal_budget_cap === null ? "" : String(s.quincenal_budget_cap));
+    setSMCap(s.monthly_budget_cap === null ? "" : String(s.monthly_budget_cap));
+    setSBuffer(String(s.safety_buffer_days));
+    setSHorizon(String(s.planning_horizon_quincenas));
+    setSIncludeEvents(s.include_events_in_plan);
+    setSettingsError(null);
+    setSettingsOpen(true);
+  }
+
+  async function handleSettingsSubmit(e: FormEvent) {
     e.preventDefault();
+    setSettingsError(null);
+    const p1 = Number.parseInt(sPayday1, 10);
+    const p2 = Number.parseInt(sPayday2, 10);
+    if (!(p1 >= 1 && p1 <= 31 && p2 >= 1 && p2 <= 31)) {
+      setSettingsError("Los dias de pago deben estar entre 1 y 31.");
+      return;
+    }
+    if (sPayType === "CATORCENAL" && !sAnchor) {
+      setSettingsError("El esquema catorcenal requiere una fecha ancla de pago.");
+      return;
+    }
+    const buffer = Number.parseInt(sBuffer, 10);
+    const horizon = Number.parseInt(sHorizon, 10);
+    if (!(buffer >= 1 && buffer <= 60)) {
+      setSettingsError("El colchon de seguridad debe estar entre 1 y 60 dias.");
+      return;
+    }
+    if (!(horizon >= 2 && horizon <= 12)) {
+      setSettingsError("El horizonte debe estar entre 2 y 12 quincenas.");
+      return;
+    }
     setSavingSettings(true);
     try {
       await onUpdateSettings({
-        currency: settings.currency || "MXN",
-        pay_schedule_type: payScheduleType,
-        payday_1: Number(payday1) || 15,
-        payday_2: Number(payday2) || 30,
-        biweekly_anchor_date:
-          payScheduleType === "CATORCENAL" ? anchorDate || null : null,
-        quincenal_budget_cap:
-          quincenalCap.trim() !== "" ? Number(quincenalCap) : null,
-        monthly_budget_cap:
-          monthlyCap.trim() !== "" ? Number(monthlyCap) : null,
-        safety_buffer_days: Number(safetyBuffer) || 7,
-        planning_horizon_quincenas: Number(horizonQuincenas) || 6,
-        include_events_in_plan: includeEvents,
+        currency: snapshot.financial_settings.currency || "MXN",
+        pay_schedule_type: sPayType,
+        payday_1: p1,
+        payday_2: p2,
+        biweekly_anchor_date: sAnchor || null,
+        quincenal_budget_cap: parseOptionalNonNeg(sQCap),
+        monthly_budget_cap: parseOptionalNonNeg(sMCap),
+        safety_buffer_days: buffer,
+        planning_horizon_quincenas: horizon,
+        include_events_in_plan: sIncludeEvents,
       });
-      setShowSettings(false);
+      setSettingsOpen(false);
+    } catch (err) {
+      setSettingsError(
+        err instanceof Error ? err.message : "No se pudo guardar la configuracion."
+      );
     } finally {
       setSavingSettings(false);
     }
   }
 
-  function startExecutePurchase(p: PlannedMedicationPurchase) {
-    setExecutingPurchaseId(p.plan_item_id);
-    setPurchasePackages(String(p.packages));
-    setPurchaseAmount(String(p.total_cost));
-    setPurchasePharmacy(p.preferred_pharmacy ?? "");
+  function openCreateExpense() {
+    setEditingExpense(null);
+    setETitle("");
+    setECategory("MEDICATION");
+    setEStatus("PAID");
+    setEAmount("");
+    setEDate(getLocalDateIso());
+    setEQuincena("");
+    setEMedId("");
+    setEEventId("");
+    setEProvider("");
+    setEMethod("");
+    setENotes("");
+    setExpenseError(null);
+    setExpenseOpen(true);
   }
 
-  async function submitExecutePurchase(
-    p: PlannedMedicationPurchase,
-    quincenaLabel: string
-  ) {
-    const amt = Number(purchaseAmount);
-    const pkgs = Number(purchasePackages);
-    if (!Number.isFinite(amt) || amt < 0 || !Number.isFinite(pkgs) || pkgs <= 0) {
+  function openEditExpense(exp: MedicalExpense) {
+    setEditingExpense(exp);
+    setETitle(exp.title);
+    setECategory(exp.category);
+    setEStatus(exp.status);
+    setEAmount(String(exp.amount));
+    setEDate(exp.expense_date.slice(0, 10));
+    setEQuincena(exp.quincena_label ?? "");
+    setEMedId(exp.medication_id ?? "");
+    setEEventId(exp.clinical_event_id ?? "");
+    setEProvider(exp.provider_or_pharmacy ?? "");
+    setEMethod(exp.payment_method ?? "");
+    setENotes(exp.notes ?? "");
+    setExpenseError(null);
+    setExpenseOpen(true);
+  }
+
+  async function handleExpenseSubmit(e: FormEvent) {
+    e.preventDefault();
+    setExpenseError(null);
+    if (!eTitle.trim()) {
+      setExpenseError("Ingresa el concepto del gasto.");
       return;
     }
-    setPurchaseBusy(true);
-    try {
-      await onExecutePlannedPurchase({
-        medication_id: p.medication_id,
-        packages: pkgs,
-        package_price: pkgs > 0 ? Number((amt / pkgs).toFixed(2)) : p.package_price,
-        total_amount: amt,
-        purchase_date: new Date().toISOString().slice(0, 10),
-        quincena_label: quincenaLabel,
-        provider_or_pharmacy: purchasePharmacy.trim() || null,
-        payment_method: purchaseMethod.trim() || null,
-        notes: `Compra ejecutada desde plan quincenal (${quincenaLabel}).`,
-      });
-      setExecutingPurchaseId(null);
-    } finally {
-      setPurchaseBusy(false);
+    const amount = parseOptionalNonNeg(eAmount);
+    if (amount === null) {
+      setExpenseError("Ingresa un monto valido mayor o igual a 0.");
+      return;
     }
-  }
-
-  function resetExpenseForm() {
-    setEditingExpenseId(null);
-    setExpTitle("");
-    setExpCategory("MEDICATION");
-    setExpStatus("PAID");
-    setExpAmount("");
-    setExpDate(new Date().toISOString().slice(0, 10));
-    setExpMedId("");
-    setExpEventId("");
-    setExpProvider("");
-    setExpMethod("Tarjeta / Nomina");
-    setExpNotes("");
-  }
-
-  function startEditExpense(exp: MedicalExpense) {
-    setEditingExpenseId(exp.id);
-    setExpTitle(exp.title);
-    setExpCategory(exp.category);
-    setExpStatus(exp.status);
-    setExpAmount(String(exp.amount));
-    setExpDate(exp.expense_date.slice(0, 10));
-    setExpMedId(exp.medication_id ?? "");
-    setExpEventId(exp.clinical_event_id ?? "");
-    setExpProvider(exp.provider_or_pharmacy ?? "");
-    setExpMethod(exp.payment_method ?? "");
-    setExpNotes(exp.notes ?? "");
-    setShowExpenseForm(true);
-  }
-
-  async function handleSaveExpense(e: FormEvent) {
-    e.preventDefault();
-    const amt = Number(expAmount);
-    if (!expTitle.trim() || !Number.isFinite(amt) || amt < 0) return;
-
-    const payload = {
-      title: expTitle.trim(),
-      category: expCategory,
-      status: expStatus,
-      amount: amt,
-      expense_date: expDate,
-      quincena_label: null,
-      medication_id: expMedId || null,
-      clinical_event_id: expEventId || null,
-      provider_or_pharmacy: expProvider.trim() || null,
-      payment_method: expMethod.trim() || null,
-      notes: expNotes.trim() || null,
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(eDate)) {
+      setExpenseError("Selecciona una fecha valida.");
+      return;
+    }
+    const payload: ExpensePayload = {
+      title: eTitle.trim(),
+      category: eCategory,
+      status: eStatus,
+      amount,
+      expense_date: eDate,
+      quincena_label: eQuincena.trim() || null,
+      medication_id: eMedId || null,
+      clinical_event_id: eEventId || null,
+      provider_or_pharmacy: eProvider.trim() || null,
+      payment_method: eMethod.trim() || null,
+      notes: eNotes.trim() || null,
     };
-
     setSavingExpense(true);
     try {
-      if (editingExpenseId) {
-        await onUpdateExpense(editingExpenseId, payload);
+      if (editingExpense) {
+        await onUpdateExpense(editingExpense.id, payload);
       } else {
         await onCreateExpense(payload);
       }
-      resetExpenseForm();
-      setShowExpenseForm(false);
+      setExpenseOpen(false);
+    } catch (err) {
+      setExpenseError(
+        err instanceof Error ? err.message : "No se pudo guardar el gasto."
+      );
     } finally {
       setSavingExpense(false);
     }
   }
 
-  const maxBucketScale = Math.max(
-    settings.quincenal_budget_cap ?? 0,
-    plan.summary.baseline_peak_quincena,
-    plan.summary.optimized_peak_quincena,
-    1000
-  );
+  function openPurchase(item: PlannedMedicationPurchase, bucket: QuincenaPlanBucket) {
+    setPurchaseItem({ item, bucket });
+    setPPackages(String(item.packages));
+    setPPrice(String(item.package_price));
+    setPTotal(String(item.total_cost));
+    setPDate(getLocalDateIso());
+    setPProvider(item.preferred_pharmacy ?? "");
+    setPMethod("Tarjeta");
+    setPNotes("");
+    setPurchaseError(null);
+  }
 
-  const visibleExpenses =
-    filterCategory === "ALL"
-      ? snapshot.recent_expenses
-      : snapshot.recent_expenses.filter((e) => e.category === filterCategory);
+  async function handlePurchaseSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!purchaseItem) return;
+    setPurchaseError(null);
+    const pkgs = Number(pPackages);
+    if (!Number.isFinite(pkgs) || pkgs <= 0) {
+      setPurchaseError("El numero de cajas debe ser mayor a 0.");
+      return;
+    }
+    const total = parseOptionalNonNeg(pTotal);
+    if (total === null) {
+      setPurchaseError("Ingresa el total pagado.");
+      return;
+    }
+    setSavingPurchase(true);
+    try {
+      await onExecutePlannedPurchase({
+        medication_id: purchaseItem.item.medication_id,
+        packages: pkgs,
+        package_price: parseOptionalNonNeg(pPrice),
+        total_amount: total,
+        purchase_date: pDate,
+        quincena_label: purchaseItem.bucket.label,
+        provider_or_pharmacy: pProvider.trim() || null,
+        payment_method: pMethod.trim() || null,
+        notes: pNotes.trim() || null,
+      });
+      setPurchaseItem(null);
+    } catch (err) {
+      setPurchaseError(
+        err instanceof Error ? err.message : "No se pudo registrar la compra."
+      );
+    } finally {
+      setSavingPurchase(false);
+    }
+  }
+
+  const settings = snapshot.financial_settings;
 
   return (
-    <div className="space-y-6 clinical-enter">
+    <div className="space-y-5 clinical-enter">
       {/* Encabezado */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 className="text-[20px] font-bold text-[#0F172A]">
-            Finanzas Clinicas y Optimizador de Compras Quincenales
-          </h2>
-          <p className="text-[14px] text-[#475569]">
-            Distribucion inteligente de compras de medicamentos segun fechas de
-            pago quincenal ({PAY_SCHEDULE_LABEL[settings.pay_schedule_type]}) para
-            suavizar picos mensuales.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowSettings((v) => !v)}
-            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
-          >
-            <Settings
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
+      <section className="clinical-card p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-[20px] font-bold text-[#0F172A]">
+              Plan Quincenal de Compras y Gastos Medicos
+            </h2>
+            <p className="mt-1 text-[14px] text-[#475569]">
+              {PAY_SCHEDULE_LABEL[settings.pay_schedule_type]} | Colchon de{" "}
+              {settings.safety_buffer_days} dias | Horizonte de{" "}
+              {settings.planning_horizon_quincenas} quincenas
+              {settings.quincenal_budget_cap !== null
+                ? ` | Tope quincenal ${formatCurrencyMxn(settings.quincenal_budget_cap)}`
+                : ""}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <IconActionButton
+              icon={Settings2}
+              label="Configurar dias de pago, topes y horizonte del plan"
+              shortLabel="Configurar"
+              tone="neutral"
+              onClick={openSettings}
             />
-            Configurar Quincenas y Tope
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              if (showExpenseForm && !editingExpenseId) {
-                setShowExpenseForm(false);
-              } else {
-                resetExpenseForm();
-                setShowExpenseForm(true);
-              }
-            }}
-            className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
-          >
-            <Plus className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
-            {showExpenseForm ? "Cerrar Gasto" : "Registrar Gasto Real"}
-          </button>
+            <IconActionButton
+              icon={Plus}
+              label="Registrar un gasto medico"
+              shortLabel="Nuevo Gasto"
+              tone="primary"
+              onClick={openCreateExpense}
+            />
+          </div>
         </div>
-      </div>
+      </section>
 
-      {/* KPIs Financieros */}
+      {/* KPIs */}
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="clinical-card p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[13px] font-medium text-[#475569]">
-              Costo Mensual Medicinas (30d)
-            </span>
-            <ShoppingBag
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
+          <div className="flex items-center justify-between text-[13px] font-medium text-[#475569]">
+            Gasto mensual proyectado
+            <Wallet className="w-4 h-4 text-[#0E7490]" aria-hidden="true" />
           </div>
-          <p className="mt-2 font-mono text-[24px] font-bold text-[#0F172A] tabular-nums">
-            {formatCurrencyMxn(plan.summary.monthly_run_rate_meds)}
+          <p className="mt-2 font-mono text-[22px] font-bold tabular-nums text-[#0F172A]">
+            {formatCurrencyMxn(summary.monthly_run_rate_total)}
           </p>
-          <p className="mt-1 text-[13px] text-[#475569] tabular-nums">
-            Eventos prorrateados:{" "}
-            {formatCurrencyMxn(plan.summary.monthly_run_rate_events)}/mes
+          <p className="mt-1 text-[12px] text-[#475569] tabular-nums">
+            Medicamentos {formatCurrencyMxn(summary.monthly_run_rate_meds)} | Eventos{" "}
+            {formatCurrencyMxn(summary.monthly_run_rate_events)}
           </p>
         </div>
-
         <div className="clinical-card p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[13px] font-medium text-[#475569]">
-              Carga Mensual Total Estimada
-            </span>
-            <CalendarRange
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
+          <div className="flex items-center justify-between text-[13px] font-medium text-[#475569]">
+            Promedio por quincena
+            <ShoppingCart className="w-4 h-4 text-[#0E7490]" aria-hidden="true" />
           </div>
-          <p className="mt-2 font-mono text-[24px] font-bold text-[#0F172A] tabular-nums">
-            {formatCurrencyMxn(plan.summary.monthly_run_rate_total)}
+          <p className="mt-2 font-mono text-[22px] font-bold tabular-nums text-[#0F172A]">
+            {formatCurrencyMxn(summary.average_quincenal_planned)}
           </p>
-          <p className="mt-1 text-[13px] text-[#475569] tabular-nums">
-            Promedio quincenal:{" "}
-            {formatCurrencyMxn(plan.summary.average_quincenal_planned)}
+          <p className="mt-1 text-[12px] text-[#475569] tabular-nums">
+            Total horizonte {formatCurrencyMxn(summary.horizon_total_planned)}
           </p>
         </div>
-
-        <div className="clinical-card p-4 border-[#A7F3D0] bg-[#ECFDF5]">
-          <div className="flex items-center justify-between">
-            <span className="text-[13px] font-medium text-[#065F46]">
-              Suavizado de Pico Quincenal
-            </span>
-            <TrendingDown
-              className="w-4 h-4 text-[#065F46]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-          </div>
-          <p className="mt-2 font-mono text-[24px] font-bold text-[#065F46] tabular-nums">
-            {formatCurrencyMxn(plan.summary.optimized_peak_quincena)}
-          </p>
-          <p className="mt-1 text-[13px] text-[#065F46] tabular-nums">
-            Sin optimizar: {formatCurrencyMxn(plan.summary.baseline_peak_quincena)}{" "}
-            {plan.summary.peak_reduction_mxn > 0
-              ? `(-${plan.summary.peak_reduction_pct}% / -${formatCurrencyMxn(
-                  plan.summary.peak_reduction_mxn
-                )})`
-              : `(${plan.summary.shifted_purchases_count} mov.)`}
-          </p>
-        </div>
-
         <div className="clinical-card p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[13px] font-medium text-[#475569]">
-              Gasto Real Registrado (Mes)
-            </span>
-            <Wallet
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
+          <div className="flex items-center justify-between text-[13px] font-medium text-[#475569]">
+            Reduccion del pico
+            <TrendingDown className="w-4 h-4 text-[#065F46]" aria-hidden="true" />
           </div>
-          <p className="mt-2 font-mono text-[24px] font-bold text-[#0F172A] tabular-nums">
-            {formatCurrencyMxn(plan.summary.paid_current_month_mxn)}
+          <p className="mt-2 font-mono text-[22px] font-bold tabular-nums text-[#065F46]">
+            {formatCurrencyMxn(summary.peak_reduction_mxn)}
           </p>
-          <p className="mt-1 text-[13px] text-[#475569] tabular-nums">
-            Acumulado historico: {formatCurrencyMxn(plan.summary.paid_total_mxn)}
+          <p className="mt-1 text-[12px] text-[#475569] tabular-nums">
+            {summary.peak_reduction_pct}% | {summary.shifted_purchases_count} compras redistribuidas
+          </p>
+        </div>
+        <div className="clinical-card p-4">
+          <div className="flex items-center justify-between text-[13px] font-medium text-[#475569]">
+            Pagado este mes
+            <Wallet className="w-4 h-4 text-[#0E7490]" aria-hidden="true" />
+          </div>
+          <p className="mt-2 font-mono text-[22px] font-bold tabular-nums text-[#0F172A]">
+            {formatCurrencyMxn(summary.paid_current_month_mxn)}
+          </p>
+          <p className="mt-1 text-[12px] text-[#475569] tabular-nums">
+            Historico {formatCurrencyMxn(summary.paid_total_mxn)}
           </p>
         </div>
       </section>
 
-      {/* Alertas: Datos pendientes + Fondo de reserva */}
+      {/* Avisos */}
       {plan.incomplete_pricing_medications.length > 0 && (
-        <section className="border border-[#FDE68A] bg-[#FFFBEB] rounded-[6px] p-4 flex flex-wrap items-center justify-between gap-3">
+        <section className="clinical-card p-4 border-[#FDE68A] bg-[#FFFBEB] flex flex-wrap items-start justify-between gap-3">
           <div className="flex items-start gap-2.5">
-            <FileWarning
-              className="w-5 h-5 text-[#92400E] shrink-0 mt-0.5"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
+            <AlertTriangle className="w-5 h-5 text-[#92400E] shrink-0 mt-0.5" aria-hidden="true" />
             <div>
-              <h3 className="text-[15px] font-bold text-[#92400E]">
-                [NO INCLUIDOS EN PRESUPUESTO] Faltan costos o inventario en{" "}
-                {plan.incomplete_pricing_medications.length} medicamento(s)
-              </h3>
-              <ul className="text-[13px] text-[#78350F] mt-1 space-y-0.5">
+              <p className="text-[14px] font-semibold text-[#92400E]">
+                Medicamentos con datos comerciales pendientes (no entran al plan hasta completarlos)
+              </p>
+              <ul className="mt-1 text-[13px] text-[#78350F] space-y-0.5">
                 {plan.incomplete_pricing_medications.map((m) => (
                   <li key={m.id}>
-                    <strong>{m.name}</strong>: falta{" "}
-                    {m.missing_fields.join(", ")}.
+                    {m.name}: falta {m.missing_fields.join(", ")}
                   </li>
                 ))}
               </ul>
@@ -457,649 +494,438 @@ export function FinancialPlannerView({
           <button
             type="button"
             onClick={onNavigateToInventory}
-            className="clinical-btn px-3.5 bg-white border border-[#F59E0B] text-[#92400E] text-[14px] font-bold"
+            className="clinical-btn px-3 border border-[#F59E0B] bg-white text-[#92400E] text-[13px] font-semibold"
           >
-            Capturar en Inventario
+            Completar en Inventario
           </button>
         </section>
       )}
 
       {plan.reserve_alerts.length > 0 && (
-        <section className="border border-[#A5F3FC] bg-[#ECFEFF] rounded-[6px] p-4 space-y-2">
-          <div className="flex items-center gap-2">
-            <AlertTriangle
-              className="w-4 h-4 text-[#164E63]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            <h3 className="text-[15px] font-bold text-[#164E63]">
-              Recomendaciones de Fondo de Reserva Quincenal (Consultas y Estudios)
-            </h3>
-          </div>
-          <ul className="space-y-1 text-[14px] text-[#164E63]">
-            {plan.reserve_alerts.map((al) => (
-              <li key={al.quincena_label}>{al.message}</li>
-            ))}
-          </ul>
+        <section className="clinical-card p-4 border-[#A5F3FC] bg-[#ECFEFF] space-y-1.5">
+          <p className="text-[14px] font-semibold text-[#164E63]">
+            Reservas sugeridas para quincenas con gastos fuertes
+          </p>
+          {plan.reserve_alerts.map((r) => (
+            <p key={r.quincena_label} className="text-[13px] text-[#164E63]">
+              {r.message}
+            </p>
+          ))}
         </section>
       )}
 
-      {/* Configurador de Nomina Quincenal */}
-      {showSettings && (
-        <form
-          onSubmit={handleSaveSettings}
-          className="clinical-card p-5 space-y-4 border-[#A5F3FC]"
-        >
-          <h3 className="text-[16px] font-bold text-[#0F172A] border-b border-[#E2E8F0] pb-2.5">
-            Configuracion de Fechas de Pago Quincenal y Presupuesto
-          </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="sm:col-span-2">
-              <label
-                htmlFor="fin-sched-type"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Esquema de pago (salario)
-              </label>
-              <select
-                id="fin-sched-type"
-                value={payScheduleType}
-                onChange={(e) =>
-                  setPayScheduleType(e.target.value as PayScheduleType)
-                }
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-              >
-                <option value="QUINCENAL_15_30">
-                  Quincenal: Dias 15 y 30 (o ultimo dia de mes)
-                </option>
-                <option value="QUINCENAL_1_15">Quincenal: Dias 1 y 15</option>
-                <option value="CUSTOM_DAYS">
-                  Quincenal: Dias del mes personalizados
-                </option>
-                <option value="CATORCENAL">Catorcenal: Cada 14 dias</option>
-              </select>
+      {/* Quincenas */}
+      <section aria-label="Plan por quincena" className="space-y-3">
+        {plan.buckets.map((bucket) => (
+          <article
+            key={bucket.index}
+            className={cn(
+              "clinical-card p-5 space-y-3",
+              bucket.over_budget && "border-[#FECACA]"
+            )}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-[16px] font-bold text-[#0F172A]">{bucket.label}</h3>
+                  {bucket.over_budget && <StatusBadge label="[SOBRE TOPE]" tone="crit" />}
+                  {bucket.index === 0 && <StatusBadge label="[QUINCENA ACTUAL]" tone="info" />}
+                </div>
+                <p className="text-[13px] text-[#475569] font-mono tabular-nums">
+                  Pago: {formatDateOnlyEs(bucket.pay_date)} | Cubre hasta {formatDateOnlyEs(bucket.period_end)}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="font-mono text-[20px] font-bold tabular-nums text-[#0F172A]">
+                  {formatCurrencyMxn(bucket.total_cost)}
+                </p>
+                {bucket.baseline_total_cost !== bucket.total_cost && (
+                  <p className="text-[12px] text-[#64748B] tabular-nums line-through">
+                    Sin optimizar {formatCurrencyMxn(bucket.baseline_total_cost)}
+                  </p>
+                )}
+              </div>
             </div>
 
-            {payScheduleType === "CUSTOM_DAYS" && (
-              <>
-                <div>
-                  <label
-                    htmlFor="fin-p1"
-                    className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                  >
-                    Primer dia de pago
-                  </label>
-                  <input
-                    id="fin-p1"
-                    type="number"
-                    min="1"
-                    max="31"
-                    value={payday1}
-                    onChange={(e) => setPayday1(e.target.value)}
-                    className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-                  />
-                </div>
-                <div>
-                  <label
-                    htmlFor="fin-p2"
-                    className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                  >
-                    Segundo dia de pago
-                  </label>
-                  <input
-                    id="fin-p2"
-                    type="number"
-                    min="1"
-                    max="31"
-                    value={payday2}
-                    onChange={(e) => setPayday2(e.target.value)}
-                    className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-                  />
-                </div>
-              </>
-            )}
+            <div
+              className="h-2 rounded-full bg-[#E2E8F0] overflow-hidden"
+              aria-hidden="true"
+            >
+              <div
+                className={cn("h-full", bucket.over_budget ? "bg-[#DC2626]" : "bg-[#0E7490]")}
+                style={{ width: `${peakBucket > 0 ? (bucket.total_cost / peakBucket) * 100 : 0}%` }}
+              />
+            </div>
 
-            {payScheduleType === "CATORCENAL" && (
-              <div>
-                <label
-                  htmlFor="fin-anchor"
-                  className="block text-[13px] font-medium text-[#0F172A] mb-1"
-                >
-                  Fecha base de pago catorcenal
-                </label>
-                <input
-                  id="fin-anchor"
-                  type="date"
-                  value={anchorDate}
-                  onChange={(e) => setAnchorDate(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-                />
+            {bucket.purchases.length === 0 && bucket.events.length === 0 ? (
+              <p className="text-[13px] text-[#64748B]">Sin compras ni eventos programados.</p>
+            ) : (
+              <div className="space-y-2">
+                {bucket.purchases.map((p) => (
+                  <div
+                    key={p.plan_item_id}
+                    className={cn(
+                      "p-3 rounded-[6px] border flex flex-wrap items-center justify-between gap-3",
+                      p.urgent_before_payday
+                        ? "border-[#FECACA] bg-[#FEF2F2]"
+                        : "border-[#E2E8F0] bg-[#F8FAFC]"
+                    )}
+                  >
+                    <div className="space-y-0.5 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-[14px] text-[#0F172A]">
+                          {p.medication_name}
+                        </span>
+                        <span className="text-[13px] text-[#475569]">
+                          {p.packages} caja{p.packages === 1 ? "" : "s"} x {formatCurrencyMxn(p.package_price)}
+                        </span>
+                        {p.urgent_before_payday && (
+                          <StatusBadge label="[URGENTE ANTES DEL PAGO]" tone="crit" />
+                        )}
+                        {p.shifted_from_quincena_label && (
+                          <StatusBadge label="[ADELANTADO]" tone="info" />
+                        )}
+                      </div>
+                      <p className="text-[12px] text-[#475569] font-mono tabular-nums">
+                        Stock al inicio {p.current_stock_at_start} | Se agota {formatDateOnlyEs(p.projected_depletion_date)} | Comprar antes de {formatDateOnlyEs(p.recommended_deadline_date)}
+                      </p>
+                      {p.optimization_reason && (
+                        <p className="text-[12px] text-[#0E7490]">{p.optimization_reason}</p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-bold text-[14px] tabular-nums text-[#0F172A]">
+                        {formatCurrencyMxn(p.total_cost)}
+                      </span>
+                      <IconActionButton
+                        icon={PackagePlus}
+                        label={`Registrar compra realizada de ${p.medication_name}`}
+                        tone="success"
+                        onClick={() => openPurchase(p, bucket)}
+                      />
+                    </div>
+                  </div>
+                ))}
+                {bucket.events.map((ev) => (
+                  <div
+                    key={ev.event_id}
+                    className="p-3 rounded-[6px] border border-[#E2E8F0] bg-white flex flex-wrap items-center justify-between gap-3"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <StatusBadge label={EVENT_CATEGORY_TAG[ev.category]} tone="neutral" />
+                      <span className="font-semibold text-[14px] text-[#0F172A]">{ev.title}</span>
+                      <span className="text-[12px] text-[#475569] font-mono tabular-nums">
+                        {formatDateOnlyEs(ev.event_date)}
+                      </span>
+                      {ev.date_is_estimated && <StatusBadge label="[FECHA ESTIMADA]" tone="warn" />}
+                    </div>
+                    <span className="font-mono font-bold text-[14px] tabular-nums text-[#0F172A]">
+                      {formatCurrencyMxn(ev.estimated_cost)}
+                    </span>
+                  </div>
+                ))}
               </div>
             )}
+          </article>
+        ))}
+      </section>
 
-            <div>
-              <label
-                htmlFor="fin-qcap"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
+      {/* Bitacora de gastos */}
+      <section className="clinical-card p-5 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-[16px] font-bold text-[#0F172A]">
+            Bitacora de Gastos ({snapshot.recent_expenses.length})
+          </h3>
+          <div className="flex flex-wrap gap-1.5">
+            {(
+              [
+                ["ALL", "Todos"],
+                ["PAID", "Pagados"],
+                ["PLANNED", "Planeados"],
+                ["CANCELLED", "Cancelados"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setExpenseFilter(key)}
+                className={cn(
+                  "px-3 py-1.5 rounded-[4px] border text-[13px] font-medium cursor-pointer",
+                  expenseFilter === key
+                    ? "bg-[#0E7490] border-[#0E7490] text-white"
+                    : "bg-white border-[#CBD5E1] text-[#334155] hover:bg-[#F8FAFC]"
+                )}
               >
-                Tope ideal por quincena (MXN opc.)
-              </label>
-              <input
-                id="fin-qcap"
-                type="number"
-                min="0"
-                step="50"
-                placeholder="Sin tope fijo"
-                value={quincenalCap}
-                onChange={(e) => setQuincenalCap(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-              />
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {filteredExpenses.length === 0 ? (
+          <p className="text-[14px] text-[#475569] py-4 text-center">
+            Sin gastos registrados con este filtro.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[13px]">
+              <thead>
+                <tr className="text-left text-[#475569] border-b border-[#E2E8F0]">
+                  <th className="py-2 pr-3 font-semibold">Fecha</th>
+                  <th className="py-2 pr-3 font-semibold">Concepto</th>
+                  <th className="py-2 pr-3 font-semibold">Categoria</th>
+                  <th className="py-2 pr-3 font-semibold">Estado</th>
+                  <th className="py-2 pr-3 font-semibold text-right">Monto</th>
+                  <th className="py-2 font-semibold text-right">Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredExpenses.map((exp) => (
+                  <tr key={exp.id} className="border-b border-[#F1F5F9] align-middle">
+                    <td className="py-2 pr-3 font-mono tabular-nums whitespace-nowrap">
+                      {formatDateOnlyEs(exp.expense_date)}
+                    </td>
+                    <td className="py-2 pr-3">
+                      <p className="font-semibold text-[#0F172A]">{exp.title}</p>
+                      <p className="text-[12px] text-[#64748B]">
+                        {[exp.provider_or_pharmacy, exp.payment_method, exp.quincena_label]
+                          .filter(Boolean)
+                          .join(" | ")}
+                      </p>
+                    </td>
+                    <td className="py-2 pr-3">
+                      <StatusBadge label={EXPENSE_CATEGORY_TAG[exp.category]} tone="neutral" />
+                    </td>
+                    <td className="py-2 pr-3">
+                      <StatusBadge
+                        label={EXPENSE_STATUS_TAG[exp.status]}
+                        tone={exp.status === "PAID" ? "ok" : exp.status === "PLANNED" ? "info" : "warn"}
+                      />
+                    </td>
+                    <td className="py-2 pr-3 text-right font-mono font-bold tabular-nums text-[#0F172A]">
+                      {formatCurrencyMxn(exp.amount)}
+                    </td>
+                    <td className="py-2">
+                      <div className="flex items-center justify-end gap-2">
+                        <IconActionButton
+                          icon={Edit3}
+                          label={`Editar gasto ${exp.title}`}
+                          tone="neutral"
+                          onClick={() => openEditExpense(exp)}
+                        />
+                        {isAdmin &&
+                          (confirmDeleteId === exp.id ? (
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                disabled={busyKey === `del:${exp.id}`}
+                                onClick={async () => {
+                                  setBusyKey(`del:${exp.id}`);
+                                  try {
+                                    await onDeleteExpense(exp.id);
+                                    setConfirmDeleteId(null);
+                                  } catch {
+                                    // Toast global
+                                  } finally {
+                                    setBusyKey(null);
+                                  }
+                                }}
+                                className="clinical-btn px-3 bg-[#991B1B] text-white text-[12px] font-bold"
+                              >
+                                Confirmar
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteId(null)}
+                                className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white text-[#334155] text-[12px]"
+                              >
+                                No
+                              </button>
+                            </div>
+                          ) : (
+                            <IconActionButton
+                              icon={Trash2}
+                              label={`Eliminar gasto ${exp.title}`}
+                              tone="danger"
+                              onClick={() => setConfirmDeleteId(exp.id)}
+                            />
+                          ))}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* Modal Configuracion */}
+      <ClinicalModal
+        open={settingsOpen}
+        onClose={() => !savingSettings && setSettingsOpen(false)}
+        title="Configuracion del Plan Quincenal"
+        subtitle="Dias de cobro de salario, topes de gasto y horizonte de planeacion."
+        maxWidthClass="max-w-2xl"
+      >
+        <form onSubmit={handleSettingsSubmit} className="space-y-4">
+          {settingsError && (
+            <div role="alert" className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px] flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>{settingsError}</span>
             </div>
-
+          )}
+          <div>
+            <label htmlFor="fs-type" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Esquema de pago
+            </label>
+            <select
+              id="fs-type"
+              value={sPayType}
+              onChange={(e) => {
+                const next = e.target.value as PayScheduleType;
+                setSPayType(next);
+                if (next === "QUINCENAL_15_30") {
+                  setSPayday1("15");
+                  setSPayday2("30");
+                } else if (next === "QUINCENAL_1_15") {
+                  setSPayday1("1");
+                  setSPayday2("15");
+                }
+              }}
+              className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
+            >
+              {PAY_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {PAY_SCHEDULE_LABEL[t]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+            {sPayType !== "CATORCENAL" ? (
+              <>
+                <div>
+                  <label htmlFor="fs-p1" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                    Dia de pago 1
+                  </label>
+                  <input id="fs-p1" type="number" min="1" max="31" value={sPayday1} onChange={(e) => setSPayday1(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+                </div>
+                <div>
+                  <label htmlFor="fs-p2" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                    Dia de pago 2
+                  </label>
+                  <input id="fs-p2" type="number" min="1" max="31" value={sPayday2} onChange={(e) => setSPayday2(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+                </div>
+              </>
+            ) : (
+              <div className="sm:col-span-2">
+                <label htmlFor="fs-anchor" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                  Fecha de un pago conocido (ancla)
+                </label>
+                <input id="fs-anchor" type="date" value={sAnchor} onChange={(e) => setSAnchor(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+              </div>
+            )}
             <div>
-              <label
-                htmlFor="fin-mcap"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Tope mensual de referencia (MXN opc.)
+              <label htmlFor="fs-buffer" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Colchon (dias)
               </label>
-              <input
-                id="fin-mcap"
-                type="number"
-                min="0"
-                step="100"
-                placeholder="Sin tope fijo"
-                value={monthlyCap}
-                onChange={(e) => setMonthlyCap(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-              />
+              <input id="fs-buffer" type="number" min="1" max="60" value={sBuffer} onChange={(e) => setSBuffer(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
             </div>
-
             <div>
-              <label
-                htmlFor="fin-buffer"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Colchon de seguridad global (dias)
+              <label htmlFor="fs-qcap" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Tope por quincena (MXN)
               </label>
-              <input
-                id="fin-buffer"
-                type="number"
-                min="1"
-                max="60"
-                value={safetyBuffer}
-                onChange={(e) => setSafetyBuffer(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-              />
+              <input id="fs-qcap" type="number" step="0.01" min="0" value={sQCap} onChange={(e) => setSQCap(e.target.value)} placeholder="Sin tope" className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
             </div>
-
             <div>
-              <label
-                htmlFor="fin-horizon"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Horizonte (quincenas a planear)
+              <label htmlFor="fs-mcap" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Tope mensual (MXN)
               </label>
-              <select
-                id="fin-horizon"
-                value={horizonQuincenas}
-                onChange={(e) => setHorizonQuincenas(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[14px]"
-              >
-                {[4, 6, 8, 10, 12].map((n) => (
-                  <option key={n} value={n}>
-                    {n} quincenas ({Math.round(n / 2)} meses)
+              <input id="fs-mcap" type="number" step="0.01" min="0" value={sMCap} onChange={(e) => setSMCap(e.target.value)} placeholder="Sin tope" className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="fs-horizon" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Horizonte (quincenas)
+              </label>
+              <input id="fs-horizon" type="number" min="2" max="12" value={sHorizon} onChange={(e) => setSHorizon(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+          </div>
+          <label className="flex items-center gap-2 text-[13px] font-medium text-[#0F172A] cursor-pointer">
+            <input type="checkbox" checked={sIncludeEvents} onChange={(e) => setSIncludeEvents(e.target.checked)} className="w-4 h-4 accent-[#0E7490]" />
+            Incluir costos estimados de citas e inyecciones en el plan
+          </label>
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button type="button" onClick={() => setSettingsOpen(false)} className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]">
+              Cancelar
+            </button>
+            <button type="submit" disabled={savingSettings} className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold">
+              {savingSettings ? "Recalculando..." : "Guardar y Recalcular"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
+
+      {/* Modal Gasto */}
+      <ClinicalModal
+        open={expenseOpen}
+        onClose={() => !savingExpense && setExpenseOpen(false)}
+        title={editingExpense ? `Editar Gasto: ${editingExpense.title}` : "Registrar Gasto Medico"}
+        maxWidthClass="max-w-2xl"
+      >
+        <form onSubmit={handleExpenseSubmit} className="space-y-4">
+          {expenseError && (
+            <div role="alert" className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px] flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>{expenseError}</span>
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div className="sm:col-span-2">
+              <label htmlFor="ex-title" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Concepto *
+              </label>
+              <input id="ex-title" type="text" required value={eTitle} onChange={(e) => setETitle(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ex-category" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Categoria
+              </label>
+              <select id="ex-category" value={eCategory} onChange={(e) => setECategory(e.target.value as ExpenseCategory)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white">
+                {EXPENSE_CATEGORIES.map((c) => (
+                  <option key={c} value={c}>
+                    {EXPENSE_CATEGORY_LABEL[c]}
                   </option>
                 ))}
               </select>
             </div>
-
-            <div className="flex items-end pb-1">
-              <label className="inline-flex items-center gap-2 h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] w-full bg-[#F8FAFC] text-[14px] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={includeEvents}
-                  onChange={(e) => setIncludeEvents(e.target.checked)}
-                  className="w-4 h-4 accent-[#0E7490]"
-                />
-                Incluir citas y estudios en el balance
-              </label>
-            </div>
-          </div>
-
-          <div className="flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={() => setShowSettings(false)}
-              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
-            >
-              Cancelar
-            </button>
-            <button
-              type="submit"
-              disabled={savingSettings}
-              className="clinical-btn px-5 bg-[#0E7490] text-white text-[14px] font-bold"
-            >
-              {savingSettings
-                ? "Recalculando plan..."
-                : "Guardar y Recalcular Plan"}
-            </button>
-          </div>
-        </form>
-      )}
-
-      {/* Plan de Compras por Quincena */}
-      <section aria-labelledby="quincena-plan-heading" className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h3
-              id="quincena-plan-heading"
-              className="text-[18px] font-bold text-[#0F172A]"
-            >
-              Calendario Optimizado de Compras por Quincena
-            </h3>
-            <p className="text-[13px] text-[#475569]">
-              El motor adelanta compras hasta 2 quincenas cuando conviene para
-              evitar acumular varios medicamentos caros o consultas en una sola fecha
-              de pago.
-            </p>
-          </div>
-          {settings.quincenal_budget_cap && (
-            <StatusBadge
-              label={`TOPE QUINCENAL: ${formatCurrencyMxn(
-                settings.quincenal_budget_cap
-              )}`}
-              tone="info"
-            />
-          )}
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {plan.buckets.map((bucket) => {
-            const barPct = Math.min(
-              100,
-              Math.round((bucket.total_cost / maxBucketScale) * 100)
-            );
-            return (
-              <article
-                key={bucket.index}
-                className={cn(
-                  "clinical-card p-4 space-y-3",
-                  bucket.over_budget && "border-[#FECACA]"
-                )}
-              >
-                <header className="flex flex-wrap items-start justify-between gap-2 border-b border-[#E2E8F0] pb-2.5">
-                  <div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <h4 className="text-[16px] font-bold text-[#0F172A]">
-                        {bucket.label}
-                      </h4>
-                      {bucket.over_budget && (
-                        <StatusBadge label="[EXCEDE TOPE]" tone="crit" />
-                      )}
-                      {bucket.purchases.some((p) => p.shifted_from_quincena_label) && (
-                        <StatusBadge label="[SUAVIZADO]" tone="ok" />
-                      )}
-                    </div>
-                    <p className="font-mono text-[12px] text-[#64748B]">
-                      Cobertura: {bucket.pay_date} al {bucket.period_end}
-                    </p>
-                  </div>
-
-                  <div className="text-right">
-                    <span className="block font-mono text-[20px] font-bold text-[#0F172A] tabular-nums">
-                      {formatCurrencyMxn(bucket.total_cost)}
-                    </span>
-                    {bucket.baseline_total_cost !== bucket.total_cost && (
-                      <span className="block font-mono text-[12px] text-[#475569] tabular-nums">
-                        Sin optimizar:{" "}
-                        {formatCurrencyMxn(bucket.baseline_total_cost)}
-                      </span>
-                    )}
-                  </div>
-                </header>
-
-                <div className="space-y-1">
-                  <div className="flex justify-between text-[12px] font-mono text-[#475569] tabular-nums">
-                    <span>
-                      Medicinas: {formatCurrencyMxn(bucket.medications_subtotal)}
-                    </span>
-                    <span>
-                      Citas/Estudios: {formatCurrencyMxn(bucket.events_subtotal)}
-                    </span>
-                  </div>
-                  <div className="h-2 w-full bg-[#E2E8F0] rounded-full overflow-hidden">
-                    <div
-                      className={cn(
-                        "h-full",
-                        bucket.over_budget ? "bg-[#DC2626]" : "bg-[#0E7490]"
-                      )}
-                      style={{ width: `${barPct}%` }}
-                    />
-                  </div>
-                </div>
-
-                {bucket.purchases.length === 0 && bucket.events.length === 0 ? (
-                  <p className="text-[13px] text-[#64748B] py-2">
-                    Quincena libre de compras y consultas programadas.
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {bucket.purchases.map((p) => {
-                      const isExec = executingPurchaseId === p.plan_item_id;
-                      return (
-                        <div
-                          key={p.plan_item_id}
-                          className={cn(
-                            "p-2.5 rounded-[6px] border text-[13px] space-y-2",
-                            p.urgent_before_payday
-                              ? "bg-[#FEF2F2] border-[#FECACA]"
-                              : "bg-[#F8FAFC] border-[#E2E8F0]"
-                          )}
-                        >
-                          <div className="flex flex-wrap items-start justify-between gap-2">
-                            <div className="space-y-0.5">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <span className="font-bold text-[#0F172A]">
-                                  {p.medication_name}
-                                </span>
-                                <StatusBadge
-                                  label={`${p.packages} env. (${p.units_per_package} u.)`}
-                                  tone="neutral"
-                                />
-                                {p.urgent_before_payday && (
-                                  <StatusBadge
-                                    label="[URGENTE ANTES DEL PAGO]"
-                                    tone="crit"
-                                  />
-                                )}
-                                {p.shifted_from_quincena_label && (
-                                  <StatusBadge
-                                    label="[ADELANTADA]"
-                                    tone="ok"
-                                  />
-                                )}
-                              </div>
-                              <p className="font-mono text-[12px] text-[#475569] tabular-nums">
-                                Agota: {p.projected_depletion_date} | Comprar
-                                antes: {p.recommended_deadline_date}
-                              </p>
-                              {p.optimization_reason && (
-                                <p className="text-[12px] text-[#065F46]">
-                                  {p.optimization_reason}
-                                </p>
-                              )}
-                            </div>
-
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono font-bold text-[14px] text-[#0F172A] tabular-nums">
-                                {formatCurrencyMxn(p.total_cost)}
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  isExec
-                                    ? setExecutingPurchaseId(null)
-                                    : startExecutePurchase(p)
-                                }
-                                className="px-2.5 h-[36px] rounded-[6px] bg-[#0E7490] hover:bg-[#155E75] text-white text-[12px] font-bold inline-flex items-center gap-1 cursor-pointer"
-                              >
-                                <CheckCircle2
-                                  className="w-3.5 h-3.5"
-                                  strokeWidth={1.75}
-                                  aria-hidden="true"
-                                />
-                                {isExec ? "Cerrar" : "Registrar Compra"}
-                              </button>
-                            </div>
-                          </div>
-
-                          {isExec && (
-                            <div className="pt-2 border-t border-[#CBD5E1] grid grid-cols-1 sm:grid-cols-3 gap-2 items-end">
-                              <div>
-                                <label className="block text-[11px] text-[#334155]">
-                                  Envases comprados
-                                </label>
-                                <input
-                                  type="number"
-                                  min="1"
-                                  step="1"
-                                  value={purchasePackages}
-                                  onChange={(e) => {
-                                    setPurchasePackages(e.target.value);
-                                    const n = Number(e.target.value);
-                                    if (Number.isFinite(n) && n > 0) {
-                                      setPurchaseAmount(
-                                        String(
-                                          Number((n * p.package_price).toFixed(2))
-                                        )
-                                      );
-                                    }
-                                  }}
-                                  className="w-full h-[36px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[13px]"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-[11px] text-[#334155]">
-                                  Monto real pagado (MXN)
-                                </label>
-                                <input
-                                  type="number"
-                                  min="0"
-                                  step="0.01"
-                                  value={purchaseAmount}
-                                  onChange={(e) =>
-                                    setPurchaseAmount(e.target.value)
-                                  }
-                                  className="w-full h-[36px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[13px]"
-                                />
-                              </div>
-                              <div>
-                                <label className="block text-[11px] text-[#334155]">
-                                  Farmacia / Metodo
-                                </label>
-                                <input
-                                  type="text"
-                                  placeholder="Farmacia"
-                                  value={purchasePharmacy}
-                                  onChange={(e) =>
-                                    setPurchasePharmacy(e.target.value)
-                                  }
-                                  className="w-full h-[36px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white text-[13px]"
-                                />
-                              </div>
-                              <div className="sm:col-span-2">
-                                <input
-                                  type="text"
-                                  placeholder="Metodo de pago (ej. Debito / Efectivo)"
-                                  value={purchaseMethod}
-                                  onChange={(e) =>
-                                    setPurchaseMethod(e.target.value)
-                                  }
-                                  className="w-full h-[36px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white text-[13px]"
-                                />
-                              </div>
-                              <button
-                                type="button"
-                                disabled={purchaseBusy}
-                                onClick={() =>
-                                  submitExecutePurchase(p, bucket.label)
-                                }
-                                className="h-[36px] px-3 rounded-[6px] bg-[#065F46] text-white text-[12px] font-bold"
-                              >
-                                {purchaseBusy
-                                  ? "Aplicando..."
-                                  : "Confirmar + Sumar Stock"}
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-
-                    {bucket.events.map((ev) => (
-                      <div
-                        key={ev.event_id}
-                        className="p-2.5 rounded-[6px] border border-[#A5F3FC] bg-[#ECFEFF] flex items-center justify-between gap-2 text-[13px]"
-                      >
-                        <div>
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <StatusBadge
-                              label={EVENT_CATEGORY_TAG[ev.category]}
-                              tone="info"
-                            />
-                            <span className="font-bold text-[#0F172A]">
-                              {ev.title}
-                            </span>
-                            {ev.date_is_estimated && (
-                              <StatusBadge label="[FECHA ESTIMADA]" tone="warn" />
-                            )}
-                          </div>
-                          <p className="font-mono text-[12px] text-[#164E63]">
-                            Fecha: {ev.event_date}
-                            {ev.specialist_or_center
-                              ? ` | ${ev.specialist_or_center}`
-                              : ""}
-                          </p>
-                        </div>
-                        <span className="font-mono font-bold text-[14px] text-[#164E63] tabular-nums shrink-0">
-                          {formatCurrencyMxn(ev.estimated_cost)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </article>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* Formulario Crear / Editar Gasto Real */}
-      {showExpenseForm && (
-        <form
-          onSubmit={handleSaveExpense}
-          className="clinical-card p-5 space-y-4 border-[#A5F3FC]"
-        >
-          <h3 className="text-[16px] font-bold text-[#0F172A] border-b border-[#E2E8F0] pb-2.5">
-            {editingExpenseId
-              ? "Editar Registro de Gasto Medico"
-              : "Registrar Nuevo Gasto Medico o Compra"}
-          </h3>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="md:col-span-2">
-              <label
-                htmlFor="exp-title"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Concepto del gasto *
-              </label>
-              <input
-                id="exp-title"
-                type="text"
-                required
-                placeholder="Ej. Compra Quetiapina 100 mg / Consulta Reumatologia"
-                value={expTitle}
-                onChange={(e) => setExpTitle(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
-              />
-            </div>
-
             <div>
-              <label
-                htmlFor="exp-cat"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Categoria *
-              </label>
-              <select
-                id="exp-cat"
-                value={expCategory}
-                onChange={(e) =>
-                  setExpCategory(e.target.value as ExpenseCategory)
-                }
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-              >
-                <option value="MEDICATION">Medicamento</option>
-                <option value="APPOINTMENT">Consulta Medica</option>
-                <option value="LAB_TEST">Analisis Clinico</option>
-                <option value="IMAGING">Imagenologia (RX / US)</option>
-                <option value="PROCEDURE">Procedimiento</option>
-                <option value="THERAPY">Psicologia / Terapia</option>
-                <option value="INSURANCE">Seguro / Reembolso</option>
-                <option value="OTHER">Otro Gasto Medico</option>
-              </select>
-            </div>
-
-            <div>
-              <label
-                htmlFor="exp-amount"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Monto (MXN) *
-              </label>
-              <input
-                id="exp-amount"
-                type="number"
-                step="0.01"
-                min="0"
-                required
-                value={expAmount}
-                onChange={(e) => setExpAmount(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px]"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="exp-date"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Fecha del gasto *
-              </label>
-              <input
-                id="exp-date"
-                type="date"
-                required
-                value={expDate}
-                onChange={(e) => setExpDate(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px]"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="exp-status"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
+              <label htmlFor="ex-status" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
                 Estado
               </label>
-              <select
-                id="exp-status"
-                value={expStatus}
-                onChange={(e) => setExpStatus(e.target.value as ExpenseStatus)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-              >
+              <select id="ex-status" value={eStatus} onChange={(e) => setEStatus(e.target.value as ExpenseStatus)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white">
                 <option value="PAID">Pagado</option>
                 <option value="PLANNED">Planeado</option>
                 <option value="CANCELLED">Cancelado</option>
               </select>
             </div>
-
             <div>
-              <label
-                htmlFor="exp-med"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Vincular a medicamento (opcional)
+              <label htmlFor="ex-amount" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Monto (MXN) *
               </label>
-              <select
-                id="exp-med"
-                value={expMedId}
-                onChange={(e) => setExpMedId(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-              >
+              <input id="ex-amount" type="number" step="0.01" min="0" required value={eAmount} onChange={(e) => setEAmount(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ex-date" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Fecha *
+              </label>
+              <input id="ex-date" type="date" required value={eDate} onChange={(e) => setEDate(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ex-med" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Medicamento vinculado
+              </label>
+              <select id="ex-med" value={eMedId} onChange={(e) => setEMedId(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white">
                 <option value="">Ninguno</option>
                 {snapshot.medications.map((m) => (
                   <option key={m.id} value={m.id}>
@@ -1108,240 +934,154 @@ export function FinancialPlannerView({
                 ))}
               </select>
             </div>
-
             <div>
-              <label
-                htmlFor="exp-provider"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Farmacia / Especialista / Centro
+              <label htmlFor="ex-event" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Evento vinculado
               </label>
-              <input
-                id="exp-provider"
-                type="text"
-                placeholder="Ej. Farmacia del Ahorro"
-                value={expProvider}
-                onChange={(e) => setExpProvider(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-              />
+              <select id="ex-event" value={eEventId} onChange={(e) => setEEventId(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white">
+                <option value="">Ninguno</option>
+                {[...snapshot.upcoming_events, ...snapshot.completed_events].map((ev) => (
+                  <option key={ev.id} value={ev.id}>
+                    {ev.title}
+                  </option>
+                ))}
+              </select>
             </div>
-
             <div>
-              <label
-                htmlFor="exp-method"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
+              <label htmlFor="ex-provider" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Farmacia / Proveedor
+              </label>
+              <input id="ex-provider" type="text" value={eProvider} onChange={(e) => setEProvider(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="ex-method" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
                 Metodo de pago
               </label>
-              <input
-                id="exp-method"
-                type="text"
-                placeholder="Tarjeta / Efectivo / Transferencia"
-                value={expMethod}
-                onChange={(e) => setExpMethod(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-              />
+              <input id="ex-method" type="text" value={eMethod} onChange={(e) => setEMethod(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
             </div>
-
-            <div className="md:col-span-3">
-              <label
-                htmlFor="exp-notes"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Notas o folio de recibo
+            <div>
+              <label htmlFor="ex-quincena" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Quincena (etiqueta)
               </label>
-              <input
-                id="exp-notes"
-                type="text"
-                value={expNotes}
-                onChange={(e) => setExpNotes(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px]"
-              />
+              <input id="ex-quincena" type="text" value={eQuincena} onChange={(e) => setEQuincena(e.target.value)} placeholder="Automatica si se deja vacia" className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
             </div>
           </div>
-
-          <div className="flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={() => {
-                setShowExpenseForm(false);
-                resetExpenseForm();
-              }}
-              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
-            >
+          <div>
+            <label htmlFor="ex-notes" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Notas
+            </label>
+            <textarea id="ex-notes" rows={2} value={eNotes} onChange={(e) => setENotes(e.target.value)} className="w-full rounded-[6px] border border-[#CBD5E1] p-3 text-[14px]" />
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button type="button" onClick={() => setExpenseOpen(false)} className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]">
               Cancelar
             </button>
-            <button
-              type="submit"
-              disabled={savingExpense}
-              className="clinical-btn px-5 bg-[#0E7490] text-white text-[14px] font-bold"
-            >
-              {savingExpense
-                ? "Guardando..."
-                : editingExpenseId
-                ? "Actualizar Gasto"
-                : "Guardar Gasto"}
+            <button type="submit" disabled={savingExpense} className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold">
+              {savingExpense ? "Guardando..." : editingExpense ? "Guardar Cambios" : "Registrar Gasto"}
             </button>
           </div>
         </form>
-      )}
+      </ClinicalModal>
 
-      {/* Bitacora de Gastos Reales (CRUD) */}
-      <section aria-labelledby="expenses-ledger-heading" className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h3
-            id="expenses-ledger-heading"
-            className="text-[18px] font-bold text-[#0F172A]"
-          >
-            Bitacora de Gastos y Compras ({visibleExpenses.length})
-          </h3>
-
-          <select
-            aria-label="Filtrar gastos por categoria"
-            value={filterCategory}
-            onChange={(e) => setFilterCategory(e.target.value)}
-            className="h-[42px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-          >
-            <option value="ALL">Todas las categorias</option>
-            {Object.entries(EXPENSE_CATEGORY_LABEL).map(([k, label]) => (
-              <option key={k} value={k}>
-                {label}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="clinical-card overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[13px] font-semibold text-[#475569]">
-                  <th className="py-3 px-4">Fecha / Quincena</th>
-                  <th className="py-3 px-3">Concepto</th>
-                  <th className="py-3 px-3">Categoria / Estado</th>
-                  <th className="py-3 px-3">Proveedor / Metodo</th>
-                  <th className="py-3 px-3 text-right">Monto</th>
-                  <th className="py-3 px-4 text-right">Acciones</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#E2E8F0]">
-                {visibleExpenses.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="py-8 px-4 text-center text-[14px] text-[#64748B]"
-                    >
-                      No hay gastos medicos registrados aun. Usa Registrar Compra
-                      en cualquier quincena o Registrar Gasto Real.
-                    </td>
-                  </tr>
-                ) : (
-                  visibleExpenses.map((exp) => (
-                    <tr key={exp.id} className="bg-white hover:bg-[#F8FAFC]">
-                      <td className="py-3 px-4 font-mono text-[13px] text-[#0F172A] tabular-nums">
-                        <div className="font-semibold">{exp.expense_date}</div>
-                        {exp.quincena_label && (
-                          <div className="text-[12px] text-[#64748B]">
-                            {exp.quincena_label}
-                          </div>
-                        )}
-                      </td>
-                      <td className="py-3 px-3">
-                        <div className="font-bold text-[14px] text-[#0F172A]">
-                          {exp.title}
-                        </div>
-                        {exp.notes && (
-                          <div className="text-[12px] text-[#64748B]">
-                            {exp.notes}
-                          </div>
-                        )}
-                      </td>
-                      <td className="py-3 px-3">
-                        <div className="flex flex-wrap gap-1.5">
-                          <StatusBadge
-                            label={EXPENSE_CATEGORY_TAG[exp.category]}
-                            tone="info"
-                          />
-                          <StatusBadge
-                            label={EXPENSE_STATUS_TAG[exp.status]}
-                            tone={
-                              exp.status === "PAID"
-                                ? "ok"
-                                : exp.status === "PLANNED"
-                                ? "warn"
-                                : "neutral"
-                            }
-                          />
-                        </div>
-                      </td>
-                      <td className="py-3 px-3 text-[13px] text-[#475569]">
-                        <div>{exp.provider_or_pharmacy || "--"}</div>
-                        {exp.payment_method && (
-                          <div className="text-[12px] text-[#64748B]">
-                            {exp.payment_method}
-                          </div>
-                        )}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono font-bold text-[15px] text-[#0F172A] tabular-nums">
-                        {formatCurrencyMxn(exp.amount)}
-                      </td>
-                      <td className="py-3 px-4 text-right">
-                        <div className="inline-flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => startEditExpense(exp)}
-                            className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[13px]"
-                          >
-                            <Edit3
-                              className="w-3.5 h-3.5"
-                              strokeWidth={1.75}
-                              aria-hidden="true"
-                            />
-                          </button>
-                          {confirmDeleteExpId === exp.id ? (
-                            <>
-                              <button
-                                type="button"
-                                onClick={async () => {
-                                  await onDeleteExpense(exp.id);
-                                  setConfirmDeleteExpId(null);
-                                }}
-                                className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[12px] font-bold"
-                              >
-                                Confirmar
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setConfirmDeleteExpId(null)}
-                                className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[12px]"
-                              >
-                                No
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteExpId(exp.id)}
-                              className="clinical-btn px-2.5 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
-                              aria-label={`Eliminar gasto ${exp.title}`}
-                            >
-                              <Trash2
-                                className="w-3.5 h-3.5"
-                                strokeWidth={1.75}
-                                aria-hidden="true"
-                              />
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+      {/* Modal Ejecutar Compra Planeada */}
+      <ClinicalModal
+        open={Boolean(purchaseItem)}
+        onClose={() => !savingPurchase && setPurchaseItem(null)}
+        title={`Registrar Compra: ${purchaseItem?.item.medication_name ?? ""}`}
+        subtitle={`Suma el inventario y registra el gasto en ${purchaseItem?.bucket.label ?? "la quincena"}.`}
+        maxWidthClass="max-w-xl"
+      >
+        <form onSubmit={handlePurchaseSubmit} className="space-y-4">
+          {purchaseError && (
+            <div role="alert" className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]">
+              {purchaseError}
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div>
+              <label htmlFor="pp-packages" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Cajas compradas *
+              </label>
+              <input
+                id="pp-packages"
+                type="number"
+                step="any"
+                min="0.1"
+                required
+                value={pPackages}
+                onChange={(e) => {
+                  setPPackages(e.target.value);
+                  const price = Number(pPrice);
+                  const pk = Number(e.target.value);
+                  if (Number.isFinite(price) && Number.isFinite(pk)) {
+                    setPTotal(String(Number((price * pk).toFixed(2))));
+                  }
+                }}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+            <div>
+              <label htmlFor="pp-price" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Precio por caja (MXN)
+              </label>
+              <input
+                id="pp-price"
+                type="number"
+                step="0.01"
+                min="0"
+                value={pPrice}
+                onChange={(e) => {
+                  setPPrice(e.target.value);
+                  const price = Number(e.target.value);
+                  const pk = Number(pPackages);
+                  if (Number.isFinite(price) && Number.isFinite(pk)) {
+                    setPTotal(String(Number((price * pk).toFixed(2))));
+                  }
+                }}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+            <div>
+              <label htmlFor="pp-total" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Total pagado (MXN) *
+              </label>
+              <input id="pp-total" type="number" step="0.01" min="0" required value={pTotal} onChange={(e) => setPTotal(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="pp-date" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Fecha de compra
+              </label>
+              <input id="pp-date" type="date" value={pDate} onChange={(e) => setPDate(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="pp-provider" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Farmacia
+              </label>
+              <input id="pp-provider" type="text" value={pProvider} onChange={(e) => setPProvider(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
+            <div>
+              <label htmlFor="pp-method" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+                Metodo de pago
+              </label>
+              <input id="pp-method" type="text" value={pMethod} onChange={(e) => setPMethod(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+            </div>
           </div>
-        </div>
-      </section>
+          <div>
+            <label htmlFor="pp-notes" className="block text-[13px] font-semibold text-[#0F172A] mb-1">
+              Notas
+            </label>
+            <input id="pp-notes" type="text" value={pNotes} onChange={(e) => setPNotes(e.target.value)} className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]" />
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button type="button" onClick={() => setPurchaseItem(null)} className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]">
+              Cancelar
+            </button>
+            <button type="submit" disabled={savingPurchase} className="clinical-btn px-5 bg-[#065F46] hover:bg-[#047857] text-white text-[14px] font-semibold">
+              {savingPurchase ? "Registrando..." : "Confirmar Compra"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
     </div>
   );
 }

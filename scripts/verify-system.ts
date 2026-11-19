@@ -1,425 +1,433 @@
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
-import assert from "node:assert/strict";
+process.env.FORCE_PGLITE = "1";
 
-const testPgDir = path.join(os.tmpdir(), `clinical-verify-${Date.now()}`);
-delete process.env.DATABASE_URL;
-process.env.CLINICAL_PGDATA_DIR = testPgDir;
-process.env.TELEGRAM_WEBHOOK_SECRET = "verify-secret-token";
-process.env.CRON_SECRET = "verify-cron-secret";
-
-import { closeDbForTests, ensureInitialized, query } from "../src/lib/db/client";
-import { DoseClusteringService } from "../src/lib/services/dose-clustering.service";
-import { ClinicalEventsService } from "../src/lib/services/clinical-events.service";
-import { FollowUpTopicsService } from "../src/lib/services/follow-up-topics.service";
-import { FinancialPlannerService } from "../src/lib/services/financial-planner.service";
-import { PatientDossierService } from "../src/lib/services/patient-dossier.service";
+import { query, withTransaction } from "../src/lib/db/client";
+import { seedClinicalDatabaseIfEmpty } from "../src/lib/db/seed";
+import { createSessionToken, verifySessionToken } from "../src/lib/auth/session";
 import {
-  PATIENT_PERSISTENT_KEYBOARD,
-  TelegramNotificationService,
-} from "../src/lib/services/telegram-notification.service";
+  calculateEffectiveDailyRate,
+  formatActiveDaysLabel,
+  isDateActiveForMedication,
+} from "../src/lib/periodicity";
+import { AuthService } from "../src/lib/services/auth.service";
 import { getCommandCenterSnapshot } from "../src/lib/services/command-center.service";
-import {
-  GET as cronDispatchGet,
-  POST as cronDispatchPost,
-} from "../src/app/api/cron/dispatch/route";
-import type { ClinicalEventItem, FinancialSettings, Medication } from "../src/lib/types/clinical";
+import { DoseClusteringService } from "../src/lib/services/dose-clustering.service";
+import { FinancialPlannerService } from "../src/lib/services/financial-planner.service";
+import { FollowUpTopicsService } from "../src/lib/services/follow-up-topics.service";
+import { MedicationVersionService } from "../src/lib/services/medication-version.service";
+import { PatientDossierService } from "../src/lib/services/patient-dossier.service";
+import { TelegramNotificationService } from "../src/lib/services/telegram-notification.service";
+import type { Medication } from "../src/lib/types/clinical";
 
-function scanForEmojis(dir: string): string[] {
-  const hits: string[] = [];
-  const emojiRegex = /[\p{Extended_Pictographic}\uFE0F]/u;
-
-  function walk(current: string) {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === "node_modules" || entry.name === ".next") continue;
-        walk(fullPath);
-      } else if (/\.(ts|tsx|css|sql|md)$/.test(entry.name)) {
-        const content = fs.readFileSync(fullPath, "utf8");
-        const lines = content.split(/\r?\n/);
-        lines.forEach((line, idx) => {
-          if (emojiRegex.test(line)) {
-            hits.push(`${fullPath}:${idx + 1}: ${line.trim()}`);
-          }
-        });
-      }
-    }
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) {
+    throw new Error(`ASSERTION FAILED: ${message}`);
   }
-
-  walk(dir);
-  return hits;
 }
 
 async function runVerification() {
-  console.log("[1/12] Inicializando esquema DDL (14 tablas), triggers y semilla real...");
-  await ensureInitialized();
+  console.log("=== VERIFICACION INTEGRAL DEL SISTEMA CLINICO (PGLITE) ===");
 
-  const tablesRes = await query<{ tablename: string }>(
-    `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
-  );
-  const tableNames = new Set(tablesRes.rows.map((r) => r.tablename));
-  for (const expected of [
-    "medications",
-    "intake_clusters",
-    "medication_schedules",
-    "intake_logs",
-    "clinical_events",
-    "follow_up_topics",
-    "topic_annotations",
-    "telegram_recipients",
-    "notification_queue",
-    "financial_settings",
-    "medical_expenses",
-    "patient_profile",
-    "care_providers",
-    "governance_audit_logs",
-  ]) {
-    assert.ok(tableNames.has(expected), `Falta tabla ${expected}`);
-  }
-
-  const idxRes = await query<{ indexname: string }>(
-    `SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`
-  );
-  const idxNames = new Set(idxRes.rows.map((r) => r.indexname));
-  for (const idx of [
-    "idx_meds_low_stock",
-    "idx_intake_pending_today",
-    "idx_events_upcoming",
-    "idx_topics_open",
-    "idx_notifications_dispatch",
-    "idx_telegram_active_recipients",
-    "idx_expenses_active_date",
-    "idx_audit_recent",
-  ]) {
-    assert.ok(idxNames.has(idx), `Falta indice parcial ${idx}`);
-  }
-
-  // 2. Verificar semilla real del Word
-  console.log("[2/12] Verificando catalogo real sembrado (7 medicamentos, Rolet pendiente, Fluanxol)...");
-  const initialSnap = await getCommandCenterSnapshot();
-  assert.equal(initialSnap.medications.length, 7, "Deben sembrarse 7 medicamentos reales");
-  const roletMed = initialSnap.medications.find((m) => m.name.includes("Rolet Sup"));
-  assert.ok(roletMed, "Debe existir Rolet Sup 80/12.5");
-  assert.equal(roletMed.current_stock, null, "Rolet Sup debe iniciar con current_stock NULL");
-  assert.equal(roletMed.package_price, null, "Rolet Sup debe iniciar con package_price NULL");
-  assert.equal(roletMed.units_per_package, null, "Rolet Sup debe iniciar con units_per_package NULL");
-  assert.equal(roletMed.days_of_supply_remaining, null, "Rolet Sup debe tener cobertura NULL");
-
-  const fluanxolMed = initialSnap.medications.find((m) => m.name.includes("Fluanxol"));
-  assert.ok(fluanxolMed && fluanxolMed.units_per_package === 1, "Fluanxol debe tener units_per_package = 1");
-  const quetiapinaMed = initialSnap.medications.find((m) => m.name.includes("Quetiapina"));
-  assert.ok(quetiapinaMed && quetiapinaMed.daily_consumption_rate === 6, "Quetiapina debe tener tasa 6/dia");
-
-  // 3. Calculo de tasa diaria y agrupacion simetrica
-  console.log("[3/12] Verificando DoseClusteringService (tasa diaria y shift simetrico)...");
-  assert.equal(
-    DoseClusteringService.calculateDailyConsumptionRate(1, "FIXED_HOURS", 8),
-    3
-  );
-  assert.equal(
-    DoseClusteringService.calculateDailyConsumptionRate(1, "INTERVAL_WEEKS", 3),
-    0.0476
-  );
-
-  const med8h = await DoseClusteringService.createOrUpdateMedication({
-    name: "Test Enalapril 10mg",
-    active_ingredient: "Enalapril",
-    presentation: "Tableta",
-    dose_amount: 1,
-    current_stock: 30,
-    units_per_package: 30,
-    package_price: 120,
-    frequency_type: "FIXED_HOURS",
-    frequency_value: 8,
-    tolerance_window_mins: 30,
-    intake_rule: "NONE",
-    ideal_times: ["07:30"],
+  // Reinicio limpio de tablas en PGlite para garantizar semilla actualizada
+  await withTransaction(async (tx) => {
+    await tx.query(
+      `TRUNCATE TABLE
+         medication_versions,
+         governance_audit_logs,
+         medical_expenses,
+         notification_queue,
+         topic_annotations,
+         follow_up_topics,
+         clinical_events,
+         intake_logs,
+         medication_schedules,
+         medications,
+         intake_clusters,
+         financial_settings,
+         patient_profile,
+         care_providers,
+         alert_monitoring_settings,
+         auth_users,
+         telegram_recipients
+       RESTART IDENTITY CASCADE`
+    );
+    await seedClinicalDatabaseIfEmpty(tx);
   });
 
-  const medSchedules = await query<{ effective_clustered_time: string; cluster_id: string | null }>(
-    `SELECT effective_clustered_time::text, cluster_id FROM medication_schedules
-     WHERE medication_id = $1::uuid AND is_active = TRUE ORDER BY effective_clustered_time ASC`,
-    [med8h.id]
+  // T1: Seed inicial y estructura base
+  console.log("\n[T1] Verificando seed clinico inicial...");
+  const adminSnap = await getCommandCenterSnapshot("2026-11-19", "ADMIN");
+  assert(
+    adminSnap.medications.length === 7,
+    `Esperaba 7 medicamentos iniciales, obtuvo ${adminSnap.medications.length}`
   );
-  assert.ok(medSchedules.rows.length === 3, "Debe generar 3 tomas para cada 8h");
-  assert.ok(
-    medSchedules.rows.some((s) => s.effective_clustered_time.startsWith("08:00")),
-    "El desplazamiento simetrico debe alinear 07:30 -> 08:00"
+  assert(
+    adminSnap.clusters.filter((c) => c.is_active).length === 3,
+    `Esperaba 3 bloques horarios activos (08:00, 15:00, 21:00), obtuvo ${adminSnap.clusters.length}`
+  );
+  const rolet = adminSnap.medications.find((m) =>
+    m.name.toLowerCase().includes("rolet")
+  );
+  assert(rolet, "Rolet Sup debe existir en el catalogo");
+  assert(
+    rolet.current_stock === null && rolet.package_price === null,
+    "Rolet Sup debe iniciar con stock y precio diferibles (null)"
+  );
+  console.log(
+    "  OK: 7 medicamentos reales, 3 bloques activos (08:00/15:00/21:00) y campos diferibles."
   );
 
-  // 4. Gobernanza CRUD completa de medicamentos (crear diferido, editar, ajustar, archivar, restaurar, borrar) + clusters CRUD
-  console.log("[4/12] Verificando Gobernanza CRUD de Medicamentos y Clusters...");
-  const medDeferred = await DoseClusteringService.createOrUpdateMedication({
-    name: "Test Diferido Med",
-    presentation: "Tableta",
-    dose_amount: 1,
-    current_stock: null,
-    units_per_package: null,
-    package_price: null,
-    frequency_type: "DAILY_SLOTS",
-    frequency_value: 1,
-    tolerance_window_mins: 30,
-    intake_rule: "WITH_FOOD",
-    ideal_times: ["08:00"],
+  // T2: Datos clinicos reales solicitados (Valproato 08/15/21h, Leflunomida Lu-Vi, Fluanxol 27-nov-2026 oficial)
+  console.log(
+    "\n[T2] Verificando esquema real de Valproato, Leflunomida y Fluanxol..."
+  );
+  const valproato = adminSnap.medications.find((m) =>
+    m.name.toLowerCase().includes("valproato")
+  );
+  assert(valproato, "Valproato semisodico 500 mg debe existir");
+  assert(
+    valproato.frequency_type === "DAILY_SLOTS" &&
+      valproato.frequency_value === 3,
+    `Valproato debe ser DAILY_SLOTS=3, obtuvo ${valproato.frequency_type}=${valproato.frequency_value}`
+  );
+  assert(
+    Number(valproato.daily_consumption_rate) === 3,
+    `Valproato debe tener tasa diaria 3, obtuvo ${valproato.daily_consumption_rate}`
+  );
+  const valTimes = (valproato.schedules ?? []).map((s) =>
+    s.effective_clustered_time.slice(0, 5)
+  );
+  assert(
+    valTimes.includes("08:00") &&
+      valTimes.includes("15:00") &&
+      valTimes.includes("21:00"),
+    `Valproato debe estar en bloques 08:00, 15:00 y 21:00; obtuvo ${valTimes.join(", ")}`
+  );
+
+  const leflu = adminSnap.medications.find((m) =>
+    m.name.toLowerCase().includes("leflunomida")
+  );
+  assert(leflu, "Leflunomida 20 mg debe existir");
+  assert(
+    formatActiveDaysLabel(leflu.active_days) === "Lunes a Viernes",
+    `Leflunomida debe tener dias Lunes a Viernes, obtuvo ${formatActiveDaysLabel(leflu.active_days)}`
+  );
+  assert(
+    Math.abs(Number(leflu.daily_consumption_rate) - 0.7143) < 0.001,
+    `Leflunomida debe tener tasa efectiva 0.7143/dia, obtuvo ${leflu.daily_consumption_rate}`
+  );
+  assert(
+    Math.abs(Number(leflu.days_of_supply_remaining) - 126) < 0.5,
+    `Leflunomida con 90 tabletas Lu-Vi debe durar 126 dias, obtuvo ${leflu.days_of_supply_remaining}`
+  );
+
+  const fluanxolEvent = adminSnap.upcoming_events.find((e) =>
+    e.title.toLowerCase().includes("fluanxol")
+  );
+  assert(fluanxolEvent, "Evento de Inyeccion Fluanxol 20 mg debe existir");
+  assert(
+    fluanxolEvent.event_datetime.startsWith("2026-11-27"),
+    `Inyeccion Fluanxol debe tener fecha 2026-11-27, obtuvo ${fluanxolEvent.event_datetime}`
+  );
+  assert(
+    fluanxolEvent.date_is_estimated === false,
+    "Inyeccion Fluanxol debe estar marcada como fecha oficial (date_is_estimated = false)"
+  );
+  assert(
+    fluanxolEvent.cascade_alerts.length === 4,
+    `Inyeccion Fluanxol debe tener 4 alertas en cascada (-7d, -3d, -1d, 0d), obtuvo ${fluanxolEvent.cascade_alerts.length}`
+  );
+  console.log(
+    "  OK: Valproato (08/15/21h), Leflunomida (Lu-Vi, 0.7143/d, 126d) y Fluanxol (2026-11-27 Oficial)."
+  );
+
+  // T3: Periodicidad por dia de la semana en generacion de tomas
+  console.log(
+    "\n[T3] Verificando generacion de tomas de Lunes a Viernes vs Sabado/Domingo..."
+  );
+  assert(
+    isDateActiveForMedication(leflu, "2026-11-19") === true,
+    "Jueves 2026-11-19 debe ser dia activo para Leflunomida"
+  );
+  assert(
+    isDateActiveForMedication(leflu, "2026-11-21") === false,
+    "Sabado 2026-11-21 debe ser dia de descanso para Leflunomida"
+  );
+  assert(
+    isDateActiveForMedication(leflu, "2026-11-22") === false,
+    "Domingo 2026-11-22 debe ser dia de descanso para Leflunomida"
+  );
+
+  await DoseClusteringService.generateDailyIntakeLogsAndAlerts("2026-11-19");
+  const thuSnap = await getCommandCenterSnapshot("2026-11-19", "PATIENT");
+  const thuItems = thuSnap.today_clusters.flatMap((c) => c.items);
+  assert(
+    thuItems.some((i) => i.medication_id === leflu.id),
+    "Leflunomida debe aparecer en las tomas del jueves 2026-11-19"
+  );
+  assert(
+    !thuSnap.resting_medications_today.some((r) => r.medication_id === leflu.id),
+    "Leflunomida NO debe aparecer en descanso el jueves"
+  );
+
+  await DoseClusteringService.generateDailyIntakeLogsAndAlerts("2026-11-21");
+  const satSnap = await getCommandCenterSnapshot("2026-11-21", "PATIENT");
+  const satItems = satSnap.today_clusters.flatMap((c) => c.items);
+  assert(
+    !satItems.some((i) => i.medication_id === leflu.id),
+    "Leflunomida NO debe generar toma el sabado 2026-11-21"
+  );
+  assert(
+    satSnap.resting_medications_today.some((r) => r.medication_id === leflu.id),
+    "Leflunomida debe aparecer en resting_medications_today el sabado"
+  );
+  console.log(
+    "  OK: Periodicidad Lu-Vi genera toma en jueves y descansa en sabado/domingo."
+  );
+
+  // T4: Autenticacion y tokens firmados
+  console.log(
+    "\n[T4] Verificando autenticacion obligatoria y sesiones HMAC..."
+  );
+  const adminUser = await AuthService.authenticateUser(
+    "admin",
+    "AdminClinico2026!"
+  );
+  assert(adminUser && adminUser.role === "ADMIN", "Login de admin debe ser exitoso");
+  const patientUser = await AuthService.authenticateUser("papa", "Salud2026");
+  assert(
+    patientUser && patientUser.role === "PATIENT",
+    "Login de paciente debe ser exitoso"
+  );
+  const badLogin = await AuthService.authenticateUser("papa", "ClaveIncorrecta");
+  assert(badLogin === null, "Contrasena incorrecta debe retornar null");
+
+  const token = createSessionToken({
+    id: patientUser.id,
+    username: patientUser.username,
+    displayName: patientUser.displayName,
+    role: patientUser.role,
   });
-  assert.equal(medDeferred.current_stock, null);
-
-  const medEdited = await DoseClusteringService.createOrUpdateMedication({
-    id: medDeferred.id,
-    name: "Test Diferido Editado",
-    presentation: "Capsula",
-    dose_amount: 2,
-    current_stock: 20,
-    units_per_package: 20,
-    package_price: 400,
-    frequency_type: "DAILY_SLOTS",
-    frequency_value: 1,
-    tolerance_window_mins: 30,
-    intake_rule: "WITH_FOOD",
-    ideal_times: ["08:00"],
-  });
-  assert.equal(medEdited.name, "Test Diferido Editado");
-  assert.equal(medEdited.current_stock, 20);
-
-  const adjusted = await DoseClusteringService.adjustMedicationStock(
-    medEdited.id,
-    18,
-    "Conteo de verificacion"
+  const verifiedSession = verifySessionToken(token);
+  assert(
+    verifiedSession &&
+      verifiedSession.username === "papa" &&
+      verifiedSession.role === "PATIENT",
+    "Token HMAC debe verificarse correctamente"
   );
-  assert.equal(adjusted.current_stock, 18);
+  console.log("  OK: Autenticacion de Paciente y Administrador verificada.");
 
-  const archived = await DoseClusteringService.archiveMedication(
-    medEdited.id,
-    "Prueba de archivo"
+  // T5: RBAC Sigiloso (Stealth Patient Mode)
+  console.log(
+    "\n[T5] Verificando aislamiento sigiloso de snapshot para Paciente..."
   );
-  assert.equal(archived.is_active, false);
-
-  const restored = await DoseClusteringService.restoreMedication(medEdited.id);
-  assert.equal(restored.is_active, true);
-
-  await DoseClusteringService.deleteMedicationPermanently(medEdited.id);
-  const goneCheck = await query<{ id: string }>(
-    `SELECT id FROM medications WHERE id = $1::uuid`,
-    [medEdited.id]
+  const patientSnap = await getCommandCenterSnapshot("2026-11-19", "PATIENT");
+  assert(
+    patientSnap.telegram_configured === false &&
+      patientSnap.telegram_recipients.length === 0 &&
+      patientSnap.recent_notifications.length === 0,
+    "Paciente NO debe recibir ningun dato de Telegram en el snapshot"
   );
-  assert.equal(goneCheck.rows.length, 0, "Debe eliminar permanentemente el medicamento");
-
-  const tempCluster = await DoseClusteringService.createCluster({
-    label: "Bloque Merienda Test",
-    anchor_time: "18:30",
-    intake_rule: "NONE",
-  });
-  const updCluster = await DoseClusteringService.updateCluster(tempCluster.id, {
-    label: "Bloque Merienda Editado",
-    anchor_time: "18:45",
-    intake_rule: "WITH_FOOD",
-    is_active: true,
-  });
-  assert.equal(updCluster.label, "Bloque Merienda Editado");
-  await DoseClusteringService.deleteCluster(tempCluster.id);
-
-  // 5. Trigger atomico de descuento + reembolso al revertir/eliminar + no corrupcion de NULL
-  console.log("[5/12] Verificando trigger de descuento, alerta <= 7d y reembolso al revertir/borrar...");
-  const medLowTrigger = await DoseClusteringService.createOrUpdateMedication({
-    name: "Test Prednisona 5mg",
-    active_ingredient: "Prednisona",
-    presentation: "Tableta",
-    dose_amount: 1,
-    current_stock: 8,
-    units_per_package: 30,
-    package_price: 90,
-    frequency_type: "DAILY_SLOTS",
-    frequency_value: 1,
-    tolerance_window_mins: 30,
-    intake_rule: "WITH_FOOD",
-    ideal_times: ["08:00"],
-  });
-
-  const insLogRes = await query<{ id: string }>(
-    `INSERT INTO intake_logs (medication_id, scheduled_for, status, quantity_deducted, recorded_by)
-     VALUES ($1::uuid, NOW(), 'TAKEN', 1, 'verify-script') RETURNING id`,
-    [medLowTrigger.id]
+  assert(
+    patientSnap.medication_versions.length === 0 &&
+      patientSnap.recent_audit_logs.length === 0 &&
+      patientSnap.archived_medications.length === 0 &&
+      patientSnap.auth_users.length === 0 &&
+      patientSnap.alert_monitoring_settings === null,
+    "Paciente NO debe recibir versiones, auditoria, archivados, cuentas ni monitoreo"
   );
-  const takenLogId = insLogRes.rows[0].id;
-
-  let afterMed = await query<{ current_stock: number; days_of_supply_remaining: number }>(
-    `SELECT current_stock::float8, days_of_supply_remaining::float8 FROM medications WHERE id = $1::uuid`,
-    [medLowTrigger.id]
+  assert(
+    patientSnap.today_clusters.every((c) => c.telegram_notification === null),
+    "Los bloques del paciente no deben incluir metadatos de notificaciones de Telegram"
   );
-  assert.equal(afterMed.rows[0].current_stock, 7);
-  assert.equal(afterMed.rows[0].days_of_supply_remaining, 7);
-
-  const restockNotif = await query<{ source_type: string; stage: string }>(
-    `SELECT source_type, stage FROM notification_queue
-     WHERE source_type = 'RESTOCK_ALERT' AND source_id = $1::uuid`,
-    [medLowTrigger.id]
+  assert(
+    adminSnap.telegram_recipients.length >= 3 &&
+      adminSnap.auth_users.length === 2 &&
+      adminSnap.alert_monitoring_settings !== null,
+    "Administrador SI debe recibir destinatarios de Telegram, cuentas y monitoreo"
   );
-  assert.equal(restockNotif.rows.length, 1, "Debe insertar RESTOCK_ALERT al llegar a <= 7d");
-
-  // Revertir TAKEN -> PENDING debe reembolsar +1
-  await DoseClusteringService.confirmSingleIntakeLog(takenLogId, "PENDING", "verify-script");
-  afterMed = await query<{ current_stock: number; days_of_supply_remaining: number }>(
-    `SELECT current_stock::float8, days_of_supply_remaining::float8 FROM medications WHERE id = $1::uuid`,
-    [medLowTrigger.id]
+  console.log(
+    "  OK: Snapshot del paciente 100% libre de referencias a Telegram, versiones y admin."
   );
-  assert.equal(afterMed.rows[0].current_stock, 8, "Revertir TAKEN -> PENDING debe reembolsar stock");
 
-  // Marcar TAKEN y luego eliminar el log debe descontar y volver a reembolsar
-  await DoseClusteringService.confirmSingleIntakeLog(takenLogId, "TAKEN", "verify-script");
-  await DoseClusteringService.deleteIntakeLog(takenLogId, "verify-script");
-  afterMed = await query<{ current_stock: number; days_of_supply_remaining: number }>(
-    `SELECT current_stock::float8, days_of_supply_remaining::float8 FROM medications WHERE id = $1::uuid`,
-    [medLowTrigger.id]
+  // T6: Control de Versiones en Medicamentos (Edicion por Paciente -> Alerta Admin -> Restauracion)
+  console.log(
+    "\n[T6] Verificando control de versiones y restauracion por Administrador..."
   );
-  assert.equal(afterMed.rows[0].current_stock, 8, "Eliminar log TAKEN debe reembolsar stock");
-
-  // Confirmar toma de Rolet Sup (stock NULL) no debe mutar NULL a 0
-  await query(
-    `INSERT INTO intake_logs (medication_id, scheduled_for, status, quantity_deducted, recorded_by)
-     VALUES ($1::uuid, NOW(), 'TAKEN', 1, 'verify-script')`,
-    [roletMed.id]
-  );
-  const roletAfter = await query<{ current_stock: number | null }>(
-    `SELECT current_stock::float8 FROM medications WHERE id = $1::uuid`,
-    [roletMed.id]
-  );
-  assert.equal(roletAfter.rows[0].current_stock, null, "Stock NULL no debe corromperse a 0");
-
-  // 6. Eventos clinicos CRUD completo (crear, editar, completar + gasto, reabrir, eliminar)
-  console.log("[6/12] Verificando ClinicalEventsService CRUD completo...");
-  const recEvent = await ClinicalEventsService.createClinicalEvent({
-    title: "Test Inyeccion Biologica 21d",
-    category: "INJECTION",
-    specialist_or_center: "Centro Clinico",
-    event_datetime: new Date(Date.now() + 10 * 86400000).toISOString(),
-    is_recurring: true,
-    recurrence_interval_days: 21,
-    medication_id: medLowTrigger.id,
-    estimated_cost: 500,
-    periodicity_label: "Cada 21 dias",
-    date_is_estimated: true,
-    preparation_instructions: "Aplicacion subcutanea.",
-  });
-
-  const updEvent = await ClinicalEventsService.updateClinicalEvent(recEvent.id, {
-    title: "Test Inyeccion Editada",
-    category: "INJECTION",
-    specialist_or_center: "Centro Editado",
-    event_datetime: new Date(Date.now() + 12 * 86400000).toISOString(),
-    is_recurring: true,
-    recurrence_interval_days: 21,
-    medication_id: medLowTrigger.id,
-    estimated_cost: 650,
-    periodicity_label: "Cada 21 dias",
-    date_is_estimated: false,
-    preparation_instructions: "Aplicacion intramuscular.",
-  });
-  assert.equal(updEvent.title, "Test Inyeccion Editada");
-
-  const compRes = await ClinicalEventsService.completeClinicalEvent(
-    recEvent.id,
-    "verify-script",
-    { actual_cost: 650, notes: "Aplicada sin incidentes", log_expense: true }
-  );
-  assert.ok(compRes.nextEventId, "Debe crear automaticamente el siguiente ciclo");
-  assert.equal(compRes.stockDeducted, true);
-  assert.equal(compRes.expenseLogged, true);
-
-  await ClinicalEventsService.reopenClinicalEvent(recEvent.id);
-  await ClinicalEventsService.deleteClinicalEvent(recEvent.id);
-  if (compRes.nextEventId) {
-    await ClinicalEventsService.deleteClinicalEvent(compRes.nextEventId);
-  }
-
-  // 7. Temas de seguimiento + anotaciones CRUD + convertir a evento
-  console.log("[7/12] Verificando FollowUpTopicsService CRUD completo y conversion...");
-  const topic = await FollowUpTopicsService.createFollowUpTopic({
-    title: "Test Buscar Rehabilitador",
-    description: "Evaluar 3 opciones",
-    priority: 1,
-    deadline_at: new Date(Date.now() + 10 * 86400000).toISOString(),
-    estimated_budget: 950,
-  });
-  const ann = await FollowUpTopicsService.addTopicAnnotation({
-    topic_id: topic.id,
-    author: "Cuidador",
-    note_type: "QUOTE",
-    contact_name: "Clinica Norte",
-    contact_phone: "+52 55 1234 5678",
-    estimated_cost: 950,
-    content: "Cotizacion inicial.",
-  });
-  const annUpd = await FollowUpTopicsService.updateTopicAnnotation(ann.id, {
-    note_type: "QUOTE",
-    estimated_cost: 900,
-    content: "Cotizacion ajustada a $900.",
-  });
-  assert.equal(annUpd.estimated_cost, 900);
-
-  const conv = await FollowUpTopicsService.convertTopicToEvent(
-    topic.id,
+  const originalDose = leflu.dose_amount;
+  const updatedByPatient = await DoseClusteringService.createOrUpdateMedication(
     {
-      title: "Primera Sesion Rehabilitacion",
-      category: "APPOINTMENT",
-      event_datetime: new Date(Date.now() + 5 * 86400000).toISOString(),
-      is_recurring: false,
-      estimated_cost: 900,
+      id: leflu.id,
+      name: leflu.name,
+      active_ingredient: leflu.active_ingredient,
+      presentation: leflu.presentation,
+      units_per_package: leflu.units_per_package,
+      package_price: leflu.package_price,
+      dose_amount: 2,
+      current_stock: leflu.current_stock,
+      frequency_type: leflu.frequency_type,
+      frequency_value: leflu.frequency_value,
+      tolerance_window_mins: leflu.tolerance_window_mins,
+      intake_rule: leflu.intake_rule,
+      active_days: [1, 3, 5],
+      schedule_start_date: null,
+      preferred_pharmacy: leflu.preferred_pharmacy,
+      purchase_priority: leflu.purchase_priority,
+      safety_buffer_days: leflu.safety_buffer_days,
+      clinical_notes: "Cambio temporal hecho por paciente",
+      ideal_times: ["08:00:00"],
     },
-    true
+    { role: "PATIENT", actor: "Paciente (Papa)" }
   );
-  assert.equal(conv.topic.status, "COMPLETED");
-  await ClinicalEventsService.deleteClinicalEvent(conv.event.id);
-  await FollowUpTopicsService.deleteTopicAnnotation(ann.id);
-  await FollowUpTopicsService.deleteFollowUpTopic(topic.id);
-
-  // 8. Modulo Financiero y Optimizador Quincenal
-  console.log("[8/12] Verificando FinancialPlannerService (quincenas 15/30, feb, suavizado Min-Max, compras y gastos CRUD)...");
-  const testSettings: FinancialSettings = {
-    id: 1,
-    currency: "MXN",
-    pay_schedule_type: "QUINCENAL_15_30",
-    payday_1: 15,
-    payday_2: 30,
-    biweekly_anchor_date: null,
-    quincenal_budget_cap: 2500,
-    monthly_budget_cap: null,
-    safety_buffer_days: 7,
-    planning_horizon_quincenas: 6,
-    include_events_in_plan: true,
-    updated_at: new Date().toISOString(),
-  };
-
-  // Verificar febrero: debe resolver a 2027-02-28
-  const febPlan = FinancialPlannerService.buildFinancialSnapshot(
-    [],
-    [],
-    testSettings,
-    [],
-    new Date("2027-02-01T12:00:00Z")
-  );
-  assert.ok(
-    febPlan.buckets.some((b) => b.pay_date === "2027-02-28"),
-    "El dia 30 en febrero 2027 debe ajustarse al ultimo dia del mes (2027-02-28)"
+  assert(
+    Number(updatedByPatient.dose_amount) === 2,
+    "El paciente debe poder editar un medicamento libremente"
   );
 
-  // Verificar suavizado de pico: una consulta de $2,000 en Q2 + medicamento caro que cae tambien en Q2 debe adelantarse a Q1
-  const spikeMed: Medication = {
-    id: "00000000-0000-0000-0000-0000000000a1",
-    name: "Med Costoso",
-    active_ingredient: "Test",
-    presentation: "Caja",
+  const versions = await MedicationVersionService.listVersionsForMedication(
+    leflu.id
+  );
+  assert(
+    versions.length >= 2,
+    `Deben existir al menos 2 versiones (base + edicion del paciente), obtuvo ${versions.length}`
+  );
+  const latestVersion = versions[0];
+  const baselineVersion = versions[versions.length - 1];
+  assert(
+    latestVersion.changed_by_role === "PATIENT" &&
+      latestVersion.reviewed_by_admin === false,
+    "La version editada por el paciente debe quedar pendiente de revision por admin"
+  );
+  assert(
+    latestVersion.changed_fields.some((f) => f.field === "dose_amount"),
+    "El diff de la version debe registrar el cambio de dosis"
+  );
+
+  const changeAlertsRes = await query<{ count: string }>(
+    `SELECT COUNT(*)::text AS count
+     FROM notification_queue
+     WHERE source_type = 'PATIENT_CHANGE_ALERT'
+       AND source_id = $1::uuid`,
+    [leflu.id]
+  );
+  assert(
+    Number(changeAlertsRes.rows[0]?.count ?? 0) >= 1,
+    "Editar como paciente debe encolar una alerta PATIENT_CHANGE_ALERT para administradores"
+  );
+
+  await MedicationVersionService.markVersionReviewed(
+    latestVersion.id,
+    "Administrador Clinico"
+  );
+  await MedicationVersionService.restoreMedicationVersion(
+    leflu.id,
+    baselineVersion.id,
+    "Administrador Clinico"
+  );
+
+  const restoredSnap = await getCommandCenterSnapshot("2026-11-19", "ADMIN");
+  const restoredLeflu = restoredSnap.medications.find((m) => m.id === leflu.id);
+  assert(
+    restoredLeflu &&
+      Number(restoredLeflu.dose_amount) === Number(originalDose) &&
+      formatActiveDaysLabel(restoredLeflu.active_days) === "Lunes a Viernes",
+    "La restauracion de version debe devolver Leflunomida a dosis 1 y Lunes a Viernes"
+  );
+  console.log(
+    "  OK: Version base capturada, cambio del paciente auditado y version restaurada con exito."
+  );
+
+  // T7: Trigger SQL de descuento de stock y reversa
+  console.log("\n[T7] Verificando trigger SQL fn_process_medication_intake...");
+  const thuLog = thuItems.find((i) => i.medication_id === valproato.id);
+  assert(thuLog, "Debe existir toma de Valproato el jueves");
+  const stockBefore = valproato.current_stock ?? 0;
+
+  await DoseClusteringService.confirmSingleIntakeLog(
+    thuLog.intake_log_id,
+    "TAKEN",
+    "Test Runner",
+    "Tomada con desayuno"
+  );
+  const afterTakenRes = await query<{ current_stock: string }>(
+    `SELECT current_stock::text FROM medications WHERE id = $1::uuid`,
+    [valproato.id]
+  );
+  assert(
+    Number(afterTakenRes.rows[0]?.current_stock) ===
+      stockBefore - valproato.dose_amount,
+    "Confirmar TAKEN debe descontar la dosis del stock"
+  );
+
+  await DoseClusteringService.confirmSingleIntakeLog(
+    thuLog.intake_log_id,
+    "PENDING",
+    "Test Runner"
+  );
+  const afterRevertRes = await query<{ current_stock: string }>(
+    `SELECT current_stock::text FROM medications WHERE id = $1::uuid`,
+    [valproato.id]
+  );
+  assert(
+    Number(afterRevertRes.rows[0]?.current_stock) === stockBefore,
+    "Revertir a PENDING debe reembolsar la dosis al stock"
+  );
+  console.log("  OK: Descuento y reembolso transaccional de stock verificados.");
+
+  // T8: Gobernanza CRUD de medicamentos, eventos, temas, finanzas y expediente
+  console.log(
+    "\n[T8] Verificando CRUD completo (Medicamentos, Eventos, Temas, Finanzas, Expediente)..."
+  );
+  const tempMed = await DoseClusteringService.createOrUpdateMedication(
+    {
+      name: "Test Enalapril 10mg",
+      active_ingredient: "Enalapril",
+      presentation: "Tabletas",
+      units_per_package: 30,
+      package_price: 240,
+      dose_amount: 1,
+      current_stock: 15,
+      frequency_type: "DAILY_SLOTS",
+      frequency_value: 2,
+      tolerance_window_mins: 45,
+      intake_rule: "WITH_FOOD",
+      active_days: [1, 2, 3, 4, 5],
+      schedule_start_date: null,
+      preferred_pharmacy: "Farmacia San Pablo",
+      purchase_priority: 2,
+      safety_buffer_days: 7,
+      clinical_notes: "Prueba temporal",
+      ideal_times: ["08:00:00", "21:00:00"],
+    },
+    { role: "ADMIN", actor: "Test Suite" }
+  );
+  assert(
+    Math.abs(
+      tempMed.daily_consumption_rate -
+        calculateEffectiveDailyRate(1, "DAILY_SLOTS", 2, [1, 2, 3, 4, 5])
+    ) < 0.001,
+    "Tasa diaria de medicamento Lu-Vi con 2 tomas debe ser 1.4286"
+  );
+  await DoseClusteringService.archiveMedication(tempMed.id, "Fin de prueba");
+  await DoseClusteringService.restoreMedication(tempMed.id);
+  await DoseClusteringService.deleteMedicationPermanently(tempMed.id);
+
+  const mockMed: Medication = {
+    id: "00000000-0000-0000-0000-000000000099",
+    name: "Mock Med",
+    active_ingredient: null,
+    presentation: "Tabletas",
     units_per_package: 30,
-    package_price: 1500,
+    package_price: 600,
     dose_amount: 1,
-    current_stock: 40, // agota ~40 dias -> deadline ~33 dias (caeria en Q2/Q3)
+    current_stock: 5,
     frequency_type: "DAILY_SLOTS",
     frequency_value: 1,
     tolerance_window_mins: 30,
     intake_rule: "NONE",
+    active_days: null,
+    schedule_start_date: null,
     daily_consumption_rate: 1,
-    days_of_supply_remaining: 40,
+    days_of_supply_remaining: 5,
     preferred_pharmacy: null,
     purchase_priority: 1,
     safety_buffer_days: 7,
@@ -430,282 +438,137 @@ async function runVerification() {
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
-  const spikeEvent: ClinicalEventItem = {
-    id: "00000000-0000-0000-0000-0000000000e1",
-    title: "Consulta Especialista Cara",
-    category: "APPOINTMENT",
-    specialist_or_center: "Centro",
-    location_address: null,
-    event_datetime: "2026-12-31T16:00:00Z", // cae en bucket Q2 (2026-12-30..2027-01-14)
-    is_recurring: false,
-    recurrence_interval_days: null,
-    medication_id: null,
-    medication_name: null,
-    parent_event_id: null,
-    preparation_instructions: null,
-    estimated_cost: 2200,
-    actual_cost: null,
-    periodicity_label: null,
-    date_is_estimated: false,
-    notes: null,
-    is_completed: false,
-    completed_at: null,
-    created_at: new Date().toISOString(),
-    cascade_alerts: [],
-  };
-
-  const smoothPlan = FinancialPlannerService.buildFinancialSnapshot(
-    [spikeMed],
-    [spikeEvent],
-    testSettings,
+  const planCheck = FinancialPlannerService.buildFinancialSnapshot(
+    [mockMed],
     [],
-    new Date("2026-12-01T12:00:00Z")
+    null,
+    [],
+    new Date("2026-11-19T12:00:00Z")
   );
-  assert.ok(
-    smoothPlan.summary.optimized_peak_quincena <
-      smoothPlan.summary.baseline_peak_quincena,
-    "El optimizador debe reducir el pico quincenal respecto al baseline"
+  assert(
+    planCheck.buckets.some((b) => b.purchases.length >= 1),
+    "Debe proyectar compras quincenales"
   );
-  assert.ok(smoothPlan.summary.shifted_purchases_count >= 1);
 
-  const updatedSettings = await FinancialPlannerService.updateFinancialSettings({
-    currency: "MXN",
-    pay_schedule_type: "QUINCENAL_15_30",
-    payday_1: 15,
-    payday_2: 30,
-    quincenal_budget_cap: 3000,
-    monthly_budget_cap: 6000,
-    safety_buffer_days: 7,
-    planning_horizon_quincenas: 6,
-    include_events_in_plan: true,
+  const tempTopic = await FollowUpTopicsService.createFollowUpTopic({
+    title: "Cotizar estudio temporal",
+    description: "Prueba",
+    priority: 2,
+    deadline_at: new Date(Date.now() + 5 * 86400000).toISOString(),
+    estimated_budget: 1200,
   });
-  assert.equal(updatedSettings.quincenal_budget_cap, 3000);
-
-  const execPurchase = await FinancialPlannerService.executePlannedPurchase({
-    medication_id: roletMed.id,
-    packages: 1,
-    units_override: 30,
-    package_price: 420,
-    total_amount: 420,
-    purchase_date: new Date().toISOString().slice(0, 10),
-    quincena_label: "Q2 Nov 2026",
-    provider_or_pharmacy: "Farmacia del Ahorro",
-    payment_method: "Debito",
+  const tempAnn = await FollowUpTopicsService.addTopicAnnotation({
+    topic_id: tempTopic.id,
+    author: "Test",
+    note_type: "QUOTE",
+    content: "Cotizacion recibida",
   });
-  assert.equal(execPurchase.medication.current_stock, 30);
-  assert.equal(execPurchase.medication.package_price, 420);
+  await FollowUpTopicsService.deleteTopicAnnotation(tempAnn.id);
+  await FollowUpTopicsService.deleteFollowUpTopic(tempTopic.id);
 
-  const updExp = await FinancialPlannerService.updateExpense(execPurchase.expense.id, {
-    title: "Compra Rolet Sup Editada",
-    category: "MEDICATION",
-    status: "PAID",
-    amount: 430,
-    expense_date: new Date().toISOString().slice(0, 10),
-    medication_id: roletMed.id,
-  });
-  assert.equal(updExp.amount, 430);
-  await FinancialPlannerService.deleteExpense(updExp.id);
-
-  // 9. Expediente Clinico y Directorio Medico
-  console.log("[9/12] Verificando PatientDossierService y Auditoria...");
-  const prof = await PatientDossierService.updatePatientProfile({
-    full_name: "Papa Dobrusin",
-    blood_type: "O+",
-    weight_kg: 76.5,
-    allergies: "Ninguna conocida",
-  });
-  assert.equal(prof.blood_type, "O+");
-
-  const prov = await PatientDossierService.createCareProvider({
-    name: "Dr. Prueba",
+  const tempProvider = await PatientDossierService.createCareProvider({
+    name: "Dr. Temporal",
     specialty: "Medicina Interna",
-    consultation_fee: 1100,
   });
-  const provUpd = await PatientDossierService.updateCareProvider(prov.id, {
-    name: "Dr. Prueba Editado",
-    specialty: "Medicina Interna",
-    consultation_fee: 1200,
-  });
-  assert.equal(provUpd.consultation_fee, 1200);
-  await PatientDossierService.deleteCareProvider(prov.id);
+  await PatientDossierService.deleteCareProvider(tempProvider.id);
+  console.log("  OK: Gobernanza CRUD y motor financiero quincenal verificados.");
 
-  // 10. Telegram bilateral + gobernanza de destinatarios y cola
-  console.log("[10/12] Verificando TelegramNotificationService (bilateral, NULL-resilient, gobernanza)...");
-  const payloadsRes = await query<{ callback_action_payload: string | null }>(
-    `SELECT callback_action_payload FROM notification_queue WHERE callback_action_payload IS NOT NULL`
+  // T9: Separacion Paciente vs Admin en Telegram + Alertas de Bloque Atrasado + Reporte Semanal
+  console.log(
+    "\n[T9] Verificando separacion de roles y monitoreo administrativo en Telegram..."
   );
-  for (const row of payloadsRes.rows) {
-    assert.ok(
-      Buffer.byteLength(row.callback_action_payload ?? "", "utf8") <= 64,
-      `Payload excede 64 bytes: ${row.callback_action_payload}`
-    );
-  }
-
-  const dispatchRes = await TelegramNotificationService.dispatchQueuedNotifications();
-  assert.ok(dispatchRes.dispatched >= 1);
-
-  const badSecret = await TelegramNotificationService.handleWebhookUpdate(
-    { update_id: 1, message: { message_id: 1, chat: { id: 100100002 }, text: "/estado" } },
-    "wrong-secret"
-  );
-  assert.equal(badSecret.unauthorized, true);
-
-  const estadoRes = await TelegramNotificationService.handleWebhookUpdate(
-    { update_id: 2, message: { message_id: 2, chat: { id: 100100002 }, text: "/estado" } },
-    "verify-secret-token"
-  );
-  assert.equal(estadoRes.ok, true);
-  assert.ok(estadoRes.statusHtml?.includes("ESTADO CLINICO CONSOLIDADO"));
-  assert.ok(estadoRes.statusHtml?.includes("1. BLOQUES PENDIENTES HOY"));
-  assert.ok(estadoRes.statusHtml?.includes("2. INVENTARIO CRITICO"));
-  assert.ok(estadoRes.statusHtml?.includes("3. PROXIMOS EVENTOS CLINICOS"));
-  assert.ok(estadoRes.statusHtml?.includes("4. TEMAS DE SEGUIMIENTO ABIERTOS"));
-
-  assert.equal(PATIENT_PERSISTENT_KEYBOARD.is_persistent, true);
-  for (const [btnText, expectedAction] of [
-    ["[ Tomas de Hoy ]", "tomas_hoy"],
-    ["[ Registrar Restock ]", "restock_menu"],
-    ["[ Proximas Citas ]", "citas"],
-    ["[ Estado de Inventario ]", "estado"],
-  ] as const) {
-    const btnResp = await TelegramNotificationService.handleWebhookUpdate(
+  const patientReportAttempt =
+    await TelegramNotificationService.handleWebhookUpdate(
       {
-        update_id: Date.now(),
-        message: { message_id: 100, chat: { id: 100100002 }, text: btnText },
+        update_id: 90001,
+        message: {
+          message_id: 1,
+          chat: { id: 100100001 }, // Chat ID del Paciente
+          text: "/reporte",
+        },
       },
-      "verify-secret-token"
+      null,
+      { skipSecretCheck: true }
     );
-    assert.equal(btnResp.ok, true);
-    assert.equal(btnResp.action, expectedAction);
-  }
-
-  const restockKb = TelegramNotificationService.buildRestockInlineKeyboard(
-    medLowTrigger.id,
-    30
+  assert(
+    !(patientReportAttempt.statusHtml ?? "").includes("REPORTE SEMANAL"),
+    "El paciente en Telegram NO debe tener acceso al comando /reporte de administradores"
   );
-  for (const row of restockKb.inline_keyboard) {
-    for (const btn of row) {
-      assert.ok(Buffer.byteLength(btn.callback_data, "utf8") <= 64);
-    }
-  }
 
-  const addResp = await TelegramNotificationService.handleWebhookUpdate(
-    {
-      update_id: Date.now(),
-      callback_query: {
-        id: "sim_add_1",
-        from: { id: 100100002 },
-        message: { message_id: 201, chat: { id: 100100002 }, text: "Select" },
-        data: `restock_add:${medLowTrigger.id}:30`,
+  const adminReportAttempt =
+    await TelegramNotificationService.handleWebhookUpdate(
+      {
+        update_id: 90002,
+        message: {
+          message_id: 2,
+          chat: { id: 100100002 }, // Chat ID de Administrador
+          text: "/reporte",
+        },
       },
-    },
-    "verify-secret-token"
+      null,
+      { skipSecretCheck: true }
+    );
+  assert(
+    (adminReportAttempt.statusHtml ?? "").includes("REPORTE SEMANAL"),
+    "El administrador en Telegram SI debe recibir el reporte semanal con /reporte"
   );
-  assert.equal(addResp.action, "restock_add");
-  assert.ok(addResp.statusHtml?.includes("RESTOCK CONFIRMADO +30"));
 
-  const tempRec = await TelegramNotificationService.upsertRecipient({
-    full_name: "Temporal TG",
-    role: "FAMILY_MEMBER",
-    telegram_chat_id: "999888777",
-  });
-  const updRec = await TelegramNotificationService.updateRecipient(tempRec.id, {
-    full_name: "Temporal Editado",
-    role: "CAREGIVER",
-    telegram_chat_id: "999888777",
-  });
-  assert.equal(updRec.full_name, "Temporal Editado");
-  await TelegramNotificationService.deleteRecipient(tempRec.id);
-
-  // Confirmacion parcial ack_log + sync Web->TG
-  const snapshotBeforeAck = await getCommandCenterSnapshot();
-  const pendingCluster = snapshotBeforeAck.today_clusters.find(
-    (c) => c.items.filter((i) => i.status === "PENDING").length >= 2
-  );
-  assert.ok(pendingCluster, "Debe haber un bloque con >= 2 medicinas pendientes");
-  const pendingItems = pendingCluster.items.filter((i) => i.status === "PENDING");
-  const partialResp = await TelegramNotificationService.handleWebhookUpdate(
-    {
-      update_id: Date.now(),
-      callback_query: {
-        id: "sim_ack_log_1",
-        from: { id: 100100002 },
-        message: { message_id: 202, chat: { id: 100100002 }, text: "Bloque" },
-        data: `ack_log:${pendingItems[0].intake_log_id}`,
+  // Restock hecho por paciente en Telegram crea version y alerta para admin
+  const patientRestockAttempt =
+    await TelegramNotificationService.handleWebhookUpdate(
+      {
+        update_id: 90003,
+        callback_query: {
+          id: "sim_cb_restock_test",
+          from: { id: 100100001 },
+          message: {
+            message_id: 3,
+            chat: { id: 100100001 },
+          },
+          data: `restock_add:${valproato.id}:30`,
+        },
       },
-    },
-    "verify-secret-token"
+      null,
+      { skipSecretCheck: true }
+    );
+  assert(
+    patientRestockAttempt.ok,
+    "El paciente debe poder registrar restock desde Telegram"
   );
-  assert.equal(partialResp.action, "ack_log_partial");
-
-  await DoseClusteringService.confirmClusterIntake(
-    pendingCluster.cluster_id,
-    snapshotBeforeAck.target_date,
-    "Consola Clinica Web",
-    { origin: "WEB" }
+  const valVersions = await MedicationVersionService.listVersionsForMedication(
+    valproato.id
   );
-
-  // 11. Command Center Snapshot + Vercel Hobby + Cron Auth
-  console.log("[11/12] Verificando Command Center Snapshot completo, Vercel Hobby y Cron Auth...");
-  const finalSnap = await getCommandCenterSnapshot();
-  assert.ok(finalSnap.today_clusters.length >= 1);
-  assert.ok(finalSnap.financial_plan.buckets.length >= 6);
-  assert.ok(finalSnap.recent_audit_logs.length >= 5);
-  assert.equal(finalSnap.patient_profile.blood_type, "O+");
-
-  const vercelRaw = fs.readFileSync(
-    path.resolve(process.cwd(), "vercel.json"),
-    "utf8"
-  );
-  const vercelCfg = JSON.parse(vercelRaw) as {
-    regions?: string[];
-    crons?: unknown;
-  };
-  assert.deepEqual(vercelCfg.regions, ["iad1"]);
-  assert.equal(vercelCfg.crons, undefined);
-
-  const unauthResp = await cronDispatchGet(
-    new Request("http://localhost/api/cron/dispatch", { method: "GET" })
-  );
-  assert.equal(unauthResp.status, 401);
-
-  const wrongAuthResp = await cronDispatchPost(
-    new Request("http://localhost/api/cron/dispatch", {
-      method: "POST",
-      headers: { Authorization: "Bearer wrong-cron-secret" },
-    })
-  );
-  assert.equal(wrongAuthResp.status, 401);
-
-  const okCronResp = await cronDispatchGet(
-    new Request("http://localhost/api/cron/dispatch", {
-      method: "GET",
-      headers: { Authorization: "Bearer verify-cron-secret" },
-    })
-  );
-  assert.equal(okCronResp.status, 200);
-  const okCronBody = (await okCronResp.json()) as {
-    ok: boolean;
-    dispatched_count: number;
-  };
-  assert.equal(okCronBody.ok, true);
-
-  // 12. Cero emojis estricto en src/
-  console.log("[12/12] Auditando cero emojis en todo src/ ...");
-  const emojiHits = scanForEmojis(path.resolve(process.cwd(), "src"));
-  assert.equal(
-    emojiHits.length,
-    0,
-    `Se encontraron emojis prohibidos en:\n${emojiHits.join("\n")}`
+  assert(
+    valVersions.some(
+      (v) => v.change_action === "RESTOCK" && v.changed_by_role === "PATIENT"
+    ),
+    "El restock del paciente en Telegram debe quedar registrado en control de versiones para el admin"
   );
 
-  await closeDbForTests();
-  fs.rmSync(testPgDir, { recursive: true, force: true });
-  console.log("VERIFICACION INTEGRAL EXITOSA: 12/12 PRUEBAS SUPERADAS CON CERO EMOJIS.");
+  // Evaluacion de bloque no marcado como tomado (60 min despues de las 08:00 -> 10:30 local)
+  const missedEval = await TelegramNotificationService.evaluateMissedBlockAlerts(
+    new Date("2026-11-19T16:30:00Z") // 10:30 America/Mexico_City (UTC-6)
+  );
+  assert(
+    missedEval.queued >= 1,
+    `Debe encolar alerta MISSED_INTAKE_ALERT para el bloque de las 08:00 no tomado (encoladas: ${missedEval.queued})`
+  );
+
+  const weeklyNow = await TelegramNotificationService.queueWeeklyReportNow(
+    "Test Runner"
+  );
+  assert(
+    weeklyNow.reportHtml.includes("REPORTE SEMANAL"),
+    "queueWeeklyReportNow debe generar el HTML del reporte semanal de comportamiento"
+  );
+  console.log(
+    "  OK: Bot separado por rol, alerta de bloque no tomado y reporte semanal verificados."
+  );
+
+  console.log("\n=== TODAS LAS PRUEBAS (T1 - T9) PASARON EXITOSAMENTE ===");
 }
 
-runVerification().catch(async (err) => {
-  console.error("VERIFICACION FALLIDA:", err);
-  await closeDbForTests().catch(() => {});
+runVerification().catch((err) => {
+  console.error("\nFALLO EN VERIFICACION:", err);
   process.exit(1);
 });

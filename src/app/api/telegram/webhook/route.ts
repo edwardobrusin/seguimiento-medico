@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { requireAdmin } from "@/lib/auth/session";
+import { formatApiError } from "@/lib/api-error";
 import {
   TelegramNotificationService,
   type TelegramUpdatePayload,
@@ -12,6 +14,10 @@ export async function POST(req: Request) {
   try {
     const url = new URL(req.url);
     const isLocalSimulation = url.searchParams.get("simulate") === "1";
+    if (isLocalSimulation) {
+      await requireAdmin();
+    }
+
     const secretHeader = req.headers.get("x-telegram-bot-api-secret-token");
     const update = (await req.json()) as TelegramUpdatePayload;
 
@@ -34,11 +40,13 @@ export async function POST(req: Request) {
 
     return NextResponse.json(result, { headers: NO_STORE_HEADERS });
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "Error en webhook de Telegram.";
+    const { status, message } = formatApiError(
+      err,
+      "Error en webhook de Telegram."
+    );
     return NextResponse.json(
       { error: message },
-      { status: 400, headers: NO_STORE_HEADERS }
+      { status, headers: NO_STORE_HEADERS }
     );
   }
 }

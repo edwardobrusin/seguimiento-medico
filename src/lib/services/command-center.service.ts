@@ -1,5 +1,13 @@
 import { ensureInitialized, getDbMode, query } from "@/lib/db/client";
+import {
+  formatActiveDaysLabel,
+  isDateActiveForMedication,
+  normalizeActiveDays,
+} from "@/lib/periodicity";
+import { getClinicalDateParts } from "@/lib/utils";
 import type {
+  AlertMonitoringSettings,
+  AuthUserPublic,
   CareProvider,
   ClinicalEventItem,
   ClusterIntakeItem,
@@ -11,10 +19,13 @@ import type {
   MedicalExpense,
   Medication,
   MedicationAdherenceSummary,
+  MedicationVersionItem,
   NotificationQueueItem,
   PatientProfile,
+  RestingMedicationToday,
   TelegramRecipient,
   TodayClusterBlock,
+  UserRole,
 } from "@/lib/types/clinical";
 import {
   DEFAULT_FINANCIAL_SETTINGS,
@@ -59,6 +70,9 @@ interface SnapshotSqlPayload {
   care_providers: CareProvider[];
   adherence_30d: MedicationAdherenceSummary[];
   recent_audit_logs: GovernanceAuditLog[];
+  medication_versions: MedicationVersionItem[];
+  alert_monitoring_settings: AlertMonitoringSettings | null;
+  auth_users: AuthUserPublic[];
 }
 
 const COMMAND_CENTER_SNAPSHOT_SQL = `
@@ -107,7 +121,7 @@ today_cluster_items AS (
   JOIN medications m ON m.id = il.medication_id
   LEFT JOIN medication_schedules ms ON ms.id = il.schedule_id
   WHERE il.cluster_id IS NOT NULL
-    AND (il.scheduled_for AT TIME ZONE 'UTC')::date = ($1::text)::date
+    AND (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = ($1::text)::date
     AND (m.is_active = TRUE OR il.status != 'PENDING')
 ),
 today_clusters_agg AS (
@@ -162,7 +176,7 @@ unclustered_today_cte AS (
       'quantity_deducted', il.quantity_deducted::float8,
       'intake_rule', m.intake_rule,
       'ideal_time', ms.ideal_time::text,
-      'effective_clustered_time', COALESCE(ms.effective_clustered_time::text, (il.scheduled_for AT TIME ZONE 'UTC')::time::text),
+      'effective_clustered_time', COALESCE(ms.effective_clustered_time::text, (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::time::text),
       'scheduled_for', il.scheduled_for,
       'taken_at', il.taken_at,
       'status', il.status,
@@ -177,7 +191,7 @@ unclustered_today_cte AS (
   JOIN medications m ON m.id = il.medication_id
   LEFT JOIN medication_schedules ms ON ms.id = il.schedule_id
   WHERE il.cluster_id IS NULL
-    AND (il.scheduled_for AT TIME ZONE 'UTC')::date = ($1::text)::date
+    AND (il.scheduled_for AT TIME ZONE 'America/Mexico_City')::date = ($1::text)::date
     AND (m.is_active = TRUE OR il.status != 'PENDING')
 ),
 med_schedules_agg AS (
@@ -213,6 +227,8 @@ active_medications AS (
     m.frequency_value,
     m.tolerance_window_mins,
     m.intake_rule,
+    m.active_days,
+    m.schedule_start_date::text AS schedule_start_date,
     m.daily_consumption_rate::float8 AS daily_consumption_rate,
     m.days_of_supply_remaining::float8 AS days_of_supply_remaining,
     m.preferred_pharmacy,
@@ -243,6 +259,8 @@ archived_medications_cte AS (
     m.frequency_value,
     m.tolerance_window_mins,
     m.intake_rule,
+    m.active_days,
+    m.schedule_start_date::text AS schedule_start_date,
     m.daily_consumption_rate::float8 AS daily_consumption_rate,
     m.days_of_supply_remaining::float8 AS days_of_supply_remaining,
     m.preferred_pharmacy,
@@ -443,6 +461,9 @@ telegram_recipients_cte AS (
     tr.receive_restock_alerts,
     tr.receive_event_reminders,
     tr.receive_topic_reminders,
+    tr.receive_missed_block_alerts,
+    tr.receive_weekly_report,
+    tr.receive_change_alerts,
     tr.is_active,
     tr.created_at
   FROM telegram_recipients tr
@@ -589,6 +610,52 @@ recent_audit_logs_cte AS (
   FROM governance_audit_logs gal
   ORDER BY gal.created_at DESC
   LIMIT 50
+),
+medication_versions_cte AS (
+  SELECT
+    mv.id,
+    mv.medication_id,
+    m.name AS medication_name,
+    mv.version_number,
+    mv.change_action,
+    mv.changed_by_role,
+    mv.changed_by_actor,
+    mv.change_summary,
+    mv.changed_fields,
+    mv.snapshot_json,
+    mv.reviewed_by_admin,
+    mv.reviewed_at,
+    mv.created_at
+  FROM medication_versions mv
+  JOIN medications m ON m.id = mv.medication_id
+  ORDER BY mv.created_at DESC
+  LIMIT 60
+),
+alert_monitoring_settings_cte AS (
+  SELECT
+    ams.id,
+    ams.timezone,
+    ams.missed_block_grace_mins,
+    ams.missed_block_alerts_enabled,
+    ams.weekly_report_enabled,
+    ams.weekly_report_day,
+    ams.weekly_report_hour,
+    ams.notify_admin_on_patient_change,
+    ams.updated_at
+  FROM alert_monitoring_settings ams
+  WHERE ams.id = 1
+  LIMIT 1
+),
+auth_users_cte AS (
+  SELECT
+    au.id,
+    au.username,
+    au.display_name,
+    au.role,
+    au.is_active,
+    au.updated_at
+  FROM auth_users au
+  ORDER BY CASE WHEN au.role = 'ADMIN' THEN 0 ELSE 1 END, au.username ASC
 )
 SELECT json_build_object(
   'today_clusters', COALESCE(
@@ -736,12 +803,35 @@ SELECT json_build_object(
       FROM recent_audit_logs_cte al
     ),
     '[]'::json
+  ),
+  'medication_versions', COALESCE(
+    (
+      SELECT json_agg(row_to_json(mv) ORDER BY mv.created_at DESC)
+      FROM medication_versions_cte mv
+    ),
+    '[]'::json
+  ),
+  'alert_monitoring_settings', (SELECT row_to_json(ams) FROM alert_monitoring_settings_cte ams),
+  'auth_users', COALESCE(
+    (
+      SELECT json_agg(row_to_json(au))
+      FROM auth_users_cte au
+    ),
+    '[]'::json
   )
 ) AS snapshot;
 `;
 
+function normalizeMedList(list: Medication[] | undefined): Medication[] {
+  return (list ?? []).map((m) => ({
+    ...m,
+    active_days: normalizeActiveDays(m.active_days),
+  }));
+}
+
 export async function getCommandCenterSnapshot(
-  targetDateStr?: string
+  targetDateStr?: string,
+  viewerRole: UserRole = "ADMIN"
 ): Promise<CommandCenterSnapshot> {
   await ensureInitialized();
 
@@ -749,7 +839,7 @@ export async function getCommandCenterSnapshot(
   const dateStr =
     trimmed && /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
       ? trimmed
-      : new Date().toISOString().slice(0, 10);
+      : getClinicalDateParts("America/Mexico_City").dateStr;
 
   const res = await query<{ snapshot: SnapshotSqlPayload | string }>(
     COMMAND_CENTER_SNAPSHOT_SQL,
@@ -780,9 +870,31 @@ export async function getCommandCenterSnapshot(
           care_providers: [],
           adherence_30d: [],
           recent_audit_logs: [],
+          medication_versions: [],
+          alert_monitoring_settings: null,
+          auth_users: [],
         };
 
-  const medications = parsed.medications ?? [];
+  const medications = normalizeMedList(parsed.medications);
+  const lowStockMedications = normalizeMedList(parsed.low_stock_medications);
+  const incompleteMedications = normalizeMedList(parsed.incomplete_medications);
+  const archivedMedications = normalizeMedList(parsed.archived_medications);
+
+  const restingMedicationsToday: RestingMedicationToday[] = medications
+    .filter(
+      (med) =>
+        med.schedules &&
+        med.schedules.length > 0 &&
+        !isDateActiveForMedication(med, dateStr)
+    )
+    .map((med) => ({
+      medication_id: med.id,
+      name: med.name,
+      dose_amount: med.dose_amount,
+      presentation: med.presentation,
+      active_days_label: formatActiveDaysLabel(med.active_days),
+    }));
+
   const upcomingEvents = parsed.upcoming_events ?? [];
   const financialSettings =
     parsed.financial_settings ?? DEFAULT_FINANCIAL_SETTINGS;
@@ -795,30 +907,43 @@ export async function getCommandCenterSnapshot(
     recentExpenses
   );
 
+  const isAdmin = viewerRole === "ADMIN";
+  const todayClusters = (parsed.today_clusters ?? []).map((block) =>
+    isAdmin ? block : { ...block, telegram_notification: null }
+  );
+
   return {
     generated_at: new Date().toISOString(),
     target_date: dateStr,
     db_mode: getDbMode(),
-    telegram_configured: Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim()),
-    today_clusters: parsed.today_clusters ?? [],
+    telegram_configured: isAdmin
+      ? Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim())
+      : false,
+    today_clusters: todayClusters,
     unclustered_today_intakes: parsed.unclustered_today_intakes ?? [],
-    low_stock_medications: parsed.low_stock_medications ?? [],
-    incomplete_medications: parsed.incomplete_medications ?? [],
+    resting_medications_today: restingMedicationsToday,
+    low_stock_medications: lowStockMedications,
+    incomplete_medications: incompleteMedications,
     medications,
-    archived_medications: parsed.archived_medications ?? [],
+    archived_medications: isAdmin ? archivedMedications : [],
     clusters: parsed.clusters ?? [],
     upcoming_events: upcomingEvents,
     completed_events: parsed.completed_events ?? [],
     open_topics: parsed.open_topics ?? [],
     completed_topics: parsed.completed_topics ?? [],
-    telegram_recipients: parsed.telegram_recipients ?? [],
-    recent_notifications: parsed.recent_notifications ?? [],
+    telegram_recipients: isAdmin ? parsed.telegram_recipients ?? [] : [],
+    recent_notifications: isAdmin ? parsed.recent_notifications ?? [] : [],
     financial_settings: financialSettings,
     financial_plan: financialPlan,
     recent_expenses: recentExpenses,
     patient_profile: parsed.patient_profile ?? DEFAULT_PATIENT_PROFILE,
     care_providers: parsed.care_providers ?? [],
     adherence_30d: parsed.adherence_30d ?? [],
-    recent_audit_logs: parsed.recent_audit_logs ?? [],
+    recent_audit_logs: isAdmin ? parsed.recent_audit_logs ?? [] : [],
+    medication_versions: isAdmin ? parsed.medication_versions ?? [] : [],
+    alert_monitoring_settings: isAdmin
+      ? parsed.alert_monitoring_settings ?? null
+      : null,
+    auth_users: isAdmin ? parsed.auth_users ?? [] : [],
   };
 }

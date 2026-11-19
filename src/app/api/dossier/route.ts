@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { getActorLabel, requireAdmin, requireSession } from "@/lib/auth/session";
+import { formatApiError } from "@/lib/api-error";
 import { PatientDossierService } from "@/lib/services/patient-dossier.service";
 import { NO_STORE_HEADERS, safeRevalidateHome } from "@/lib/vercel-cache";
 
@@ -55,8 +57,17 @@ export async function POST(req: Request) {
     const raw = await req.json();
     const body = dossierActionSchema.parse(raw);
 
+    const session =
+      body.action === "delete_provider"
+        ? await requireAdmin()
+        : await requireSession();
+    const actor = getActorLabel(session);
+
     if (body.action === "update_profile") {
-      const profile = await PatientDossierService.updatePatientProfile(body);
+      const profile = await PatientDossierService.updatePatientProfile(
+        body,
+        actor
+      );
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, profile },
@@ -65,7 +76,10 @@ export async function POST(req: Request) {
     }
 
     if (body.action === "create_provider") {
-      const provider = await PatientDossierService.createCareProvider(body);
+      const provider = await PatientDossierService.createCareProvider(
+        body,
+        actor
+      );
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, provider },
@@ -76,7 +90,8 @@ export async function POST(req: Request) {
     if (body.action === "update_provider") {
       const provider = await PatientDossierService.updateCareProvider(
         body.provider_id,
-        body
+        body,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -86,7 +101,8 @@ export async function POST(req: Request) {
     }
 
     const result = await PatientDossierService.deleteCareProvider(
-      body.provider_id
+      body.provider_id,
+      actor
     );
     safeRevalidateHome();
     return NextResponse.json(
@@ -94,11 +110,13 @@ export async function POST(req: Request) {
       { headers: NO_STORE_HEADERS }
     );
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "Error en expediente clinico.";
+    const { status, message } = formatApiError(
+      err,
+      "Error en expediente clinico."
+    );
     return NextResponse.json(
       { error: message },
-      { status: 400, headers: NO_STORE_HEADERS }
+      { status, headers: NO_STORE_HEADERS }
     );
   }
 }

@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { getActorLabel, requireAdmin, requireSession } from "@/lib/auth/session";
+import { formatApiError } from "@/lib/api-error";
 import { ClinicalEventsService } from "@/lib/services/clinical-events.service";
 import { NO_STORE_HEADERS, safeRevalidateHome } from "@/lib/vercel-cache";
 
@@ -36,7 +38,7 @@ const eventActionSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("complete"),
     event_id: z.string().uuid(),
-    recorded_by: z.string().min(1).max(100).default("Consola Clinica Web"),
+    recorded_by: z.string().min(1).max(100).optional(),
     actual_cost: z.number().min(0).nullable().optional(),
     notes: z.string().nullable().optional(),
     log_expense: z.boolean().default(false),
@@ -61,8 +63,15 @@ export async function POST(req: Request) {
     const raw = await req.json();
     const body = eventActionSchema.parse(raw);
 
+    const session =
+      body.action === "delete" ? await requireAdmin() : await requireSession();
+    const actor = getActorLabel(session);
+
     if (body.action === "create") {
-      const event = await ClinicalEventsService.createClinicalEvent(body);
+      const event = await ClinicalEventsService.createClinicalEvent(
+        body,
+        actor
+      );
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, event },
@@ -73,7 +82,8 @@ export async function POST(req: Request) {
     if (body.action === "update") {
       const event = await ClinicalEventsService.updateClinicalEvent(
         body.event_id,
-        body
+        body,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -85,7 +95,7 @@ export async function POST(req: Request) {
     if (body.action === "complete") {
       const result = await ClinicalEventsService.completeClinicalEvent(
         body.event_id,
-        body.recorded_by,
+        actor,
         {
           actual_cost: body.actual_cost ?? null,
           notes: body.notes ?? null,
@@ -101,7 +111,8 @@ export async function POST(req: Request) {
 
     if (body.action === "reopen") {
       const event = await ClinicalEventsService.reopenClinicalEvent(
-        body.event_id
+        body.event_id,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -112,7 +123,8 @@ export async function POST(req: Request) {
 
     if (body.action === "delete") {
       const result = await ClinicalEventsService.deleteClinicalEvent(
-        body.event_id
+        body.event_id,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -123,7 +135,8 @@ export async function POST(req: Request) {
 
     const event = await ClinicalEventsService.rescheduleClinicalEvent(
       body.event_id,
-      body.event_datetime
+      body.event_datetime,
+      actor
     );
     safeRevalidateHome();
     return NextResponse.json(
@@ -131,11 +144,13 @@ export async function POST(req: Request) {
       { headers: NO_STORE_HEADERS }
     );
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "Error al procesar evento clinico.";
+    const { status, message } = formatApiError(
+      err,
+      "Error al procesar evento clinico."
+    );
     return NextResponse.json(
       { error: message },
-      { status: 400, headers: NO_STORE_HEADERS }
+      { status, headers: NO_STORE_HEADERS }
     );
   }
 }

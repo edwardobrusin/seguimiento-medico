@@ -1,10 +1,15 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import {
+  AlertCircle,
   Archive,
+  CalendarClock,
+  Check,
   Clock,
   Edit3,
+  History,
+  Info,
   PackagePlus,
   Plus,
   RefreshCw,
@@ -25,7 +30,25 @@ import {
   INTAKE_RULE_TAG,
   PURCHASE_PRIORITY_TAG,
 } from "@/lib/clinical-labels";
-import { cn, formatCurrencyMxn, formatShortTime } from "@/lib/utils";
+import {
+  activeDaysEqual,
+  calculateEffectiveDailyRate,
+  DAY_SCHEDULE_PRESETS,
+  formatActiveDaysLabel,
+  normalizeActiveDays,
+  WEEKDAY_LABEL,
+  WEEKDAY_ORDER,
+  WEEKDAY_TWO_CHAR,
+} from "@/lib/periodicity";
+import {
+  cn,
+  formatCurrencyMxn,
+  formatShortTime,
+  getLocalDateIso,
+} from "@/lib/utils";
+import { ClinicalModal } from "./ClinicalModal";
+import { IconActionButton } from "./IconActionButton";
+import { MedicationVersionsModal } from "./MedicationVersionsModal";
 import { StatusBadge } from "./StatusBadge";
 
 export interface SaveMedicationPayload {
@@ -41,6 +64,9 @@ export interface SaveMedicationPayload {
   frequency_value: number;
   tolerance_window_mins: number;
   intake_rule: IntakeConstraint;
+  active_days: number[] | null;
+  schedule_start_date: string | null;
+  event_linked_only: boolean;
   preferred_pharmacy: string | null;
   purchase_priority: number;
   safety_buffer_days: number;
@@ -50,6 +76,7 @@ export interface SaveMedicationPayload {
 
 interface MedicationsInventoryViewProps {
   snapshot: CommandCenterSnapshot;
+  isAdmin: boolean;
   onSaveMedication: (payload: SaveMedicationPayload) => Promise<void>;
   onRestockMedication: (
     medicationId: string,
@@ -74,7 +101,9 @@ interface MedicationsInventoryViewProps {
   ) => Promise<void>;
   onRestoreMedication: (medicationId: string) => Promise<void>;
   onDeleteMedication: (medicationId: string) => Promise<void>;
-  onGenerateTodayLogs: () => Promise<void>;
+  onRestoreVersion: (medicationId: string, versionId: string) => Promise<void>;
+  onMarkVersionReviewed: (versionId: string) => Promise<void>;
+  onGenerateTodayLogs: (overrideDate?: string) => Promise<void>;
   onCreateCluster: (payload: {
     label: string;
     anchor_time: string;
@@ -92,911 +121,1512 @@ interface MedicationsInventoryViewProps {
   onDeleteCluster: (clusterId: string) => Promise<void>;
 }
 
-type FilterTab = "active" | "incomplete" | "critical" | "archived";
+const DEFAULT_SLOT_DEFAULTS = ["08:00", "15:00", "21:00", "23:00", "06:00", "12:00"];
 
-function previewDailyRate(
-  doseAmount: number,
-  freqType: MedFrequencyType,
-  freqValue: number
-): number {
-  if (!Number.isFinite(doseAmount) || !Number.isFinite(freqValue) || freqValue <= 0) {
-    return 0;
+function parseOptionalNumber(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : null;
+}
+
+function buildInitialSlots(count: number, clusterAnchors: string[]): string[] {
+  const safeCount = Math.max(1, Math.min(8, count));
+  const pool =
+    clusterAnchors.length > 0 ? clusterAnchors : DEFAULT_SLOT_DEFAULTS;
+  const result: string[] = [];
+  for (let i = 0; i < safeCount; i++) {
+    result.push(pool[i] ?? DEFAULT_SLOT_DEFAULTS[i] ?? "08:00");
   }
-  switch (freqType) {
-    case "FIXED_HOURS":
-      return Number(((24 / freqValue) * doseAmount).toFixed(4));
-    case "DAILY_SLOTS":
-      return Number((freqValue * doseAmount).toFixed(4));
-    case "INTERVAL_DAYS":
-      return Number((doseAmount / freqValue).toFixed(4));
-    case "INTERVAL_WEEKS":
-      return Number((doseAmount / (freqValue * 7)).toFixed(4));
-  }
+  return result;
 }
 
 export function MedicationsInventoryView({
   snapshot,
+  isAdmin,
   onSaveMedication,
   onRestockMedication,
   onAdjustStock,
   onArchiveMedication,
   onRestoreMedication,
   onDeleteMedication,
+  onRestoreVersion,
+  onMarkVersionReviewed,
   onGenerateTodayLogs,
   onCreateCluster,
   onUpdateCluster,
   onDeleteCluster,
 }: MedicationsInventoryViewProps) {
-  const [filterTab, setFilterTab] = useState<FilterTab>("active");
-  const [searchQuery, setSearchQuery] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
 
-  // Formulario Crear / Editar Medicamento
-  const [showForm, setShowForm] = useState(false);
-  const [editingMedId, setEditingMedId] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [activeIngredient, setActiveIngredient] = useState("");
-  const [presentation, setPresentation] = useState("Tableta");
-  const [doseAmount, setDoseAmount] = useState("1");
-  const [frequencyType, setFrequencyType] =
-    useState<MedFrequencyType>("DAILY_SLOTS");
-  const [frequencyValue, setFrequencyValue] = useState("1");
-  const [toleranceMins, setToleranceMins] = useState("30");
-  const [intakeRule, setIntakeRule] = useState<IntakeConstraint>("WITH_FOOD");
-  const [idealTimeInput, setIdealTimeInput] = useState("08:00");
-  const [clinicalNotes, setClinicalNotes] = useState("");
-
-  // Campos diferibles / financieros
-  const [stockPending, setStockPending] = useState(false);
-  const [currentStock, setCurrentStock] = useState("30");
-  const [pkgPending, setPkgPending] = useState(false);
-  const [unitsPerPackage, setUnitsPerPackage] = useState("30");
-  const [pricePending, setPricePending] = useState(false);
-  const [packagePrice, setPackagePrice] = useState("");
-  const [preferredPharmacy, setPreferredPharmacy] = useState("");
-  const [purchasePriority, setPurchasePriority] = useState("1");
-  const [safetyBufferDays, setSafetyBufferDays] = useState("7");
-  const [formError, setFormError] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  // Acciones por fila
-  const [restockId, setRestockId] = useState<string | null>(null);
-  const [restockQty, setRestockQty] = useState("30");
-  const [restockPrice, setRestockPrice] = useState("");
-  const [restockPkgUnits, setRestockPkgUnits] = useState("");
-  const [restockPharmacy, setRestockPharmacy] = useState("");
-  const [restockLogExpense, setRestockLogExpense] = useState(true);
-
-  const [adjustId, setAdjustId] = useState<string | null>(null);
-  const [adjustStockVal, setAdjustStockVal] = useState("0");
-  const [adjustMarkPending, setAdjustMarkPending] = useState(false);
-  const [adjustReason, setAdjustReason] = useState("Conteo fisico");
-
-  const [archiveTargetId, setArchiveTargetId] = useState<string | null>(null);
-  const [archiveReason, setArchiveReason] = useState("");
-
-  const [confirmDeleteMedId, setConfirmDeleteMedId] = useState<string | null>(
-    null
+  // Modal Create/Edit Medication
+  const [medModalOpen, setMedModalOpen] = useState(false);
+  const [editingMed, setEditingMed] = useState<Medication | null>(null);
+  const [medName, setMedName] = useState("");
+  const [medIngredient, setMedIngredient] = useState("");
+  const [medPresentation, setMedPresentation] = useState("Tabletas");
+  const [medDose, setMedDose] = useState("1");
+  const [medFreqType, setMedFreqType] = useState<MedFrequencyType>("DAILY_SLOTS");
+  const [medFreqVal, setMedFreqVal] = useState("1");
+  const [medTolerance, setMedTolerance] = useState("45");
+  const [medRule, setMedRule] = useState<IntakeConstraint>("WITH_FOOD");
+  const [medActiveDays, setMedActiveDays] = useState<number[] | null>(null);
+  const [medScheduleStart, setMedScheduleStart] = useState<string>(
+    getLocalDateIso()
   );
+  const [medEventLinkedOnly, setMedEventLinkedOnly] = useState(false);
+  const [medSlotTimes, setMedSlotTimes] = useState<string[]>(["08:00"]);
+  const [medStartTime, setMedStartTime] = useState("08:00");
+  const [medStock, setMedStock] = useState("");
+  const [medUnitsPkg, setMedUnitsPkg] = useState("");
+  const [medPrice, setMedPrice] = useState("");
+  const [medPharmacy, setMedPharmacy] = useState("");
+  const [medPriority, setMedPriority] = useState("2");
+  const [medBufferDays, setMedBufferDays] = useState("7");
+  const [medNotes, setMedNotes] = useState("");
+  const [medFormError, setMedFormError] = useState<string | null>(null);
+  const [savingMed, setSavingMed] = useState(false);
 
-  // Gestion de Clusters Horarios
-  const [showClusterManager, setShowClusterManager] = useState(false);
-  const [editingClusterId, setEditingClusterId] = useState<string | null>(null);
+  // Modal Restock
+  const [restockTarget, setRestockTarget] = useState<Medication | null>(null);
+  const [restockQty, setRestockQty] = useState("30");
+  const [restockUnitsPkg, setRestockUnitsPkg] = useState("");
+  const [restockPkgPrice, setRestockPkgPrice] = useState("");
+  const [restockExpenseAmount, setRestockExpenseAmount] = useState("");
+  const [restockPharmacy, setRestockPharmacy] = useState("");
+  const [restockPaymentMethod, setRestockPaymentMethod] = useState("Tarjeta");
+  const [restockLogExpense, setRestockLogExpense] = useState(true);
+  const [restockError, setRestockError] = useState<string | null>(null);
+  const [savingRestock, setSavingRestock] = useState(false);
+
+  // Modal Adjust Stock
+  const [adjustTarget, setAdjustTarget] = useState<Medication | null>(null);
+  const [adjustStockVal, setAdjustStockVal] = useState("");
+  const [adjustUnknown, setAdjustUnknown] = useState(false);
+  const [adjustReason, setAdjustReason] = useState("Conteo fisico manual");
+  const [adjustError, setAdjustError] = useState<string | null>(null);
+  const [savingAdjust, setSavingAdjust] = useState(false);
+
+  // Modal Archive (Admin)
+  const [archiveTarget, setArchiveTarget] = useState<Medication | null>(null);
+  const [archiveReason, setArchiveReason] = useState("");
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [savingArchive, setSavingArchive] = useState(false);
+
+  // Modal Versions (Admin)
+  const [versionsTarget, setVersionsTarget] = useState<Medication | null>(null);
+
+  // Modal Clusters
+  const [clustersModalOpen, setClustersModalOpen] = useState(false);
+  const [editingCluster, setEditingCluster] = useState<IntakeCluster | null>(null);
   const [clusterLabel, setClusterLabel] = useState("");
-  const [clusterTime, setClusterTime] = useState("08:00");
+  const [clusterAnchor, setClusterAnchor] = useState("15:00");
   const [clusterRule, setClusterRule] = useState<IntakeConstraint>("WITH_FOOD");
+  const [clusterActive, setClusterActive] = useState(true);
+  const [clusterError, setClusterError] = useState<string | null>(null);
+  const [savingCluster, setSavingCluster] = useState(false);
   const [confirmDeleteClusterId, setConfirmDeleteClusterId] = useState<
     string | null
   >(null);
 
-  const computedRate = previewDailyRate(
-    Number(doseAmount),
-    frequencyType,
-    Number(frequencyValue)
+  // Busy & 2-step delete state
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [confirmDeleteMedId, setConfirmDeleteMedId] = useState<string | null>(
+    null
   );
 
-  function resetForm() {
-    setEditingMedId(null);
-    setName("");
-    setActiveIngredient("");
-    setPresentation("Tableta");
-    setDoseAmount("1");
-    setFrequencyType("DAILY_SLOTS");
-    setFrequencyValue("1");
-    setToleranceMins("30");
-    setIntakeRule("WITH_FOOD");
-    setIdealTimeInput("08:00");
-    setClinicalNotes("");
-    setStockPending(false);
-    setCurrentStock("30");
-    setPkgPending(false);
-    setUnitsPerPackage("30");
-    setPricePending(false);
-    setPackagePrice("");
-    setPreferredPharmacy("");
-    setPurchasePriority("2");
-    setSafetyBufferDays("7");
-    setFormError(null);
-  }
+  const clusterAnchors = useMemo(
+    () =>
+      snapshot.clusters
+        .filter((c) => c.is_active)
+        .map((c) => formatShortTime(c.anchor_time)),
+    [snapshot.clusters]
+  );
 
-  function openNewMedicationForm() {
-    resetForm();
-    setShowForm(true);
-  }
-
-  function openEditMedicationForm(med: Medication) {
-    setEditingMedId(med.id);
-    setName(med.name);
-    setActiveIngredient(med.active_ingredient ?? "");
-    setPresentation(med.presentation);
-    setDoseAmount(String(med.dose_amount));
-    setFrequencyType(med.frequency_type);
-    setFrequencyValue(String(med.frequency_value));
-    setToleranceMins(String(med.tolerance_window_mins));
-    setIntakeRule(med.intake_rule);
-    const times =
-      med.schedules && med.schedules.length > 0
-        ? med.schedules.map((s) => formatShortTime(s.ideal_time)).join(", ")
-        : "08:00";
-    setIdealTimeInput(times);
-    setClinicalNotes(med.clinical_notes ?? "");
-
-    setStockPending(med.current_stock === null);
-    setCurrentStock(med.current_stock !== null ? String(med.current_stock) : "");
-    setPkgPending(med.units_per_package === null);
-    setUnitsPerPackage(
-      med.units_per_package !== null ? String(med.units_per_package) : ""
+  const filteredMeds = useMemo(() => {
+    const q = searchTerm.trim().toLowerCase();
+    if (!q) return snapshot.medications;
+    return snapshot.medications.filter(
+      (m) =>
+        m.name.toLowerCase().includes(q) ||
+        (m.active_ingredient ?? "").toLowerCase().includes(q) ||
+        (m.preferred_pharmacy ?? "").toLowerCase().includes(q)
     );
-    setPricePending(med.package_price === null);
-    setPackagePrice(
-      med.package_price !== null ? String(med.package_price) : ""
-    );
-    setPreferredPharmacy(med.preferred_pharmacy ?? "");
-    setPurchasePriority(String(med.purchase_priority ?? 2));
-    setSafetyBufferDays(String(med.safety_buffer_days ?? 7));
-    setFormError(null);
-    setShowForm(true);
+  }, [snapshot.medications, searchTerm]);
+
+  const versionsByMedId = useMemo(() => {
+    const map = new Map<
+      string,
+      { total: number; unreviewed: number }
+    >();
+    if (!isAdmin) return map;
+    for (const ver of snapshot.medication_versions) {
+      const current = map.get(ver.medication_id) ?? {
+        total: 0,
+        unreviewed: 0,
+      };
+      current.total += 1;
+      if (ver.changed_by_role === "PATIENT" && !ver.reviewed_by_admin) {
+        current.unreviewed += 1;
+      }
+      map.set(ver.medication_id, current);
+    }
+    return map;
+  }, [isAdmin, snapshot.medication_versions]);
+
+  // Preview rate in Create/Edit modal
+  const previewRate = useMemo(() => {
+    const doseNum = parseOptionalNumber(medDose) ?? 1;
+    const freqNum = Math.max(1, Number.parseInt(medFreqVal || "1", 10) || 1);
+    const daysArg =
+      medFreqType === "DAILY_SLOTS" || medFreqType === "FIXED_HOURS"
+        ? medActiveDays
+        : null;
+    return calculateEffectiveDailyRate(doseNum, medFreqType, freqNum, daysArg);
+  }, [medDose, medFreqType, medFreqVal, medActiveDays]);
+
+  const previewSupplyDays = useMemo(() => {
+    const stockNum = parseOptionalNumber(medStock);
+    if (stockNum === null || previewRate <= 0) return null;
+    return Number((stockNum / previewRate).toFixed(1));
+  }, [medStock, previewRate]);
+
+  function openCreateMedicationModal() {
+    setEditingMed(null);
+    setMedName("");
+    setMedIngredient("");
+    setMedPresentation("Tabletas");
+    setMedDose("1");
+    setMedFreqType("DAILY_SLOTS");
+    setMedFreqVal("1");
+    setMedTolerance("45");
+    setMedRule("WITH_FOOD");
+    setMedActiveDays(null);
+    setMedScheduleStart(getLocalDateIso());
+    setMedEventLinkedOnly(false);
+    setMedSlotTimes([clusterAnchors[0] ?? "08:00"]);
+    setMedStartTime(clusterAnchors[0] ?? "08:00");
+    setMedStock("");
+    setMedUnitsPkg("");
+    setMedPrice("");
+    setMedPharmacy("");
+    setMedPriority("2");
+    setMedBufferDays("7");
+    setMedNotes("");
+    setMedFormError(null);
+    setMedModalOpen(true);
   }
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setFormError(null);
-    if (!name.trim()) {
-      setFormError("Escribe el nombre del medicamento.");
-      return;
+  function openEditMedicationModal(med: Medication) {
+    setEditingMed(med);
+    setMedName(med.name);
+    setMedIngredient(med.active_ingredient ?? "");
+    setMedPresentation(med.presentation);
+    setMedDose(String(med.dose_amount));
+    setMedFreqType(med.frequency_type);
+    setMedFreqVal(String(med.frequency_value));
+    setMedTolerance(String(med.tolerance_window_mins));
+    setMedRule(med.intake_rule);
+    setMedActiveDays(normalizeActiveDays(med.active_days));
+    setMedScheduleStart(
+      med.schedule_start_date
+        ? med.schedule_start_date.slice(0, 10)
+        : getLocalDateIso()
+    );
+
+    const existingTimes = (med.schedules ?? []).map((s) =>
+      formatShortTime(s.ideal_time)
+    );
+    const isIntervalMed =
+      med.frequency_type === "INTERVAL_DAYS" ||
+      med.frequency_type === "INTERVAL_WEEKS";
+    setMedEventLinkedOnly(isIntervalMed && existingTimes.length === 0);
+
+    if (med.frequency_type === "DAILY_SLOTS") {
+      const targetCount = Math.max(1, med.frequency_value);
+      const defaults = buildInitialSlots(targetCount, clusterAnchors);
+      const merged = Array.from(
+        { length: targetCount },
+        (_, idx) => existingTimes[idx] ?? defaults[idx] ?? "08:00"
+      );
+      setMedSlotTimes(merged);
+      setMedStartTime(merged[0] ?? "08:00");
+    } else {
+      const firstTime = existingTimes[0] ?? clusterAnchors[0] ?? "08:00";
+      setMedSlotTimes([firstTime]);
+      setMedStartTime(firstTime);
     }
 
-    const doseNum = Number(doseAmount);
-    const freqNum = Number(frequencyValue);
-    const tolNum = Number(toleranceMins);
-    if (
-      !Number.isFinite(doseNum) ||
-      doseNum <= 0 ||
-      !Number.isFinite(freqNum) ||
-      freqNum <= 0
-    ) {
-      setFormError("Dosis y frecuencia deben ser valores numericos mayores a 0.");
-      return;
-    }
+    setMedStock(med.current_stock === null ? "" : String(med.current_stock));
+    setMedUnitsPkg(
+      med.units_per_package === null ? "" : String(med.units_per_package)
+    );
+    setMedPrice(med.package_price === null ? "" : String(med.package_price));
+    setMedPharmacy(med.preferred_pharmacy ?? "");
+    setMedPriority(String(med.purchase_priority));
+    setMedBufferDays(String(med.safety_buffer_days));
+    setMedNotes(med.clinical_notes ?? "");
+    setMedFormError(null);
+    setMedModalOpen(true);
+  }
 
-    let stockVal: number | null = null;
-    if (!stockPending && currentStock.trim() !== "") {
-      const parsed = Number(currentStock);
-      if (!Number.isFinite(parsed) || parsed < 0) {
-        setFormError("El inventario actual debe ser >= 0 o marcarse como pendiente.");
-        return;
-      }
-      stockVal = parsed;
-    }
-
-    let pkgVal: number | null = null;
-    if (!pkgPending && unitsPerPackage.trim() !== "") {
-      const parsed = Number(unitsPerPackage);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        setFormError("Las piezas por envase deben ser > 0 o marcarse como pendiente.");
-        return;
-      }
-      pkgVal = parsed;
-    }
-
-    let priceVal: number | null = null;
-    if (!pricePending && packagePrice.trim() !== "") {
-      const parsed = Number(packagePrice);
-      if (!Number.isFinite(parsed) || parsed < 0) {
-        setFormError("El precio por envase debe ser >= 0 o marcarse como pendiente.");
-        return;
-      }
-      priceVal = parsed;
-    }
-
-    const idealTimes = idealTimeInput
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    setIsSubmitting(true);
-    try {
-      await onSaveMedication({
-        id: editingMedId ?? undefined,
-        name: name.trim(),
-        active_ingredient: activeIngredient.trim() || null,
-        presentation: presentation.trim() || "Tableta",
-        units_per_package: pkgVal,
-        package_price: priceVal,
-        dose_amount: doseNum,
-        current_stock: stockVal,
-        frequency_type: frequencyType,
-        frequency_value: Math.round(freqNum),
-        tolerance_window_mins: Number.isFinite(tolNum) ? Math.round(tolNum) : 30,
-        intake_rule: intakeRule,
-        preferred_pharmacy: preferredPharmacy.trim() || null,
-        purchase_priority: Number(purchasePriority) || 2,
-        safety_buffer_days: Number(safetyBufferDays) || 7,
-        clinical_notes: clinicalNotes.trim() || null,
-        ideal_times: idealTimes.length > 0 ? idealTimes : ["08:00"],
+  function handleFrequencyTypeChange(nextType: MedFrequencyType) {
+    setMedFreqType(nextType);
+    if (nextType === "DAILY_SLOTS") {
+      const count = Math.max(1, Math.min(8, Number.parseInt(medFreqVal || "1", 10) || 1));
+      setMedEventLinkedOnly(false);
+      setMedSlotTimes((prev) => {
+        const fallback = buildInitialSlots(count, clusterAnchors);
+        return Array.from({ length: count }, (_, i) => prev[i] ?? fallback[i]);
       });
-      resetForm();
-      setShowForm(false);
+    } else if (nextType === "FIXED_HOURS") {
+      setMedEventLinkedOnly(false);
+      if (!medFreqVal || Number.parseInt(medFreqVal, 10) < 2) {
+        setMedFreqVal("8");
+      }
+    }
+  }
+
+  function handleFrequencyValChange(raw: string) {
+    setMedFreqVal(raw);
+    if (medFreqType === "DAILY_SLOTS") {
+      const count = Math.max(1, Math.min(8, Number.parseInt(raw || "1", 10) || 1));
+      setMedSlotTimes((prev) => {
+        const fallback = buildInitialSlots(count, clusterAnchors);
+        return Array.from({ length: count }, (_, i) => prev[i] ?? fallback[i]);
+      });
+    }
+  }
+
+  function toggleWeekday(dayNum: number) {
+    setMedActiveDays((prev) => {
+      const current = prev === null ? [...WEEKDAY_ORDER] : [...prev];
+      const exists = current.includes(dayNum);
+      const next = exists
+        ? current.filter((d) => d !== dayNum)
+        : [...current, dayNum];
+      return normalizeActiveDays(next);
+    });
+  }
+
+  async function handleSaveMedicationSubmit(e: FormEvent) {
+    e.preventDefault();
+    setMedFormError(null);
+
+    const trimmedName = medName.trim();
+    if (!trimmedName) {
+      setMedFormError("Ingresa el nombre del medicamento.");
+      return;
+    }
+
+    const parsedDose = parseOptionalNumber(medDose);
+    if (parsedDose === null || parsedDose <= 0) {
+      setMedFormError("La dosis por toma debe ser mayor a 0 (ej. 1 o 0.5).");
+      return;
+    }
+
+    const parsedFreqVal = Number.parseInt(medFreqVal, 10);
+    if (!Number.isFinite(parsedFreqVal) || parsedFreqVal <= 0) {
+      setMedFormError("La frecuencia debe ser un numero entero positivo.");
+      return;
+    }
+
+    const parsedStock = parseOptionalNumber(medStock);
+    if (parsedStock !== null && parsedStock < 0) {
+      setMedFormError("El inventario actual no puede ser negativo.");
+      return;
+    }
+
+    const parsedUnitsPkg = parseOptionalNumber(medUnitsPkg);
+    if (parsedUnitsPkg !== null && parsedUnitsPkg <= 0) {
+      setMedFormError("Las unidades por caja deben ser mayores a 0.");
+      return;
+    }
+
+    const parsedPrice = parseOptionalNumber(medPrice);
+    if (parsedPrice !== null && parsedPrice < 0) {
+      setMedFormError("El precio por caja no puede ser negativo.");
+      return;
+    }
+
+    const isDailyOrFixed =
+      medFreqType === "DAILY_SLOTS" || medFreqType === "FIXED_HOURS";
+
+    const idealTimes = medEventLinkedOnly
+      ? []
+      : medFreqType === "DAILY_SLOTS"
+      ? medSlotTimes.slice(0, parsedFreqVal).map((t) => `${t}:00`.slice(0, 8))
+      : [`${medStartTime}:00`.slice(0, 8)];
+
+    const payload: SaveMedicationPayload = {
+      ...(editingMed ? { id: editingMed.id } : {}),
+      name: trimmedName,
+      active_ingredient: medIngredient.trim() || null,
+      presentation: medPresentation.trim() || "Tabletas",
+      units_per_package: parsedUnitsPkg,
+      package_price: parsedPrice,
+      dose_amount: parsedDose,
+      current_stock: parsedStock,
+      frequency_type: medFreqType,
+      frequency_value: parsedFreqVal,
+      tolerance_window_mins: Math.max(
+        0,
+        Math.min(180, Number.parseInt(medTolerance || "45", 10) || 45)
+      ),
+      intake_rule: medRule,
+      active_days: isDailyOrFixed ? normalizeActiveDays(medActiveDays) : null,
+      schedule_start_date: isDailyOrFixed
+        ? null
+        : medScheduleStart.trim() || null,
+      event_linked_only: medEventLinkedOnly,
+      preferred_pharmacy: medPharmacy.trim() || null,
+      purchase_priority: Math.max(
+        1,
+        Math.min(3, Number.parseInt(medPriority || "2", 10) || 2)
+      ),
+      safety_buffer_days: Math.max(
+        1,
+        Math.min(60, Number.parseInt(medBufferDays || "7", 10) || 7)
+      ),
+      clinical_notes: medNotes.trim() || null,
+      ideal_times: idealTimes,
+    };
+
+    setSavingMed(true);
+    try {
+      await onSaveMedication(payload);
+      setMedModalOpen(false);
     } catch (err) {
-      setFormError(
-        err instanceof Error ? err.message : "Error al guardar medicamento."
+      setMedFormError(
+        err instanceof Error
+          ? err.message
+          : "No se pudo guardar el medicamento."
       );
     } finally {
-      setIsSubmitting(false);
+      setSavingMed(false);
     }
   }
 
-  async function handleQuickRestock(med: Medication) {
-    const qty = Number(restockQty);
-    if (!Number.isFinite(qty) || qty <= 0) return;
-
-    const expenseAmt =
-      restockPrice.trim() !== "" && Number.isFinite(Number(restockPrice))
-        ? Number(restockPrice)
-        : null;
-    const pkgUnitsVal =
-      restockPkgUnits.trim() !== "" && Number.isFinite(Number(restockPkgUnits))
-        ? Number(restockPkgUnits)
-        : null;
-
-    await onRestockMedication(med.id, qty, {
-      package_price:
-        expenseAmt !== null && med.package_price === null ? expenseAmt : undefined,
-      units_per_package: pkgUnitsVal ?? undefined,
-      expense_amount: expenseAmt,
-      provider_or_pharmacy: restockPharmacy.trim() || null,
-      log_expense: restockLogExpense && expenseAmt !== null,
-    });
-    setRestockId(null);
-    setRestockPrice("");
-    setRestockPkgUnits("");
-    setRestockPharmacy("");
+  function openRestockModal(med: Medication) {
+    setRestockTarget(med);
+    const defaultQty = med.units_per_package ?? 30;
+    setRestockQty(String(defaultQty));
+    setRestockUnitsPkg(
+      med.units_per_package !== null ? String(med.units_per_package) : String(defaultQty)
+    );
+    setRestockPkgPrice(med.package_price !== null ? String(med.package_price) : "");
+    setRestockExpenseAmount(
+      med.package_price !== null ? String(med.package_price) : ""
+    );
+    setRestockPharmacy(med.preferred_pharmacy ?? "");
+    setRestockPaymentMethod("Tarjeta");
+    setRestockLogExpense(true);
+    setRestockError(null);
   }
 
-  async function handleAdjustSubmit(med: Medication) {
-    const exactVal = adjustMarkPending ? null : Number(adjustStockVal);
-    if (!adjustMarkPending && (!Number.isFinite(exactVal) || (exactVal ?? -1) < 0)) {
+  async function handleRestockSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!restockTarget) return;
+    setRestockError(null);
+
+    const qty = parseOptionalNumber(restockQty);
+    if (qty === null || qty <= 0) {
+      setRestockError("Ingresa una cantidad valida mayor a 0.");
       return;
     }
-    await onAdjustStock(med.id, exactVal, adjustReason.trim() || "Ajuste manual");
-    setAdjustId(null);
+
+    const unitsPkg = parseOptionalNumber(restockUnitsPkg);
+    const pkgPrice = parseOptionalNumber(restockPkgPrice);
+    const expenseAmt = parseOptionalNumber(restockExpenseAmount);
+
+    setSavingRestock(true);
+    try {
+      await onRestockMedication(restockTarget.id, qty, {
+        units_per_package: unitsPkg,
+        package_price: pkgPrice,
+        expense_amount: restockLogExpense ? expenseAmt : null,
+        provider_or_pharmacy: restockPharmacy.trim() || null,
+        payment_method: restockPaymentMethod.trim() || null,
+        log_expense: restockLogExpense && expenseAmt !== null && expenseAmt >= 0,
+      });
+      setRestockTarget(null);
+    } catch (err) {
+      setRestockError(
+        err instanceof Error ? err.message : "No se pudo registrar el restock."
+      );
+    } finally {
+      setSavingRestock(false);
+    }
+  }
+
+  function openAdjustModal(med: Medication) {
+    setAdjustTarget(med);
+    setAdjustUnknown(med.current_stock === null);
+    setAdjustStockVal(
+      med.current_stock === null ? "0" : String(med.current_stock)
+    );
+    setAdjustReason("Conteo fisico manual");
+    setAdjustError(null);
+  }
+
+  async function handleAdjustSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!adjustTarget) return;
+    setAdjustError(null);
+
+    const exact = adjustUnknown ? null : parseOptionalNumber(adjustStockVal);
+    if (!adjustUnknown && (exact === null || exact < 0)) {
+      setAdjustError("Ingresa un conteo fisico mayor o igual a 0.");
+      return;
+    }
+
+    setSavingAdjust(true);
+    try {
+      await onAdjustStock(
+        adjustTarget.id,
+        exact,
+        adjustReason.trim() || "Conteo fisico manual"
+      );
+      setAdjustTarget(null);
+    } catch (err) {
+      setAdjustError(
+        err instanceof Error ? err.message : "Error al ajustar inventario."
+      );
+    } finally {
+      setSavingAdjust(false);
+    }
+  }
+
+  async function handleArchiveSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!archiveTarget) return;
+    setArchiveError(null);
+    setSavingArchive(true);
+    try {
+      await onArchiveMedication(
+        archiveTarget.id,
+        archiveReason.trim() || null
+      );
+      setArchiveTarget(null);
+    } catch (err) {
+      setArchiveError(
+        err instanceof Error ? err.message : "Error al archivar medicamento."
+      );
+    } finally {
+      setSavingArchive(false);
+    }
+  }
+
+  function openClustersModal() {
+    setEditingCluster(null);
+    setClusterLabel("");
+    setClusterAnchor("15:00");
+    setClusterRule("WITH_FOOD");
+    setClusterActive(true);
+    setClusterError(null);
+    setConfirmDeleteClusterId(null);
+    setClustersModalOpen(true);
+  }
+
+  function startEditCluster(cluster: IntakeCluster) {
+    setEditingCluster(cluster);
+    setClusterLabel(cluster.label);
+    setClusterAnchor(formatShortTime(cluster.anchor_time));
+    setClusterRule(cluster.intake_rule);
+    setClusterActive(cluster.is_active);
+    setClusterError(null);
   }
 
   async function handleClusterSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!clusterLabel.trim() || !clusterTime.trim()) return;
-    if (editingClusterId) {
-      await onUpdateCluster(editingClusterId, {
-        label: clusterLabel.trim(),
-        anchor_time: clusterTime.trim(),
-        intake_rule: clusterRule,
-        is_active: true,
-      });
-    } else {
-      await onCreateCluster({
-        label: clusterLabel.trim(),
-        anchor_time: clusterTime.trim(),
-        intake_rule: clusterRule,
-      });
+    setClusterError(null);
+    if (!clusterLabel.trim()) {
+      setClusterError("Ingresa el nombre del bloque horario.");
+      return;
     }
-    setEditingClusterId(null);
-    setClusterLabel("");
-    setClusterTime("08:00");
-    setClusterRule("WITH_FOOD");
+
+    setSavingCluster(true);
+    try {
+      if (editingCluster) {
+        await onUpdateCluster(editingCluster.id, {
+          label: clusterLabel.trim(),
+          anchor_time: clusterAnchor,
+          intake_rule: clusterRule,
+          is_active: clusterActive,
+        });
+      } else {
+        await onCreateCluster({
+          label: clusterLabel.trim(),
+          anchor_time: clusterAnchor,
+          intake_rule: clusterRule,
+        });
+      }
+      setEditingCluster(null);
+      setClusterLabel("");
+    } catch (err) {
+      setClusterError(
+        err instanceof Error ? err.message : "No se pudo guardar el bloque."
+      );
+    } finally {
+      setSavingCluster(false);
+    }
   }
-
-  function startEditCluster(cl: IntakeCluster) {
-    setEditingClusterId(cl.id);
-    setClusterLabel(cl.label);
-    setClusterTime(formatShortTime(cl.anchor_time));
-    setClusterRule(cl.intake_rule);
-  }
-
-  const baseList =
-    filterTab === "archived"
-      ? snapshot.archived_medications
-      : filterTab === "incomplete"
-      ? snapshot.incomplete_medications
-      : filterTab === "critical"
-      ? snapshot.low_stock_medications
-      : snapshot.medications;
-
-  const q = searchQuery.trim().toLowerCase();
-  const visibleMeds = q
-    ? baseList.filter(
-        (m) =>
-          m.name.toLowerCase().includes(q) ||
-          (m.active_ingredient ?? "").toLowerCase().includes(q) ||
-          (m.clinical_notes ?? "").toLowerCase().includes(q)
-      )
-    : baseList;
 
   return (
-    <div className="space-y-6 clinical-enter">
-      {/* Encabezado */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h2 className="text-[20px] font-bold text-[#0F172A]">
-            Inventario Farmacologico y Gobernanza de Tratamiento
-          </h2>
-          <p className="text-[14px] text-[#475569]">
-            Normas diferenciadas: nucleo clinico obligatorio y datos comerciales
-            (precio, envase, stock inicial) completables despues.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowClusterManager((v) => !v)}
-            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
-          >
-            <SlidersHorizontal
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            Bloques Horarios ({snapshot.clusters.length})
-          </button>
-
-          <button
-            type="button"
-            onClick={() => onGenerateTodayLogs()}
-            className="clinical-btn inline-flex items-center gap-2 px-3.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[14px] font-medium"
-          >
-            <RefreshCw
-              className="w-4 h-4 text-[#0E7490]"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            Regenerar Tomas de Hoy
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              if (showForm && !editingMedId) {
-                setShowForm(false);
-              } else {
-                openNewMedicationForm();
-              }
-            }}
-            className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
-          >
-            <Plus className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
-            {showForm ? "Cerrar Formulario" : "Registrar Medicamento"}
-          </button>
-        </div>
-      </div>
-
-      {/* Gestor de Bloques Horarios (Clusters CRUD) */}
-      {showClusterManager && (
-        <section className="clinical-card p-5 space-y-4 border-[#A5F3FC]">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E2E8F0] pb-2.5">
-            <h3 className="text-[16px] font-bold text-[#0F172A]">
-              Gobernanza de Bloques Horarios (Clusters)
-            </h3>
-            <span className="text-[13px] text-[#475569]">
-              Editar una hora ancla actualiza automaticamente los horarios vinculados.
-            </span>
+    <div className="space-y-5 clinical-enter">
+      {/* Encabezado y Acciones Principales */}
+      <section className="clinical-card p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-[20px] font-bold text-[#0F172A]">
+              Catalogo de Medicamentos e Inventario
+            </h2>
+            <p className="mt-1 text-[14px] text-[#475569]">
+              Gestion de dosis, periodicidad inteligente por dia de la semana,
+              horarios unificados e inventario en farmacia.
+            </p>
           </div>
 
-          <form
-            onSubmit={handleClusterSubmit}
-            className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end bg-[#F8FAFC] p-3.5 rounded-[6px] border border-[#E2E8F0]"
-          >
-            <div>
-              <label
-                htmlFor="cl-label"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Nombre del bloque
-              </label>
-              <input
-                id="cl-label"
-                type="text"
-                required
-                placeholder="Ej. Bloque Desayuno"
-                value={clusterLabel}
-                onChange={(e) => setClusterLabel(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-              />
-            </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <IconActionButton
+              icon={Clock}
+              label="Configurar bloques horarios (Desayuno / 15:00 / Cena)"
+              shortLabel={`Bloques (${snapshot.clusters.filter((c) => c.is_active).length})`}
+              tone="neutral"
+              onClick={openClustersModal}
+            />
 
-            <div>
-              <label
-                htmlFor="cl-time"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Hora ancla (HH:MM)
-              </label>
-              <input
-                id="cl-time"
-                type="time"
-                required
-                value={clusterTime}
-                onChange={(e) => setClusterTime(e.target.value)}
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[14px]"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="cl-rule"
-                className="block text-[13px] font-medium text-[#0F172A] mb-1"
-              >
-                Regla clinica del bloque
-              </label>
-              <select
-                id="cl-rule"
-                value={clusterRule}
-                onChange={(e) =>
-                  setClusterRule(e.target.value as IntakeConstraint)
+            <IconActionButton
+              icon={RefreshCw}
+              label="Sincronizar y generar tomas pendientes de hoy"
+              shortLabel="Generar tomas"
+              tone="info"
+              loading={busyKey === "gen-today"}
+              onClick={async () => {
+                setBusyKey("gen-today");
+                try {
+                  await onGenerateTodayLogs();
+                } catch {
+                  // Toast global
+                } finally {
+                  setBusyKey(null);
                 }
-                className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
-              >
-                <option value="WITH_FOOD">Con Alimentos</option>
-                <option value="FASTING">En Ayunas</option>
-                <option value="NONE">Sin Restriccion</option>
-                <option value="SEPARATE_FROM_OTHERS">Separado de Otros</option>
-              </select>
-            </div>
+              }}
+            />
 
-            <div className="flex gap-2">
+            <IconActionButton
+              icon={Plus}
+              label="Registrar nuevo medicamento en el catalogo"
+              shortLabel="Nuevo Medicamento"
+              tone="primary"
+              onClick={openCreateMedicationModal}
+            />
+          </div>
+        </div>
+
+        {/* Barra de Busqueda + Leyenda de Simbolos */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-[#E2E8F0]">
+          <div className="flex flex-wrap items-center gap-3 flex-1 min-w-[240px]">
+            <label htmlFor="med-search" className="sr-only">
+              Buscar medicamento, principio activo o farmacia
+            </label>
+            <input
+              id="med-search"
+              type="search"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder="Buscar por nombre, principio activo o farmacia..."
+              className="clinical-input max-w-md bg-white border border-[#CBD5E1] px-3 text-[14px]"
+            />
+
+            {isAdmin && snapshot.archived_medications.length > 0 && (
               <button
-                type="submit"
-                className="clinical-btn flex-1 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
+                type="button"
+                onClick={() => setShowArchived((v) => !v)}
+                className="clinical-btn px-3 border border-[#CBD5E1] bg-[#F8FAFC] hover:bg-[#F1F5F9] text-[13px] font-medium text-[#334155]"
               >
-                {editingClusterId ? "Actualizar Bloque" : "Agregar Bloque"}
+                {showArchived
+                  ? "Ocultar archivados"
+                  : `Ver archivados (${snapshot.archived_medications.length})`}
               </button>
-              {editingClusterId && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingClusterId(null);
-                    setClusterLabel("");
-                    setClusterTime("08:00");
-                  }}
-                  className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
-                >
-                  Cancelar
-                </button>
-              )}
-            </div>
-          </form>
+            )}
+          </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {snapshot.clusters.map((cl) => (
-              <div
-                key={cl.id}
-                className="border border-[#E2E8F0] rounded-[6px] p-3 flex items-center justify-between gap-2 bg-white"
+          <div
+            aria-label="Guia visual de acciones"
+            className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12px] text-[#475569] bg-[#F8FAFC] border border-[#E2E8F0] px-3 py-2 rounded-[6px]"
+          >
+            <span className="font-semibold text-[#0F172A]">Simbolos:</span>
+            <span className="inline-flex items-center gap-1">
+              <PackagePlus className="w-3.5 h-3.5 text-[#065F46]" aria-hidden="true" />
+              Restock
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <SlidersHorizontal className="w-3.5 h-3.5 text-[#0E7490]" aria-hidden="true" />
+              Ajuste stock
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <Edit3 className="w-3.5 h-3.5 text-[#334155]" aria-hidden="true" />
+              Editar esquema
+            </span>
+            {isAdmin && (
+              <>
+                <span className="inline-flex items-center gap-1">
+                  <History className="w-3.5 h-3.5 text-[#92400E]" aria-hidden="true" />
+                  Versiones
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  <Archive className="w-3.5 h-3.5 text-[#92400E]" aria-hidden="true" />
+                  Archivar
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Lista Activa de Medicamentos */}
+      <section aria-label="Medicamentos activos" className="space-y-3">
+        {filteredMeds.length === 0 ? (
+          <div className="clinical-card p-8 text-center text-[14px] text-[#475569]">
+            No se encontraron medicamentos con el filtro actual.
+          </div>
+        ) : (
+          filteredMeds.map((med) => {
+            const normalizedDays = normalizeActiveDays(med.active_days);
+            const isCriticalStock =
+              med.days_of_supply_remaining !== null &&
+              med.days_of_supply_remaining <= med.safety_buffer_days;
+            const isUnknownStock = med.current_stock === null;
+            const isUnknownPrice =
+              med.package_price === null || med.units_per_package === null;
+            const isEventLinked =
+              (med.frequency_type === "INTERVAL_DAYS" ||
+                med.frequency_type === "INTERVAL_WEEKS") &&
+              (!med.schedules || med.schedules.length === 0);
+
+            const verMeta = versionsByMedId.get(med.id);
+
+            return (
+              <article
+                key={med.id}
+                className={cn(
+                  "clinical-card p-5 transition-colors",
+                  isCriticalStock && "border-[#FECACA] bg-[#FEF2F2]/35"
+                )}
               >
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Clock
-                      className="w-4 h-4 text-[#0E7490]"
-                      strokeWidth={1.75}
-                      aria-hidden="true"
-                    />
-                    <span className="font-mono font-bold text-[15px] text-[#0F172A]">
-                      {formatShortTime(cl.anchor_time)}
-                    </span>
-                    <span className="font-bold text-[14px] text-[#0F172A]">
-                      {cl.label}
-                    </span>
-                  </div>
-                  <div className="mt-1">
-                    <StatusBadge
-                      label={INTAKE_RULE_TAG[cl.intake_rule]}
-                      tone="info"
-                    />
-                  </div>
-                </div>
+                <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                  {/* Columna Informacion Clinica */}
+                  <div className="space-y-2.5 flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-[17px] font-bold text-[#0F172A]">
+                        {med.name}
+                      </h3>
+                      <StatusBadge
+                        label={INTAKE_RULE_TAG[med.intake_rule]}
+                        tone={med.intake_rule === "FASTING" ? "warn" : "neutral"}
+                      />
+                      <StatusBadge
+                        label={
+                          PURCHASE_PRIORITY_TAG[med.purchase_priority] ??
+                          "[PRIORIDAD]"
+                        }
+                        tone={med.purchase_priority === 1 ? "crit" : "neutral"}
+                      />
+                      {isUnknownStock ? (
+                        <StatusBadge label="[STOCK PENDIENTE]" tone="warn" />
+                      ) : isCriticalStock ? (
+                        <StatusBadge
+                          label={`[CRITICO: ${med.days_of_supply_remaining}d]`}
+                          tone="crit"
+                        />
+                      ) : (
+                        <StatusBadge
+                          label={`[COBERTURA: ${med.days_of_supply_remaining ?? "--"}d]`}
+                          tone="ok"
+                        />
+                      )}
+                      {isUnknownPrice && (
+                        <StatusBadge label="[PRECIO PENDIENTE]" tone="info" />
+                      )}
+                    </div>
 
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => startEditCluster(cl)}
-                    className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px]"
-                  >
-                    Editar
-                  </button>
-                  {confirmDeleteClusterId === cl.id ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          await onDeleteCluster(cl.id);
-                          setConfirmDeleteClusterId(null);
-                        }}
-                        className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[13px] font-bold"
-                      >
-                        Confirmar
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteClusterId(null)}
-                        className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[13px]"
-                      >
-                        No
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDeleteClusterId(cl.id)}
-                      className="clinical-btn px-2.5 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B] text-[13px]"
-                    >
-                      Eliminar
-                    </button>
-                  )}
+                    <p className="text-[14px] text-[#334155]">
+                      {med.active_ingredient
+                        ? `${med.active_ingredient} | `
+                        : ""}
+                      <span className="font-semibold text-[#0F172A]">
+                        Dosis: {med.dose_amount} {med.presentation}
+                      </span>{" "}
+                      | {FREQUENCY_TYPE_LABEL[med.frequency_type]}:{" "}
+                      <span className="font-mono font-semibold text-[#0F172A]">
+                        {med.frequency_value}
+                      </span>{" "}
+                      | Consumo real:{" "}
+                      <span className="font-mono font-semibold text-[#0E7490] tabular-nums">
+                        {med.daily_consumption_rate}/dia
+                      </span>
+                    </p>
+
+                    {/* Periodicidad Inteligente + Horarios */}
+                    <div className="flex flex-wrap items-center gap-2 text-[13px]">
+                      {(med.frequency_type === "DAILY_SLOTS" ||
+                        med.frequency_type === "FIXED_HOURS") && (
+                        <div className="inline-flex flex-wrap items-center gap-1 bg-[#F8FAFC] border border-[#E2E8F0] px-2.5 py-1.5 rounded-[4px]">
+                          <span className="text-[#475569] font-medium mr-1">
+                            Dias:
+                          </span>
+                          {WEEKDAY_ORDER.map((dayNum) => {
+                            const active =
+                              normalizedDays === null ||
+                              normalizedDays.includes(dayNum);
+                            return (
+                              <span
+                                key={dayNum}
+                                title={WEEKDAY_LABEL[dayNum]}
+                                className={cn(
+                                  "px-1.5 py-0.5 rounded-[3px] font-mono text-[11px] font-bold",
+                                  active
+                                    ? "bg-[#ECFEFF] text-[#155E75] border border-[#A5F3FC]"
+                                    : "bg-[#F1F5F9] text-[#94A3B8] line-through"
+                                )}
+                              >
+                                {WEEKDAY_TWO_CHAR[dayNum]}
+                              </span>
+                            );
+                          })}
+                          <span className="ml-1 text-[12px] text-[#0F172A] font-semibold">
+                            ({formatActiveDaysLabel(med.active_days)})
+                          </span>
+                        </div>
+                      )}
+
+                      {isEventLinked ? (
+                        <span className="inline-flex items-center gap-1.5 bg-[#F8FAFC] border border-[#CBD5E1] px-2.5 py-1.5 rounded-[4px] text-[#334155] font-medium">
+                          <CalendarClock
+                            className="w-3.5 h-3.5 text-[#0E7490]"
+                            aria-hidden="true"
+                          />
+                          Vinculado a agenda/citas (sin toma diaria fija)
+                          {med.schedule_start_date && (
+                            <span className="font-mono text-[12px] text-[#64748B]">
+                              | Inicio: {med.schedule_start_date.slice(0, 10)}
+                            </span>
+                          )}
+                        </span>
+                      ) : (
+                        <div className="inline-flex flex-wrap items-center gap-1.5 bg-[#F8FAFC] border border-[#E2E8F0] px-2.5 py-1.5 rounded-[4px]">
+                          <span className="text-[#475569] font-medium">
+                            Horarios:
+                          </span>
+                          {(med.schedules ?? []).map((sch) => (
+                            <span
+                              key={sch.schedule_id}
+                              className="font-mono text-[12px] px-1.5 py-0.5 rounded-[3px] bg-white border border-[#CBD5E1] text-[#0F172A]"
+                            >
+                              {formatShortTime(sch.effective_clustered_time)}
+                              {sch.cluster_label
+                                ? ` (${sch.cluster_label})`
+                                : ""}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Inventario y Comercial */}
+                    <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[13px] text-[#475569]">
+                      <span>
+                        Stock actual:{" "}
+                        <strong className="font-mono text-[#0F172A] tabular-nums">
+                          {med.current_stock === null
+                            ? "Por definir"
+                            : `${med.current_stock} ${med.presentation}`}
+                        </strong>
+                      </span>
+                      <span>
+                        Presentacion:{" "}
+                        <strong className="font-mono text-[#0F172A] tabular-nums">
+                          {med.units_per_package === null
+                            ? "Por definir"
+                            : `${med.units_per_package} u/caja`}
+                        </strong>
+                      </span>
+                      <span>
+                        Precio caja:{" "}
+                        <strong className="font-mono text-[#0F172A] tabular-nums">
+                          {formatCurrencyMxn(med.package_price)}
+                        </strong>
+                      </span>
+                      {med.preferred_pharmacy && (
+                        <span>
+                          Farmacia:{" "}
+                          <strong className="text-[#0F172A]">
+                            {med.preferred_pharmacy}
+                          </strong>
+                        </span>
+                      )}
+                    </div>
+
+                    {med.clinical_notes && (
+                      <p className="text-[13px] text-[#475569] bg-[#F8FAFC] border-l-2 border-[#0E7490] px-3 py-1.5">
+                        {med.clinical_notes}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Columna Botones Inteligentes por Simbolo */}
+                  <div className="flex flex-wrap items-center gap-2 shrink-0 pt-1">
+                    <IconActionButton
+                      icon={PackagePlus}
+                      label={`Registrar restock o compra de ${med.name}`}
+                      tone="success"
+                      onClick={() => openRestockModal(med)}
+                    />
+
+                    <IconActionButton
+                      icon={SlidersHorizontal}
+                      label={`Ajustar conteo fisico de ${med.name}`}
+                      tone="info"
+                      onClick={() => openAdjustModal(med)}
+                    />
+
+                    <IconActionButton
+                      icon={Edit3}
+                      label={`Editar dosis, horarios y periodicidad de ${med.name}`}
+                      tone="neutral"
+                      onClick={() => openEditMedicationModal(med)}
+                    />
+
+                    {isAdmin && (
+                      <>
+                        <IconActionButton
+                          icon={History}
+                          label={
+                            verMeta && verMeta.unreviewed > 0
+                              ? `Historial de versiones de ${med.name} (${verMeta.unreviewed} cambios del paciente sin revisar)`
+                              : `Historial de versiones de ${med.name} (${verMeta?.total ?? 0})`
+                          }
+                          tone={
+                            verMeta && verMeta.unreviewed > 0 ? "warn" : "neutral"
+                          }
+                          badgeDot={Boolean(verMeta && verMeta.unreviewed > 0)}
+                          onClick={() => setVersionsTarget(med)}
+                        />
+
+                        <IconActionButton
+                          icon={Archive}
+                          label={`Archivar o suspender ${med.name}`}
+                          tone="warn"
+                          onClick={() => {
+                            setArchiveTarget(med);
+                            setArchiveReason("");
+                            setArchiveError(null);
+                          }}
+                        />
+                      </>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              </article>
+            );
+          })
+        )}
+      </section>
+
+      {/* Medicamentos Archivados (Solo Administrador) */}
+      {isAdmin && showArchived && snapshot.archived_medications.length > 0 && (
+        <section className="clinical-card p-5 space-y-3 border-dashed border-[#CBD5E1]">
+          <h3 className="text-[16px] font-bold text-[#0F172A]">
+            Tratamientos Archivados / Suspendidos ({snapshot.archived_medications.length})
+          </h3>
+          <div className="space-y-2.5">
+            {snapshot.archived_medications.map((med) => {
+              const isConfirmDelete = confirmDeleteMedId === med.id;
+              return (
+                <div
+                  key={med.id}
+                  className="p-3.5 bg-[#F8FAFC] border border-[#E2E8F0] rounded-[6px] flex flex-wrap items-center justify-between gap-3"
+                >
+                  <div>
+                    <p className="font-bold text-[15px] text-[#0F172A]">
+                      {med.name}{" "}
+                      <span className="font-normal text-[13px] text-[#475569]">
+                        ({med.dose_amount} {med.presentation})
+                      </span>
+                    </p>
+                    {med.discontinuation_reason && (
+                      <p className="text-[13px] text-[#64748B]">
+                        Motivo: {med.discontinuation_reason}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <IconActionButton
+                      icon={RotateCcw}
+                      label={`Reactivar ${med.name}`}
+                      shortLabel="Reactivar"
+                      tone="info"
+                      loading={busyKey === `restore:${med.id}`}
+                      onClick={async () => {
+                        setBusyKey(`restore:${med.id}`);
+                        try {
+                          await onRestoreMedication(med.id);
+                        } catch {
+                          // Toast
+                        } finally {
+                          setBusyKey(null);
+                        }
+                      }}
+                    />
+
+                    {isConfirmDelete ? (
+                      <div className="inline-flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={busyKey === `del:${med.id}`}
+                          onClick={async () => {
+                            setBusyKey(`del:${med.id}`);
+                            try {
+                              await onDeleteMedication(med.id);
+                              setConfirmDeleteMedId(null);
+                            } catch {
+                              // Toast
+                            } finally {
+                              setBusyKey(null);
+                            }
+                          }}
+                          className="clinical-btn px-3 bg-[#991B1B] text-white text-[12px] font-bold"
+                        >
+                          Confirmar borrado
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteMedId(null)}
+                          className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white text-[#334155] text-[12px]"
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    ) : (
+                      <IconActionButton
+                        icon={Trash2}
+                        label={`Eliminar permanentemente ${med.name}`}
+                        tone="danger"
+                        onClick={() => setConfirmDeleteMedId(med.id)}
+                      />
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </section>
       )}
 
-      {/* Formulario Crear / Editar con Normas Obligatorias vs Diferibles */}
-      {showForm && (
-        <form
-          onSubmit={handleSubmit}
-          className="clinical-card p-5 space-y-5 border-[#A5F3FC] bg-white"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3">
-            <div>
-              <h3 className="text-[16px] font-bold text-[#0F172A]">
-                {editingMedId
-                  ? `Editar Medicamento: ${name}`
-                  : "Nuevo Medicamento — Normas de Registro"}
-              </h3>
-              <p className="text-[13px] text-[#475569]">
-                Obligatorio: posologia y horario clinico. Opcional/Diferible:
-                inventario, piezas por caja y precio (puede marcarse pendiente).
-              </p>
+      {/* Modal: Crear / Editar Medicamento */}
+      <ClinicalModal
+        open={medModalOpen}
+        onClose={() => !savingMed && setMedModalOpen(false)}
+        title={
+          editingMed
+            ? `Editar Medicamento: ${editingMed.name}`
+            : "Registrar Nuevo Medicamento"
+        }
+        subtitle="Configura dosis, esquema horario, dias de la semana y datos comerciales opcionales."
+        maxWidthClass="max-w-4xl"
+      >
+        <form onSubmit={handleSaveMedicationSubmit} className="space-y-5">
+          {medFormError && (
+            <div
+              role="alert"
+              className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px] flex items-center gap-2"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>{medFormError}</span>
             </div>
-            <span className="font-mono text-[13px] px-2.5 py-1 bg-[#ECFEFF] border border-[#A5F3FC] text-[#164E63] rounded-[4px] tabular-nums">
-              Tasa diaria: {computedRate} unid/dia
-            </span>
+          )}
+
+          {/* Seccion 1: Identificacion Clinica */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            <div className="sm:col-span-2">
+              <label
+                htmlFor="med-name"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Nombre del medicamento *
+              </label>
+              <input
+                id="med-name"
+                type="text"
+                required
+                value={medName}
+                onChange={(e) => setMedName(e.target.value)}
+                placeholder="Ej. Valproato semisodico 500 mg"
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <label
+                htmlFor="med-ingredient"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Principio activo / Concentracion
+              </label>
+              <input
+                id="med-ingredient"
+                type="text"
+                value={medIngredient}
+                onChange={(e) => setMedIngredient(e.target.value)}
+                placeholder="Ej. Divalproato de sodio 500 mg"
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="med-presentation"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Presentacion *
+              </label>
+              <input
+                id="med-presentation"
+                list="med-presentation-options"
+                required
+                value={medPresentation}
+                onChange={(e) => setMedPresentation(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+              <datalist id="med-presentation-options">
+                <option value="Tabletas" />
+                <option value="Capsulas" />
+                <option value="Comprimidos" />
+                <option value="Ampolleta / Inyeccion" />
+                <option value="Sobres" />
+                <option value="Gotas" />
+                <option value="Mililitros" />
+              </datalist>
+            </div>
+
+            <div>
+              <label
+                htmlFor="med-dose"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Dosis por toma *
+              </label>
+              <input
+                id="med-dose"
+                type="number"
+                step="any"
+                min="0.01"
+                required
+                value={medDose}
+                onChange={(e) => setMedDose(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="med-rule"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Regla gastronomica
+              </label>
+              <select
+                id="med-rule"
+                value={medRule}
+                onChange={(e) => setMedRule(e.target.value as IntakeConstraint)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
+              >
+                {(
+                  [
+                    "NONE",
+                    "FASTING",
+                    "WITH_FOOD",
+                    "SEPARATE_FROM_OTHERS",
+                  ] as IntakeConstraint[]
+                ).map((rule) => (
+                  <option key={rule} value={rule}>
+                    {INTAKE_RULE_LABEL[rule]}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label
+                htmlFor="med-tolerance"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Tolerancia de agrupacion (min)
+              </label>
+              <input
+                id="med-tolerance"
+                type="number"
+                min="0"
+                max="180"
+                value={medTolerance}
+                onChange={(e) => setMedTolerance(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
           </div>
 
-          {/* Seccion 1: Nucleo Clinico Obligatorio */}
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <StatusBadge label="[1. OBLIGATORIO]" tone="info" />
-              <span className="text-[14px] font-bold text-[#0F172A]">
-                Nucleo Clinico y Posologia
+          {/* Seccion 2: Periodicidad Inteligente y Horarios */}
+          <div className="p-4 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC] space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-[14px] font-bold text-[#0F172A]">
+                Periodicidad y Horarios de Toma
+              </h4>
+              <span className="font-mono text-[12px] text-[#0E7490] font-semibold">
+                Consumo real: {previewRate} u/dia
+                {previewSupplyDays !== null
+                  ? ` | Duracion estimada: ${previewSupplyDays} dias`
+                  : ""}
               </span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <label
-                  htmlFor="med-name"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Nombre comercial / concentracion *
-                </label>
-                <input
-                  id="med-name"
-                  type="text"
-                  required
-                  placeholder="Ej. Rolet Sup 80/12.5"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="med-ingredient"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Principio activo (opcional)
-                </label>
-                <input
-                  id="med-ingredient"
-                  type="text"
-                  placeholder="Ej. Telmisartan / Hidroclorotiazida"
-                  value={activeIngredient}
-                  onChange={(e) => setActiveIngredient(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="med-presentation"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Presentacion *
-                </label>
-                <select
-                  id="med-presentation"
-                  value={presentation}
-                  onChange={(e) => setPresentation(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
-                >
-                  <option value="Tableta">Tableta</option>
-                  <option value="Capsula">Capsula</option>
-                  <option value="Inyeccion">Inyeccion</option>
-                  <option value="Jeringa Prellenada">Jeringa Prellenada</option>
-                  <option value="Ampolleta">Ampolleta</option>
-                  <option value="ml">ml</option>
-                  <option value="Gotas">Gotas</option>
-                </select>
-              </div>
-
-              <div>
-                <label
-                  htmlFor="med-dose"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Cantidad por toma *
-                </label>
-                <input
-                  id="med-dose"
-                  type="number"
-                  step="0.5"
-                  min="0.1"
-                  required
-                  value={doseAmount}
-                  onChange={(e) => setDoseAmount(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums"
-                />
-              </div>
-
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
               <div>
                 <label
                   htmlFor="med-freq-type"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
                 >
-                  Tipo de periodicidad *
+                  Tipo de periodicidad
                 </label>
                 <select
                   id="med-freq-type"
-                  value={frequencyType}
+                  value={medFreqType}
                   onChange={(e) =>
-                    setFrequencyType(e.target.value as MedFrequencyType)
+                    handleFrequencyTypeChange(e.target.value as MedFrequencyType)
                   }
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
                 >
-                  <option value="DAILY_SLOTS">Tomas por dia (ej. 1, 2)</option>
-                  <option value="FIXED_HOURS">Cada N horas (ej. 8h, 12h)</option>
-                  <option value="INTERVAL_DAYS">Cada N dias</option>
-                  <option value="INTERVAL_WEEKS">Cada N semanas</option>
+                  {(
+                    [
+                      "DAILY_SLOTS",
+                      "FIXED_HOURS",
+                      "INTERVAL_DAYS",
+                      "INTERVAL_WEEKS",
+                    ] as MedFrequencyType[]
+                  ).map((ft) => (
+                    <option key={ft} value={ft}>
+                      {FREQUENCY_TYPE_LABEL[ft]}
+                    </option>
+                  ))}
                 </select>
               </div>
 
               <div>
                 <label
                   htmlFor="med-freq-val"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
                 >
-                  Valor de frecuencia *
+                  {medFreqType === "DAILY_SLOTS"
+                    ? "Tomas por dia activo"
+                    : medFreqType === "FIXED_HOURS"
+                    ? "Intervalo en horas (ej. 8 o 12)"
+                    : medFreqType === "INTERVAL_DAYS"
+                    ? "Intervalo en dias (ej. 21)"
+                    : "Intervalo en semanas"}
                 </label>
                 <input
                   id="med-freq-val"
                   type="number"
                   min="1"
+                  max={medFreqType === "DAILY_SLOTS" ? 8 : 365}
                   required
-                  value={frequencyValue}
-                  onChange={(e) => setFrequencyValue(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="med-rule"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Regla de ingesta *
-                </label>
-                <select
-                  id="med-rule"
-                  value={intakeRule}
-                  onChange={(e) =>
-                    setIntakeRule(e.target.value as IntakeConstraint)
-                  }
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
-                >
-                  <option value="WITH_FOOD">Con Alimentos</option>
-                  <option value="NONE">Sin Restriccion</option>
-                  <option value="FASTING">En Ayunas</option>
-                  <option value="SEPARATE_FROM_OTHERS">Separado de Otros</option>
-                </select>
-              </div>
-
-              <div>
-                <label
-                  htmlFor="med-ideal-times"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Horarios ideales (HH:MM, separados por coma)
-                </label>
-                <input
-                  id="med-ideal-times"
-                  type="text"
-                  placeholder="08:00 o 08:00, 21:00"
-                  value={idealTimeInput}
-                  onChange={(e) => setIdealTimeInput(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="med-tolerance"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
-                >
-                  Ventana de tolerancia (mins)
-                </label>
-                <input
-                  id="med-tolerance"
-                  type="number"
-                  min="0"
-                  max="180"
-                  value={toleranceMins}
-                  onChange={(e) => setToleranceMins(e.target.value)}
-                  className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums"
+                  value={medFreqVal}
+                  onChange={(e) => handleFrequencyValChange(e.target.value)}
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px] bg-white"
                 />
               </div>
             </div>
+
+            {/* Selector de Dias de la Semana */}
+            {(medFreqType === "DAILY_SLOTS" || medFreqType === "FIXED_HOURS") && (
+              <div className="space-y-2.5 pt-2 border-t border-[#E2E8F0]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[13px] font-semibold text-[#0F172A]">
+                    Dias de la semana que se toma ({formatActiveDaysLabel(medActiveDays)})
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {DAY_SCHEDULE_PRESETS.map((preset) => {
+                      const selected = activeDaysEqual(medActiveDays, preset.days);
+                      return (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          onClick={() => setMedActiveDays(preset.days)}
+                          className={cn(
+                            "px-2.5 py-1 rounded-[4px] border text-[12px] font-medium cursor-pointer",
+                            selected
+                              ? "bg-[#0E7490] border-[#0E7490] text-white"
+                              : "bg-white border-[#CBD5E1] text-[#334155] hover:bg-[#F1F5F9]"
+                          )}
+                        >
+                          {preset.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {WEEKDAY_ORDER.map((dayNum) => {
+                    const isChecked =
+                      medActiveDays === null || medActiveDays.includes(dayNum);
+                    return (
+                      <button
+                        key={dayNum}
+                        type="button"
+                        aria-pressed={isChecked}
+                        aria-label={`${WEEKDAY_LABEL[dayNum]} (${isChecked ? "activo" : "descanso"})`}
+                        onClick={() => toggleWeekday(dayNum)}
+                        className={cn(
+                          "min-w-[44px] min-h-[44px] px-3 rounded-[6px] border font-mono text-[13px] font-bold cursor-pointer transition-colors",
+                          isChecked
+                            ? "bg-[#ECFEFF] border-[#0E7490] text-[#0E7490]"
+                            : "bg-white border-[#CBD5E1] text-[#94A3B8] hover:text-[#334155]"
+                        )}
+                      >
+                        {WEEKDAY_TWO_CHAR[dayNum]}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Horarios segun Frecuencia */}
+            {medFreqType === "DAILY_SLOTS" && (
+              <div className="space-y-2 pt-2 border-t border-[#E2E8F0]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-[13px] font-semibold text-[#0F172A]">
+                    Horarios diarios ideales (se agrupan a bloques cercanos)
+                  </span>
+                  {clusterAnchors.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const count = Math.max(
+                          1,
+                          Math.min(8, Number.parseInt(medFreqVal || "1", 10) || 1)
+                        );
+                        setMedSlotTimes(buildInitialSlots(count, clusterAnchors));
+                      }}
+                      className="text-[12px] font-semibold text-[#0E7490] hover:underline cursor-pointer"
+                    >
+                      Alinear a bloques activos ({clusterAnchors.join(", ")})
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  {medSlotTimes.map((timeVal, idx) => (
+                    <div key={idx}>
+                      <label
+                        htmlFor={`med-slot-${idx}`}
+                        className="block text-[12px] text-[#475569] mb-1"
+                      >
+                        Toma #{idx + 1}
+                      </label>
+                      <input
+                        id={`med-slot-${idx}`}
+                        type="time"
+                        required
+                        value={timeVal}
+                        onChange={(e) => {
+                          const next = [...medSlotTimes];
+                          next[idx] = e.target.value;
+                          setMedSlotTimes(next);
+                        }}
+                        className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px] bg-white"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {medFreqType === "FIXED_HOURS" && (
+              <div className="pt-2 border-t border-[#E2E8F0]">
+                <label
+                  htmlFor="med-start-time"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Hora de primera toma del ciclo
+                </label>
+                <input
+                  id="med-start-time"
+                  type="time"
+                  required
+                  value={medStartTime}
+                  onChange={(e) => setMedStartTime(e.target.value)}
+                  className="clinical-input max-w-[200px] border border-[#CBD5E1] px-3 font-mono text-[14px] bg-white"
+                />
+              </div>
+            )}
+
+            {(medFreqType === "INTERVAL_DAYS" ||
+              medFreqType === "INTERVAL_WEEKS") && (
+              <div className="space-y-3 pt-2 border-t border-[#E2E8F0]">
+                <label className="flex items-start gap-2.5 cursor-pointer">
+                  <input
+                    id="med-event-linked"
+                    type="checkbox"
+                    checked={medEventLinkedOnly}
+                    onChange={(e) => setMedEventLinkedOnly(e.target.checked)}
+                    className="mt-1 w-4 h-4 accent-[#0E7490]"
+                  />
+                  <span className="text-[13px] text-[#0F172A] font-medium">
+                    Aplicacion clinica vinculada unicamente a Citas / Agenda
+                    (ejemplo: Inyeccion Fluanxol cada 21 dias sin toma diaria en bloques)
+                  </span>
+                </label>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  <div>
+                    <label
+                      htmlFor="med-schedule-start"
+                      className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                    >
+                      Fecha ancla de inicio del ciclo
+                    </label>
+                    <input
+                      id="med-schedule-start"
+                      type="date"
+                      value={medScheduleStart}
+                      onChange={(e) => setMedScheduleStart(e.target.value)}
+                      className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px] bg-white"
+                    />
+                  </div>
+
+                  {!medEventLinkedOnly && (
+                    <div>
+                      <label
+                        htmlFor="med-interval-time"
+                        className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                      >
+                        Hora de toma en dias activos
+                      </label>
+                      <input
+                        id="med-interval-time"
+                        type="time"
+                        value={medStartTime}
+                        onChange={(e) => setMedStartTime(e.target.value)}
+                        className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px] bg-white"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Seccion 2: Inventario, Costos y Abasto (Diferible / Opcional) */}
-          <div className="space-y-3 pt-3 border-t border-[#E2E8F0]">
-            <div className="flex items-center gap-2">
-              <StatusBadge label="[2. OPCIONAL / DIFERIBLE]" tone="warn" />
-              <span className="text-[14px] font-bold text-[#0F172A]">
-                Inventario, Precio de Envase y Planificacion Quincenal
+          {/* Seccion 3: Inventario y Costos (Diferibles) */}
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-[13px] text-[#475569]">
+              <Info className="w-4 h-4 text-[#0E7490] shrink-0" aria-hidden="true" />
+              <span>
+                Campos comerciales e inventario opcionales: si aun no compras el
+                medicamento o desconoces el precio, dejalos en blanco y completalos despues.
               </span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-[#F8FAFC] p-4 rounded-[6px] border border-[#E2E8F0]">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
               <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label
-                    htmlFor="med-stock"
-                    className="text-[14px] font-medium text-[#0F172A]"
-                  >
-                    Inventario actual
-                  </label>
-                  <label className="inline-flex items-center gap-1.5 text-[12px] text-[#92400E] cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={stockPending}
-                      onChange={(e) => setStockPending(e.target.checked)}
-                      className="accent-[#0E7490]"
-                    />
-                    Pendiente
-                  </label>
-                </div>
+                <label
+                  htmlFor="med-stock"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Inventario actual
+                </label>
                 <input
                   id="med-stock"
                   type="number"
-                  step="0.5"
+                  step="any"
                   min="0"
-                  disabled={stockPending}
-                  placeholder={stockPending ? "Pendiente de compra" : "Ej. 30"}
-                  value={stockPending ? "" : currentStock}
-                  onChange={(e) => setCurrentStock(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums bg-white disabled:bg-[#F1F5F9]"
+                  value={medStock}
+                  onChange={(e) => setMedStock(e.target.value)}
+                  placeholder="Opcional"
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
                 />
               </div>
 
               <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label
-                    htmlFor="med-pkg-units"
-                    className="text-[14px] font-medium text-[#0F172A]"
-                  >
-                    Unidades por envase / caja
-                  </label>
-                  <label className="inline-flex items-center gap-1.5 text-[12px] text-[#92400E] cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={pkgPending}
-                      onChange={(e) => setPkgPending(e.target.checked)}
-                      className="accent-[#0E7490]"
-                    />
-                    Pendiente
-                  </label>
-                </div>
+                <label
+                  htmlFor="med-units-pkg"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Unidades por caja
+                </label>
                 <input
-                  id="med-pkg-units"
+                  id="med-units-pkg"
                   type="number"
-                  step="1"
-                  min="1"
-                  disabled={pkgPending}
-                  placeholder={pkgPending ? "Pendiente" : "Ej. 30"}
-                  value={pkgPending ? "" : unitsPerPackage}
-                  onChange={(e) => setUnitsPerPackage(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums bg-white disabled:bg-[#F1F5F9]"
+                  step="any"
+                  min="0.1"
+                  value={medUnitsPkg}
+                  onChange={(e) => setMedUnitsPkg(e.target.value)}
+                  placeholder="Opcional"
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
                 />
               </div>
 
               <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label
-                    htmlFor="med-price"
-                    className="text-[14px] font-medium text-[#0F172A]"
-                  >
-                    Precio por envase (MXN)
-                  </label>
-                  <label className="inline-flex items-center gap-1.5 text-[12px] text-[#92400E] cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={pricePending}
-                      onChange={(e) => setPricePending(e.target.checked)}
-                      className="accent-[#0E7490]"
-                    />
-                    Pendiente
-                  </label>
-                </div>
+                <label
+                  htmlFor="med-price"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Precio por caja (MXN)
+                </label>
                 <input
                   id="med-price"
                   type="number"
                   step="0.01"
                   min="0"
-                  disabled={pricePending}
-                  placeholder={pricePending ? "Pendiente" : "Ej. 250.00"}
-                  value={pricePending ? "" : packagePrice}
-                  onChange={(e) => setPackagePrice(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums bg-white disabled:bg-[#F1F5F9]"
+                  value={medPrice}
+                  onChange={(e) => setMedPrice(e.target.value)}
+                  placeholder="Opcional"
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
                 />
               </div>
 
               <div>
                 <label
                   htmlFor="med-pharmacy"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
                 >
-                  Farmacia habitual (opcional)
+                  Farmacia preferida
                 </label>
                 <input
                   id="med-pharmacy"
                   type="text"
-                  placeholder="Ej. Farmacia Guadalajara / Similar"
-                  value={preferredPharmacy}
-                  onChange={(e) => setPreferredPharmacy(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px] bg-white"
+                  value={medPharmacy}
+                  onChange={(e) => setMedPharmacy(e.target.value)}
+                  placeholder="Ej. Farmacia San Pablo"
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
                 />
               </div>
 
               <div>
                 <label
-                  htmlFor="med-prio"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
+                  htmlFor="med-priority"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
                 >
                   Prioridad de compra
                 </label>
                 <select
-                  id="med-prio"
-                  value={purchasePriority}
-                  onChange={(e) => setPurchasePriority(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[14px] bg-white"
+                  id="med-priority"
+                  value={medPriority}
+                  onChange={(e) => setMedPriority(e.target.value)}
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
                 >
                   <option value="1">1 - Esencial / Critico</option>
                   <option value="2">2 - Prioridad Media</option>
@@ -1007,7 +1637,7 @@ export function MedicationsInventoryView({
               <div>
                 <label
                   htmlFor="med-buffer"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
                 >
                   Colchon de seguridad (dias)
                 </label>
@@ -1016,680 +1646,579 @@ export function MedicationsInventoryView({
                   type="number"
                   min="1"
                   max="60"
-                  value={safetyBufferDays}
-                  onChange={(e) => setSafetyBufferDays(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] bg-white"
+                  value={medBufferDays}
+                  onChange={(e) => setMedBufferDays(e.target.value)}
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
                 />
               </div>
 
-              <div className="md:col-span-3">
+              <div className="sm:col-span-2">
                 <label
                   htmlFor="med-notes"
-                  className="block text-[14px] font-medium text-[#0F172A] mb-1"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
                 >
-                  Notas clinicas de administracion
+                  Indicaciones clinicas
                 </label>
                 <input
                   id="med-notes"
                   type="text"
-                  placeholder="Indicaciones medicas o notas sobre adquisicion"
-                  value={clinicalNotes}
-                  onChange={(e) => setClinicalNotes(e.target.value)}
-                  className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
+                  value={medNotes}
+                  onChange={(e) => setMedNotes(e.target.value)}
+                  placeholder="Observaciones medicas, ajustes del doctor..."
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
                 />
               </div>
             </div>
           </div>
 
-          {formError && (
-            <p className="text-[14px] font-medium text-[#991B1B]" role="alert">
-              {formError}
-            </p>
-          )}
-
-          <div className="flex justify-end gap-3 pt-2">
+          <div className="flex flex-wrap items-center justify-end gap-2.5 pt-3 border-t border-[#E2E8F0]">
             <button
               type="button"
-              onClick={() => {
-                setShowForm(false);
-                resetForm();
-              }}
+              disabled={savingMed}
+              onClick={() => setMedModalOpen(false)}
               className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px] font-medium"
             >
               Cancelar
             </button>
             <button
               type="submit"
-              disabled={isSubmitting}
-              className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[15px] font-bold"
+              disabled={savingMed}
+              className="clinical-btn px-5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold inline-flex items-center gap-2"
             >
-              {isSubmitting
-                ? "Guardando y optimizando..."
-                : editingMedId
+              <Check className="w-4 h-4" aria-hidden="true" />
+              {savingMed
+                ? "Guardando..."
+                : editingMed
                 ? "Guardar Cambios"
-                : "Guardar y Optimizar Bloques"}
+                : "Registrar Medicamento"}
             </button>
           </div>
         </form>
-      )}
+      </ClinicalModal>
 
-      {/* Filtros y Buscador */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {(
-            [
-              ["active", `Activos (${snapshot.medications.length})`],
-              [
-                "incomplete",
-                `Datos Pendientes (${snapshot.incomplete_medications.length})`,
-              ],
-              [
-                "critical",
-                `Criticos <=7d (${snapshot.low_stock_medications.length})`,
-              ],
-              [
-                "archived",
-                `Archivados (${snapshot.archived_medications.length})`,
-              ],
-            ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setFilterTab(id)}
-              className={cn(
-                "clinical-btn px-3.5 text-[13px] font-semibold border",
-                filterTab === id
-                  ? "bg-[#0F172A] border-[#0F172A] text-white"
-                  : "bg-white border-[#CBD5E1] text-[#334155] hover:bg-[#F8FAFC]"
-              )}
+      {/* Modal: Registrar Restock */}
+      <ClinicalModal
+        open={Boolean(restockTarget)}
+        onClose={() => !savingRestock && setRestockTarget(null)}
+        title={`Registrar Restock: ${restockTarget?.name ?? ""}`}
+        subtitle="Suma unidades al inventario y opcionalmente registra el gasto en finanzas."
+        maxWidthClass="max-w-xl"
+      >
+        <form onSubmit={handleRestockSubmit} className="space-y-4">
+          {restockError && (
+            <div
+              role="alert"
+              className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]"
             >
-              {label}
+              {restockError}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div>
+              <label
+                htmlFor="restock-qty"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Unidades recibidas *
+              </label>
+              <input
+                id="restock-qty"
+                type="number"
+                step="any"
+                min="0.1"
+                required
+                value={restockQty}
+                onChange={(e) => setRestockQty(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="restock-units-pkg"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Unidades por caja (actualizar catalogo)
+              </label>
+              <input
+                id="restock-units-pkg"
+                type="number"
+                step="any"
+                min="0.1"
+                value={restockUnitsPkg}
+                onChange={(e) => setRestockUnitsPkg(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="restock-pkg-price"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Precio por caja (MXN)
+              </label>
+              <input
+                id="restock-pkg-price"
+                type="number"
+                step="0.01"
+                min="0"
+                value={restockPkgPrice}
+                onChange={(e) => {
+                  setRestockPkgPrice(e.target.value);
+                  if (!restockExpenseAmount) {
+                    setRestockExpenseAmount(e.target.value);
+                  }
+                }}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="restock-pharmacy"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Farmacia / Proveedor
+              </label>
+              <input
+                id="restock-pharmacy"
+                type="text"
+                value={restockPharmacy}
+                onChange={(e) => setRestockPharmacy(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+              />
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 text-[13px] text-[#0F172A] font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={restockLogExpense}
+              onChange={(e) => setRestockLogExpense(e.target.checked)}
+              className="w-4 h-4 accent-[#0E7490]"
+            />
+            Registrar automaticamente el pago en el Modulo Financiero
+          </label>
+
+          {restockLogExpense && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 p-3 rounded-[6px] bg-[#F8FAFC] border border-[#E2E8F0]">
+              <div>
+                <label
+                  htmlFor="restock-expense"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Total pagado (MXN)
+                </label>
+                <input
+                  id="restock-expense"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={restockExpenseAmount}
+                  onChange={(e) => setRestockExpenseAmount(e.target.value)}
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px] bg-white"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="restock-method"
+                  className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Metodo de pago
+                </label>
+                <input
+                  id="restock-method"
+                  type="text"
+                  value={restockPaymentMethod}
+                  onChange={(e) => setRestockPaymentMethod(e.target.value)}
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button
+              type="button"
+              onClick={() => setRestockTarget(null)}
+              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
+            >
+              Cancelar
             </button>
-          ))}
-        </div>
+            <button
+              type="submit"
+              disabled={savingRestock}
+              className="clinical-btn px-4 bg-[#065F46] hover:bg-[#047857] text-white text-[14px] font-semibold"
+            >
+              {savingRestock ? "Guardando..." : "Confirmar Restock"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
 
-        <input
-          type="search"
-          placeholder="Buscar por nombre o principio activo..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          className="h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px] w-full sm:w-[280px]"
-        />
-      </div>
+      {/* Modal: Ajuste Fisico de Stock */}
+      <ClinicalModal
+        open={Boolean(adjustTarget)}
+        onClose={() => !savingAdjust && setAdjustTarget(null)}
+        title={`Ajuste Fisico de Stock: ${adjustTarget?.name ?? ""}`}
+        subtitle="Establece la cantidad exacta contada en caja (no modifica los gastos historicos)."
+        maxWidthClass="max-w-lg"
+      >
+        <form onSubmit={handleAdjustSubmit} className="space-y-4">
+          {adjustError && (
+            <div
+              role="alert"
+              className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]"
+            >
+              {adjustError}
+            </div>
+          )}
 
-      {/* Tabla de Inventario y Gobernanza */}
-      <div className="clinical-card overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[13px] font-semibold text-[#475569]">
-                <th className="py-3 px-4">Farmaco / Principio</th>
-                <th className="py-3 px-3">Dosis / Periodicidad</th>
-                <th className="py-3 px-3">Regla y Bloques</th>
-                <th className="py-3 px-3">Costo y Envase</th>
-                <th className="py-3 px-3">Stock y Cobertura</th>
-                <th className="py-3 px-4 text-right">Gobernanza</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#E2E8F0]">
-              {visibleMeds.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={6}
-                    className="py-8 px-4 text-center text-[14px] text-[#64748B]"
-                  >
-                    No hay medicamentos en esta vista.
-                  </td>
-                </tr>
-              ) : (
-                visibleMeds.map((med) => {
-                  const days =
-                    med.days_of_supply_remaining !== null
-                      ? Number(med.days_of_supply_remaining)
-                      : null;
-                  const level =
-                    days === null
-                      ? "warn"
-                      : days <= 7
-                      ? "crit"
-                      : days <= 14
-                      ? "warn"
-                      : "ok";
-                  const progressPct =
-                    days === null
-                      ? 0
-                      : Math.min(100, Math.max(4, (days / 30) * 100));
-                  const hasIncompleteData =
-                    med.current_stock === null ||
-                    med.package_price === null ||
-                    med.units_per_package === null;
+          <label className="flex items-center gap-2 text-[13px] font-medium text-[#0F172A] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={adjustUnknown}
+              onChange={(e) => setAdjustUnknown(e.target.checked)}
+              className="w-4 h-4 accent-[#0E7490]"
+            />
+            Marcar inventario como &quot;Por definir&quot; (aun sin conteo)
+          </label>
 
-                  const monthlyCostEst =
-                    med.package_price !== null &&
-                    med.units_per_package &&
-                    med.units_per_package > 0
-                      ? ((med.daily_consumption_rate * 30) /
-                          med.units_per_package) *
-                        med.package_price
-                      : null;
+          {!adjustUnknown && (
+            <div>
+              <label
+                htmlFor="adjust-stock-val"
+                className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+              >
+                Cantidad exacta ({adjustTarget?.presentation ?? "unidades"})
+              </label>
+              <input
+                id="adjust-stock-val"
+                type="number"
+                step="any"
+                min="0"
+                required
+                value={adjustStockVal}
+                onChange={(e) => setAdjustStockVal(e.target.value)}
+                className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+              />
+            </div>
+          )}
 
-                  return (
-                    <tr key={med.id} className="bg-white hover:bg-[#F8FAFC]">
-                      <td className="py-3.5 px-4 align-top">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="font-bold text-[15px] text-[#0F172A]">
-                            {med.name}
-                          </span>
-                          {hasIncompleteData && (
-                            <StatusBadge label="[DATOS PENDIENTES]" tone="warn" />
-                          )}
-                          {!med.is_active && (
-                            <StatusBadge label="[ARCHIVADO]" tone="neutral" />
-                          )}
+          <div>
+            <label
+              htmlFor="adjust-reason"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Motivo del ajuste
+            </label>
+            <input
+              id="adjust-reason"
+              type="text"
+              value={adjustReason}
+              onChange={(e) => setAdjustReason(e.target.value)}
+              className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button
+              type="button"
+              onClick={() => setAdjustTarget(null)}
+              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={savingAdjust}
+              className="clinical-btn px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-semibold"
+            >
+              {savingAdjust ? "Aplicando..." : "Guardar Ajuste"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
+
+      {/* Modal: Archivar Medicamento (Admin) */}
+      <ClinicalModal
+        open={Boolean(archiveTarget)}
+        onClose={() => !savingArchive && setArchiveTarget(null)}
+        title={`Archivar Tratamiento: ${archiveTarget?.name ?? ""}`}
+        subtitle="Deja de generar tomas diarias y compras futuras, conservando el historial clinico."
+        maxWidthClass="max-w-lg"
+      >
+        <form onSubmit={handleArchiveSubmit} className="space-y-4">
+          {archiveError && (
+            <div
+              role="alert"
+              className="p-3 rounded-[6px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]"
+            >
+              {archiveError}
+            </div>
+          )}
+
+          <div>
+            <label
+              htmlFor="archive-reason"
+              className="block text-[13px] font-semibold text-[#0F172A] mb-1"
+            >
+              Motivo medico o administrativo (opcional)
+            </label>
+            <input
+              id="archive-reason"
+              type="text"
+              value={archiveReason}
+              onChange={(e) => setArchiveReason(e.target.value)}
+              placeholder="Ej. Tratamiento concluido por medico"
+              className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E2E8F0]">
+            <button
+              type="button"
+              onClick={() => setArchiveTarget(null)}
+              className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={savingArchive}
+              className="clinical-btn px-4 bg-[#D97706] hover:bg-[#B45309] text-white text-[14px] font-semibold"
+            >
+              {savingArchive ? "Archivando..." : "Confirmar Archivo"}
+            </button>
+          </div>
+        </form>
+      </ClinicalModal>
+
+      {/* Modal: Gestion de Bloques Horarios */}
+      <ClinicalModal
+        open={clustersModalOpen}
+        onClose={() => !savingCluster && setClustersModalOpen(false)}
+        title="Bloques Horarios de Toma"
+        subtitle="Agrupa medicamentos en momentos clave del dia (ej. Desayuno 08:00, Vespertino 15:00, Cena 21:00)."
+        maxWidthClass="max-w-2xl"
+      >
+        <div className="space-y-5">
+          <div className="space-y-2.5">
+            {snapshot.clusters.map((cluster) => {
+              const isConfirmDel = confirmDeleteClusterId === cluster.id;
+              return (
+                <div
+                  key={cluster.id}
+                  className="p-3.5 rounded-[6px] border border-[#E2E8F0] bg-[#F8FAFC] flex flex-wrap items-center justify-between gap-3"
+                >
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[14px] font-bold text-[#0E7490]">
+                        {formatShortTime(cluster.anchor_time)}
+                      </span>
+                      <span className="font-bold text-[15px] text-[#0F172A]">
+                        {cluster.label}
+                      </span>
+                      <StatusBadge
+                        label={INTAKE_RULE_TAG[cluster.intake_rule]}
+                        tone="neutral"
+                      />
+                      {!cluster.is_active && (
+                        <StatusBadge label="[INACTIVO]" tone="warn" />
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <IconActionButton
+                      icon={Edit3}
+                      label={`Editar bloque ${cluster.label}`}
+                      tone="neutral"
+                      onClick={() => startEditCluster(cluster)}
+                    />
+                    {isAdmin &&
+                      (isConfirmDel ? (
+                        <div className="inline-flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={busyKey === `del-cluster:${cluster.id}`}
+                            onClick={async () => {
+                              setBusyKey(`del-cluster:${cluster.id}`);
+                              try {
+                                await onDeleteCluster(cluster.id);
+                                setConfirmDeleteClusterId(null);
+                              } catch {
+                                // Toast
+                              } finally {
+                                setBusyKey(null);
+                              }
+                            }}
+                            className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[12px] font-bold"
+                          >
+                            Confirmar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteClusterId(null)}
+                            className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[#334155] text-[12px]"
+                          >
+                            No
+                          </button>
                         </div>
-                        {med.active_ingredient && (
-                          <div className="text-[13px] text-[#475569]">
-                            {med.active_ingredient}
-                          </div>
-                        )}
-                        <div className="mt-1 flex flex-wrap gap-1">
-                          <StatusBadge
-                            label={
-                              PURCHASE_PRIORITY_TAG[med.purchase_priority] ??
-                              "[MEDIA]"
-                            }
-                            tone={med.purchase_priority === 1 ? "info" : "neutral"}
-                          />
-                        </div>
-                        {med.clinical_notes && (
-                          <p className="mt-1.5 text-[13px] text-[#64748B] max-w-[32ch]">
-                            {med.clinical_notes}
-                          </p>
-                        )}
-                        {!med.is_active && med.discontinuation_reason && (
-                          <p className="mt-1 text-[13px] text-[#991B1B]">
-                            Motivo archivo: {med.discontinuation_reason}
-                          </p>
-                        )}
-                      </td>
+                      ) : (
+                        <IconActionButton
+                          icon={Trash2}
+                          label={`Eliminar bloque ${cluster.label}`}
+                          tone="danger"
+                          onClick={() => setConfirmDeleteClusterId(cluster.id)}
+                        />
+                      ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
 
-                      <td className="py-3.5 px-3 align-top">
-                        <div className="font-mono text-[14px] font-semibold tabular-nums text-[#0F172A]">
-                          {med.dose_amount} {med.presentation}
-                        </div>
-                        <div className="text-[13px] text-[#475569] mt-0.5">
-                          {FREQUENCY_TYPE_LABEL[med.frequency_type]}:{" "}
-                          <span className="font-mono tabular-nums">
-                            {med.frequency_value}
-                          </span>
-                        </div>
-                        <div className="font-mono text-[13px] text-[#64748B] tabular-nums">
-                          Tasa: {med.daily_consumption_rate}/dia
-                        </div>
-                      </td>
+          <form
+            onSubmit={handleClusterSubmit}
+            className="p-4 rounded-[6px] border border-[#E2E8F0] bg-white space-y-3"
+          >
+            <h4 className="text-[14px] font-bold text-[#0F172A]">
+              {editingCluster
+                ? `Editando bloque: ${editingCluster.label}`
+                : "Agregar nuevo bloque horario"}
+            </h4>
 
-                      <td className="py-3.5 px-3 align-top">
-                        <div className="mb-1.5">
-                          <StatusBadge
-                            label={INTAKE_RULE_TAG[med.intake_rule]}
-                            tone="info"
-                          />
-                          <span className="sr-only">
-                            {INTAKE_RULE_LABEL[med.intake_rule]}
-                          </span>
-                        </div>
-                        {med.schedules && med.schedules.length > 0 ? (
-                          <ul className="space-y-1">
-                            {med.schedules.map((sch) => (
-                              <li
-                                key={sch.schedule_id}
-                                className="font-mono text-[13px] text-[#334155] tabular-nums"
-                              >
-                                {formatShortTime(sch.ideal_time)} -&gt;{" "}
-                                <strong className="text-[#0E7490]">
-                                  {formatShortTime(sch.effective_clustered_time)}
-                                </strong>{" "}
-                                {sch.cluster_label
-                                  ? `(${sch.cluster_label})`
-                                  : "(Dedicado)"}
-                              </li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <span className="text-[13px] text-[#64748B]">
-                            Vinculado a evento clinico
-                          </span>
-                        )}
-                      </td>
+            {clusterError && (
+              <div
+                role="alert"
+                className="p-2.5 rounded-[4px] bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] text-[13px]"
+              >
+                {clusterError}
+              </div>
+            )}
 
-                      <td className="py-3.5 px-3 align-top font-mono text-[13px] tabular-nums">
-                        {med.package_price !== null ? (
-                          <div className="font-bold text-[#0F172A]">
-                            {formatCurrencyMxn(med.package_price)} /{" "}
-                            {med.units_per_package ?? "?"} u.
-                          </div>
-                        ) : (
-                          <StatusBadge label="[PRECIO PENDIENTE]" tone="warn" />
-                        )}
-                        {monthlyCostEst !== null && (
-                          <div className="mt-1 text-[#475569]">
-                            Est. 30d: {formatCurrencyMxn(monthlyCostEst)}
-                          </div>
-                        )}
-                        {med.preferred_pharmacy && (
-                          <div className="mt-0.5 text-[12px] text-[#64748B] font-sans">
-                            {med.preferred_pharmacy}
-                          </div>
-                        )}
-                      </td>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label
+                  htmlFor="cluster-label"
+                  className="block text-[12px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Nombre *
+                </label>
+                <input
+                  id="cluster-label"
+                  type="text"
+                  required
+                  value={clusterLabel}
+                  onChange={(e) => setClusterLabel(e.target.value)}
+                  placeholder="Ej. Bloque Vespertino"
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px]"
+                />
+              </div>
 
-                      <td className="py-3.5 px-3 align-top min-w-[175px]">
-                        {med.current_stock === null || days === null ? (
-                          <div className="space-y-1">
-                            <StatusBadge label="[STOCK PENDIENTE]" tone="warn" />
-                            <p className="text-[12px] text-[#64748B]">
-                              Captura stock al recibir la caja.
-                            </p>
-                          </div>
-                        ) : (
-                          <>
-                            <div className="font-mono text-[14px] font-bold text-[#0F172A] tabular-nums mb-1">
-                              {med.current_stock} {med.presentation}
-                            </div>
-                            <div className="flex items-center justify-between gap-2 mb-1">
-                              <span
-                                className={cn(
-                                  "font-mono text-[14px] font-bold tabular-nums",
-                                  level === "crit"
-                                    ? "text-[#991B1B]"
-                                    : level === "warn"
-                                    ? "text-[#92400E]"
-                                    : "text-[#065F46]"
-                                )}
-                              >
-                                {days >= 999 ? "Indef." : `${days} dias`}
-                              </span>
-                              <StatusBadge
-                                label={
-                                  level === "crit"
-                                    ? "[CRITICO]"
-                                    : level === "warn"
-                                    ? "[ATENCION]"
-                                    : "[OPTIMO]"
-                                }
-                                tone={level}
-                              />
-                            </div>
-                            <div className="h-2 w-full bg-[#E2E8F0] rounded-full overflow-hidden">
-                              <div
-                                className={cn(
-                                  "h-full",
-                                  level === "crit"
-                                    ? "bg-[#DC2626]"
-                                    : level === "warn"
-                                    ? "bg-[#D97706]"
-                                    : "bg-[#059669]"
-                                )}
-                                style={{ width: `${progressPct}%` }}
-                              />
-                            </div>
-                          </>
-                        )}
-                      </td>
+              <div>
+                <label
+                  htmlFor="cluster-anchor"
+                  className="block text-[12px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Hora ancla *
+                </label>
+                <input
+                  id="cluster-anchor"
+                  type="time"
+                  required
+                  value={clusterAnchor}
+                  onChange={(e) => setClusterAnchor(e.target.value)}
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 font-mono text-[14px]"
+                />
+              </div>
 
-                      <td className="py-3.5 px-4 align-top text-right">
-                        <div className="flex flex-col items-end gap-1.5">
-                          <div className="flex flex-wrap justify-end gap-1.5">
-                            {med.is_active && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setRestockId(
-                                      restockId === med.id ? null : med.id
-                                    );
-                                    setAdjustId(null);
-                                    setArchiveTargetId(null);
-                                    setRestockQty(
-                                      String(med.units_per_package ?? 30)
-                                    );
-                                    setRestockPrice(
-                                      med.package_price !== null
-                                        ? String(med.package_price)
-                                        : ""
-                                    );
-                                    setRestockPkgUnits(
-                                      med.units_per_package !== null
-                                        ? String(med.units_per_package)
-                                        : ""
-                                    );
-                                    setRestockPharmacy(
-                                      med.preferred_pharmacy ?? ""
-                                    );
-                                  }}
-                                  className="clinical-btn inline-flex items-center gap-1 px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px] font-medium"
-                                >
-                                  <PackagePlus
-                                    className="w-3.5 h-3.5 text-[#0E7490]"
-                                    strokeWidth={1.75}
-                                    aria-hidden="true"
-                                  />
-                                  Sumar
-                                </button>
+              <div>
+                <label
+                  htmlFor="cluster-rule"
+                  className="block text-[12px] font-semibold text-[#0F172A] mb-1"
+                >
+                  Regla
+                </label>
+                <select
+                  id="cluster-rule"
+                  value={clusterRule}
+                  onChange={(e) =>
+                    setClusterRule(e.target.value as IntakeConstraint)
+                  }
+                  className="clinical-input w-full border border-[#CBD5E1] px-3 text-[14px] bg-white"
+                >
+                  {(
+                    [
+                      "NONE",
+                      "FASTING",
+                      "WITH_FOOD",
+                      "SEPARATE_FROM_OTHERS",
+                    ] as IntakeConstraint[]
+                  ).map((rule) => (
+                    <option key={rule} value={rule}>
+                      {INTAKE_RULE_LABEL[rule]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
 
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setAdjustId(
-                                      adjustId === med.id ? null : med.id
-                                    );
-                                    setRestockId(null);
-                                    setArchiveTargetId(null);
-                                    setAdjustMarkPending(
-                                      med.current_stock === null
-                                    );
-                                    setAdjustStockVal(
-                                      String(med.current_stock ?? 0)
-                                    );
-                                  }}
-                                  className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px]"
-                                >
-                                  Ajustar
-                                </button>
-                              </>
-                            )}
+            {editingCluster && (
+              <label className="flex items-center gap-2 text-[13px] text-[#0F172A] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={clusterActive}
+                  onChange={(e) => setClusterActive(e.target.checked)}
+                  className="w-4 h-4 accent-[#0E7490]"
+                />
+                Bloque activo para agrupacion automatica
+              </label>
+            )}
 
-                            <button
-                              type="button"
-                              onClick={() => openEditMedicationForm(med)}
-                              className={cn(
-                                "clinical-btn inline-flex items-center gap-1 px-2.5 border text-[13px] font-medium",
-                                hasIncompleteData
-                                  ? "bg-[#FEF3C7] border-[#F59E0B] text-[#92400E]"
-                                  : "bg-white border-[#CBD5E1] hover:bg-[#F1F5F9] text-[#0F172A]"
-                              )}
-                            >
-                              <Edit3
-                                className="w-3.5 h-3.5"
-                                strokeWidth={1.75}
-                                aria-hidden="true"
-                              />
-                              {hasIncompleteData ? "Completar" : "Editar"}
-                            </button>
-
-                            {med.is_active ? (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setArchiveTargetId(
-                                    archiveTargetId === med.id ? null : med.id
-                                  );
-                                  setRestockId(null);
-                                  setAdjustId(null);
-                                }}
-                                className="clinical-btn inline-flex items-center gap-1 px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#475569] text-[13px]"
-                                title="Suspender o archivar tratamiento"
-                              >
-                                <Archive
-                                  className="w-3.5 h-3.5"
-                                  strokeWidth={1.75}
-                                  aria-hidden="true"
-                                />
-                                Archivar
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => onRestoreMedication(med.id)}
-                                className="clinical-btn inline-flex items-center gap-1 px-2.5 border border-[#A7F3D0] bg-[#ECFDF5] text-[#065F46] text-[13px] font-medium"
-                              >
-                                <RotateCcw
-                                  className="w-3.5 h-3.5"
-                                  strokeWidth={1.75}
-                                  aria-hidden="true"
-                                />
-                                Restaurar
-                              </button>
-                            )}
-
-                            {confirmDeleteMedId === med.id ? (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={async () => {
-                                    await onDeleteMedication(med.id);
-                                    setConfirmDeleteMedId(null);
-                                  }}
-                                  className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[13px] font-bold"
-                                >
-                                  Confirmar Borrar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setConfirmDeleteMedId(null)}
-                                  className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[13px]"
-                                >
-                                  No
-                                </button>
-                              </>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => setConfirmDeleteMedId(med.id)}
-                                className="clinical-btn px-2 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
-                                aria-label={`Eliminar ${med.name}`}
-                              >
-                                <Trash2
-                                  className="w-3.5 h-3.5"
-                                  strokeWidth={1.75}
-                                  aria-hidden="true"
-                                />
-                              </button>
-                            )}
-                          </div>
-
-                          {/* Panel inline de Restock + Registro de Gasto */}
-                          {restockId === med.id && (
-                            <div className="mt-2 p-3 border border-[#A5F3FC] bg-[#F8FAFC] rounded-[6px] text-left space-y-2 w-full max-w-[300px]">
-                              <div className="text-[12px] font-bold text-[#0F172A]">
-                                Sumar Stock y Registrar Compra
-                              </div>
-                              <div className="grid grid-cols-2 gap-2">
-                                <div>
-                                  <label className="block text-[11px] text-[#475569]">
-                                    Unidades +{med.presentation}
-                                  </label>
-                                  <input
-                                    type="number"
-                                    min="1"
-                                    step="1"
-                                    value={restockQty}
-                                    onChange={(e) =>
-                                      setRestockQty(e.target.value)
-                                    }
-                                    className="w-full h-[38px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[13px]"
-                                  />
-                                </div>
-                                <div>
-                                  <label className="block text-[11px] text-[#475569]">
-                                    Costo pagado MXN
-                                  </label>
-                                  <input
-                                    type="number"
-                                    min="0"
-                                    step="0.01"
-                                    placeholder="Opcional"
-                                    value={restockPrice}
-                                    onChange={(e) =>
-                                      setRestockPrice(e.target.value)
-                                    }
-                                    className="w-full h-[38px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[13px]"
-                                  />
-                                </div>
-                              </div>
-                              {med.units_per_package === null && (
-                                <div>
-                                  <label className="block text-[11px] text-[#475569]">
-                                    Piezas por envase (para catalogo)
-                                  </label>
-                                  <input
-                                    type="number"
-                                    min="1"
-                                    step="1"
-                                    placeholder="Ej. 30"
-                                    value={restockPkgUnits}
-                                    onChange={(e) =>
-                                      setRestockPkgUnits(e.target.value)
-                                    }
-                                    className="w-full h-[38px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[13px]"
-                                  />
-                                </div>
-                              )}
-                              <input
-                                type="text"
-                                placeholder="Farmacia (opcional)"
-                                value={restockPharmacy}
-                                onChange={(e) =>
-                                  setRestockPharmacy(e.target.value)
-                                }
-                                className="w-full h-[36px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white text-[13px]"
-                              />
-                              <label className="inline-flex items-center gap-1.5 text-[12px] text-[#334155]">
-                                <input
-                                  type="checkbox"
-                                  checked={restockLogExpense}
-                                  onChange={(e) =>
-                                    setRestockLogExpense(e.target.checked)
-                                  }
-                                  className="accent-[#0E7490]"
-                                />
-                                Guardar en Bitacora de Gastos
-                              </label>
-                              <div className="flex justify-end gap-1.5">
-                                <button
-                                  type="button"
-                                  onClick={() => setRestockId(null)}
-                                  className="px-2.5 h-[36px] border border-[#CBD5E1] bg-white rounded-[6px] text-[12px]"
-                                >
-                                  Cancelar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleQuickRestock(med)}
-                                  className="px-3 h-[36px] bg-[#0E7490] text-white rounded-[6px] text-[12px] font-bold"
-                                >
-                                  Confirmar
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Panel inline de Ajuste Exacto de Stock */}
-                          {adjustId === med.id && (
-                            <div className="mt-2 p-3 border border-[#CBD5E1] bg-[#F8FAFC] rounded-[6px] text-left space-y-2 w-full max-w-[280px]">
-                              <div className="text-[12px] font-bold text-[#0F172A]">
-                                Ajuste Exacto (Conteo Fisico)
-                              </div>
-                              <label className="inline-flex items-center gap-1.5 text-[12px] text-[#92400E]">
-                                <input
-                                  type="checkbox"
-                                  checked={adjustMarkPending}
-                                  onChange={(e) =>
-                                    setAdjustMarkPending(e.target.checked)
-                                  }
-                                  className="accent-[#0E7490]"
-                                />
-                                Marcar stock como pendiente (NULL)
-                              </label>
-                              {!adjustMarkPending && (
-                                <input
-                                  type="number"
-                                  min="0"
-                                  step="0.5"
-                                  value={adjustStockVal}
-                                  onChange={(e) =>
-                                    setAdjustStockVal(e.target.value)
-                                  }
-                                  className="w-full h-[38px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[13px]"
-                                />
-                              )}
-                              <input
-                                type="text"
-                                placeholder="Motivo del ajuste"
-                                value={adjustReason}
-                                onChange={(e) => setAdjustReason(e.target.value)}
-                                className="w-full h-[36px] px-2 border border-[#CBD5E1] rounded-[6px] bg-white text-[13px]"
-                              />
-                              <div className="flex justify-end gap-1.5">
-                                <button
-                                  type="button"
-                                  onClick={() => setAdjustId(null)}
-                                  className="px-2.5 h-[36px] border border-[#CBD5E1] bg-white rounded-[6px] text-[12px]"
-                                >
-                                  Cancelar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleAdjustSubmit(med)}
-                                  className="px-3 h-[36px] bg-[#0F172A] text-white rounded-[6px] text-[12px] font-bold"
-                                >
-                                  Fijar Stock
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                          {/* Panel inline de Archivado */}
-                          {archiveTargetId === med.id && (
-                            <div className="mt-2 p-3 border border-[#FECACA] bg-[#FEF2F2] rounded-[6px] text-left space-y-2 w-full max-w-[280px]">
-                              <div className="text-[12px] font-bold text-[#991B1B]">
-                                Suspender / Archivar Farmaco
-                              </div>
-                              <input
-                                type="text"
-                                placeholder="Motivo medico (ej. Fin de esquema)"
-                                value={archiveReason}
-                                onChange={(e) =>
-                                  setArchiveReason(e.target.value)
-                                }
-                                className="w-full h-[36px] px-2 border border-[#FECACA] rounded-[6px] bg-white text-[13px]"
-                              />
-                              <div className="flex justify-end gap-1.5">
-                                <button
-                                  type="button"
-                                  onClick={() => setArchiveTargetId(null)}
-                                  className="px-2.5 h-[36px] border border-[#CBD5E1] bg-white rounded-[6px] text-[12px]"
-                                >
-                                  Cancelar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={async () => {
-                                    await onArchiveMedication(
-                                      med.id,
-                                      archiveReason.trim() || null
-                                    );
-                                    setArchiveTargetId(null);
-                                    setArchiveReason("");
-                                  }}
-                                  className="px-3 h-[36px] bg-[#991B1B] text-white rounded-[6px] text-[12px] font-bold"
-                                >
-                                  Confirmar Archivo
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
+            <div className="flex items-center justify-end gap-2">
+              {editingCluster && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingCluster(null);
+                    setClusterLabel("");
+                  }}
+                  className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
+                >
+                  Nuevo en su lugar
+                </button>
               )}
-            </tbody>
-          </table>
+              <button
+                type="submit"
+                disabled={savingCluster}
+                className="clinical-btn px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[13px] font-semibold"
+              >
+                {savingCluster
+                  ? "Guardando..."
+                  : editingCluster
+                  ? "Actualizar Bloque"
+                  : "Crear Bloque"}
+              </button>
+            </div>
+          </form>
         </div>
-      </div>
+      </ClinicalModal>
+
+      {/* Modal Control de Versiones (Solo Administrador) */}
+      {isAdmin && (
+        <MedicationVersionsModal
+          medication={versionsTarget}
+          versions={snapshot.medication_versions}
+          onClose={() => setVersionsTarget(null)}
+          onRestoreVersion={onRestoreVersion}
+          onMarkReviewed={onMarkVersionReviewed}
+        />
+      )}
     </div>
   );
 }

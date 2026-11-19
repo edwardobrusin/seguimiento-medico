@@ -1,16 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Activity,
+  AlertCircle,
   CalendarClock,
+  CheckCircle2,
   ClipboardList,
   Database,
   FileHeart,
+  LogOut,
   Pill,
   RefreshCw,
   Send,
   Wallet,
+  X,
 } from "lucide-react";
 import type {
   CommandCenterSnapshot,
@@ -22,6 +27,7 @@ import type {
   NoteType,
   PayScheduleType,
   TaskStatus,
+  UserRole,
 } from "@/lib/types/clinical";
 import { cn, formatDateTimeEs } from "@/lib/utils";
 import { CommandCenterView } from "./CommandCenterView";
@@ -37,9 +43,8 @@ import {
 import { FollowUpTopicsView } from "./FollowUpTopicsView";
 import { PatientDossierView } from "./PatientDossierView";
 import { TelegramConfigView } from "./TelegramConfigView";
-import { StatusBadge } from "./StatusBadge";
 
-type TabId =
+export type TabId =
   | "command"
   | "inventory"
   | "finances"
@@ -50,9 +55,20 @@ type TabId =
 
 interface ClinicalShellProps {
   initialSnapshot: CommandCenterSnapshot;
+  sessionUser: {
+    username: string;
+    displayName: string;
+    role: UserRole;
+  };
 }
 
-export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
+export function ClinicalShell({
+  initialSnapshot,
+  sessionUser,
+}: ClinicalShellProps) {
+  const router = useRouter();
+  const isAdmin = sessionUser.role === "ADMIN";
+
   const [snapshot, setSnapshot] =
     useState<CommandCenterSnapshot>(initialSnapshot);
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -72,6 +88,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
           `/api/command-center?date=${encodeURIComponent(targetDate)}`,
           { cache: "no-store" }
         );
+        if (res.status === 401) {
+          router.refresh();
+          return;
+        }
         if (!res.ok) throw new Error("Fallo al recargar estado clinico.");
         const data = (await res.json()) as CommandCenterSnapshot;
         setSnapshot(data);
@@ -84,21 +104,30 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
         setRefreshing(false);
       }
     },
-    [selectedDate]
+    [selectedDate, router]
   );
 
-  // Despachador de cola cada 60 segundos mientras la consola clinica esta activa
+  // Auto-ocultar avisos de exito tras 4.5s (mantiene errores hasta cerrar)
+  useEffect(() => {
+    if (!syncMessage) return;
+    const t = setTimeout(() => setSyncMessage(null), 4500);
+    return () => clearTimeout(t);
+  }, [syncMessage]);
+
+  // Polling cada 60s (Paciente nunca llama a endpoints /api/telegram/*)
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        await fetch("/api/telegram/dispatch", { method: "POST" });
+        if (isAdmin) {
+          await fetch("/api/telegram/dispatch", { method: "POST" });
+        }
         await refreshSnapshot();
       } catch {
-        // Silencioso en segundo plano para no interrumpir captura clinica
+        // Silencioso en segundo plano
       }
     }, 60000);
     return () => clearInterval(interval);
-  }, [refreshSnapshot]);
+  }, [isAdmin, refreshSnapshot]);
 
   async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
     const res = await fetch(url, {
@@ -106,13 +135,42 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (res.status === 401) {
+      router.refresh();
+      throw new Error("Tu sesion expiro. Vuelve a iniciar sesion.");
+    }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       throw new Error(
-        typeof data?.error === "string" ? data.error : "Error en operacion."
+        typeof data?.error === "string"
+          ? data.error
+          : "No se pudo completar la operacion."
       );
     }
     return data as T;
+  }
+
+  async function runMutation<T>(
+    fn: () => Promise<T>,
+    successMsg?: string
+  ): Promise<T> {
+    setSyncError(null);
+    try {
+      const out = await fn();
+      if (successMsg) setSyncMessage(successMsg);
+      return out;
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Error al ejecutar operacion.";
+      setSyncError(msg);
+      setSyncMessage(null);
+      throw err;
+    }
+  }
+
+  async function handleLogout() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    router.refresh();
   }
 
   async function handleSelectDate(dateStr: string) {
@@ -137,7 +195,7 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
                 ...item,
                 status: "TAKEN",
                 taken_at: nowIso,
-                recorded_by: "Consola Clinica Web",
+                recorded_by: sessionUser.displayName,
                 current_stock:
                   item.current_stock === null
                     ? null
@@ -157,9 +215,9 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
         action: "confirm_cluster",
         cluster_id: clusterId,
         date_str: dateStr,
-        recorded_by: "Consola Clinica Web",
       });
-      setSyncMessage("[CONFIRMADO] Bloque administrado y stock actualizado.");
+      setSyncMessage("Bloque confirmado e inventario actualizado.");
+      setSyncError(null);
       await refreshSnapshot();
     } catch (err) {
       setSnapshot(previous);
@@ -174,30 +232,25 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     status: IntakeStatus,
     observations?: string
   ) {
-    try {
+    return runMutation(async () => {
       await postJson("/api/intakes/confirm", {
         action: "confirm_single",
         intake_log_id: intakeLogId,
         status,
-        recorded_by: "Consola Clinica Web",
         ...(observations !== undefined ? { observations } : {}),
       });
-      setSyncMessage(`[ACTUALIZADO] Toma marcada como ${status}.`);
       await refreshSnapshot();
-    } catch (err) {
-      setSyncError(
-        err instanceof Error ? err.message : "Error al actualizar toma."
-      );
-    }
+    }, "Toma actualizada correctamente.");
   }
 
   async function handleDeleteIntakeLog(intakeLogId: string) {
-    await postJson("/api/intakes/confirm", {
-      action: "delete_log",
-      intake_log_id: intakeLogId,
-    });
-    setSyncMessage("[ELIMINADO] Registro de toma borrado (stock reembolsado si aplicaba).");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/intakes/confirm", {
+        action: "delete_log",
+        intake_log_id: intakeLogId,
+      });
+      await refreshSnapshot();
+    }, "Registro de toma eliminado.");
   }
 
   async function handleRestockMedication(
@@ -212,30 +265,31 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       log_expense?: boolean;
     }
   ) {
-    await postJson("/api/intakes/confirm", {
-      action: "restock",
-      medication_id: medicationId,
-      quantity,
-      ...options,
-    });
-    setSyncMessage(
-      `[RESTOCK COMPLETADO] +${quantity} unidades agregadas al inventario.`
-    );
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/intakes/confirm", {
+        action: "restock",
+        medication_id: medicationId,
+        quantity,
+        ...options,
+      });
+      await refreshSnapshot();
+    }, `Restock completado (+${quantity} unidades agregadas).`);
   }
 
   // Gobernanza de Medicamentos y Clusters
   async function handleSaveMedication(payload: SaveMedicationPayload) {
-    await postJson("/api/medications", {
-      action: payload.id ? "update" : "create",
-      ...payload,
-    });
-    setSyncMessage(
+    return runMutation(
+      async () => {
+        await postJson("/api/medications", {
+          action: payload.id ? "update" : "create",
+          ...payload,
+        });
+        await refreshSnapshot();
+      },
       payload.id
-        ? `[EDITADO] ${payload.name} actualizado y bloques recalculados.`
-        : `[REGISTRADO] ${payload.name} optimizado en bloques horarios.`
+        ? `${payload.name} actualizado y horarios sincronizados.`
+        : `${payload.name} registrado y optimizado en bloques.`
     );
-    await refreshSnapshot();
   }
 
   async function handleAdjustStock(
@@ -243,54 +297,83 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     exactStock: number | null,
     reason: string
   ) {
-    await postJson("/api/medications", {
-      action: "adjust_stock",
-      medication_id: medicationId,
-      exact_stock: exactStock,
-      reason,
-    });
-    setSyncMessage("[AJUSTE APLICADO] Inventario fijado con auditoria.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "adjust_stock",
+        medication_id: medicationId,
+        exact_stock: exactStock,
+        reason,
+      });
+      await refreshSnapshot();
+    }, "Inventario ajustado correctamente.");
   }
 
   async function handleArchiveMedication(
     medicationId: string,
     reason: string | null
   ) {
-    await postJson("/api/medications", {
-      action: "archive",
-      medication_id: medicationId,
-      reason,
-    });
-    setSyncMessage("[ARCHIVADO] Medicamento suspendido del esquema activo.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "archive",
+        medication_id: medicationId,
+        reason,
+      });
+      await refreshSnapshot();
+    }, "Medicamento archivado del esquema activo.");
   }
 
   async function handleRestoreMedication(medicationId: string) {
-    await postJson("/api/medications", {
-      action: "restore",
-      medication_id: medicationId,
-    });
-    setSyncMessage("[RESTAURADO] Medicamento reactivado en el catalogo.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "restore",
+        medication_id: medicationId,
+      });
+      await refreshSnapshot();
+    }, "Medicamento reactivado en el catalogo.");
   }
 
   async function handleDeleteMedication(medicationId: string) {
-    await postJson("/api/medications", {
-      action: "delete",
-      medication_id: medicationId,
-    });
-    setSyncMessage("[ELIMINADO] Medicamento eliminado permanentemente.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "delete",
+        medication_id: medicationId,
+      });
+      await refreshSnapshot();
+    }, "Medicamento eliminado permanentemente.");
   }
 
-  async function handleGenerateTodayLogs() {
-    await postJson("/api/medications", {
-      action: "generate_today",
-      date_str: selectedDate,
-    });
-    setSyncMessage("[ACTUALIZADO] Tomas y recordatorios diarios regenerados.");
-    await refreshSnapshot();
+  async function handleRestoreMedicationVersion(
+    medicationId: string,
+    versionId: string
+  ) {
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "restore_version",
+        medication_id: medicationId,
+        version_id: versionId,
+      });
+      await refreshSnapshot();
+    }, "Version restaurada con exito y tomas recalculadas.");
+  }
+
+  async function handleMarkVersionReviewed(versionId: string) {
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "mark_version_reviewed",
+        version_id: versionId,
+      });
+      await refreshSnapshot();
+    }, "Cambio marcado como revisado.");
+  }
+
+  async function handleGenerateTodayLogs(overrideDate?: string) {
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "generate_today",
+        date_str: overrideDate ?? selectedDate,
+      });
+      await refreshSnapshot();
+    }, "Tomas diarias generadas respetando periodicidad.");
   }
 
   async function handleCreateCluster(payload: {
@@ -298,9 +381,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     anchor_time: string;
     intake_rule: IntakeConstraint;
   }) {
-    await postJson("/api/medications", { action: "create_cluster", ...payload });
-    setSyncMessage(`[BLOQUE CREADO] ${payload.label} (${payload.anchor_time}).`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", { action: "create_cluster", ...payload });
+      await refreshSnapshot();
+    }, `Bloque horario "${payload.label}" creado.`);
   }
 
   async function handleUpdateCluster(
@@ -312,22 +396,24 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       is_active: boolean;
     }
   ) {
-    await postJson("/api/medications", {
-      action: "update_cluster",
-      cluster_id: clusterId,
-      ...payload,
-    });
-    setSyncMessage(`[BLOQUE ACTUALIZADO] ${payload.label}.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "update_cluster",
+        cluster_id: clusterId,
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, `Bloque horario "${payload.label}" actualizado.`);
   }
 
   async function handleDeleteCluster(clusterId: string) {
-    await postJson("/api/medications", {
-      action: "delete_cluster",
-      cluster_id: clusterId,
-    });
-    setSyncMessage("[BLOQUE ELIMINADO] Tomas reasignadas automaticamente.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/medications", {
+        action: "delete_cluster",
+        cluster_id: clusterId,
+      });
+      await refreshSnapshot();
+    }, "Bloque eliminado y horarios reasignados.");
   }
 
   // Modulo Financiero y Quincenas
@@ -343,9 +429,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     planning_horizon_quincenas: number;
     include_events_in_plan: boolean;
   }) {
-    await postJson("/api/finances", { action: "update_settings", ...payload });
-    setSyncMessage("[PLAN QUINCENAL ACTUALIZADO] Calendario recalculado.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/finances", { action: "update_settings", ...payload });
+      await refreshSnapshot();
+    }, "Plan quincenal recalculado.");
   }
 
   async function handleCreateExpense(payload: {
@@ -361,9 +448,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     payment_method: string | null;
     notes: string | null;
   }) {
-    await postJson("/api/finances", { action: "create_expense", ...payload });
-    setSyncMessage(`[GASTO REGISTRADO] ${payload.title}.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/finances", { action: "create_expense", ...payload });
+      await refreshSnapshot();
+    }, `Gasto registrado: ${payload.title}.`);
   }
 
   async function handleUpdateExpense(
@@ -382,22 +470,24 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       notes: string | null;
     }
   ) {
-    await postJson("/api/finances", {
-      action: "update_expense",
-      expense_id: expenseId,
-      ...payload,
-    });
-    setSyncMessage(`[GASTO ACTUALIZADO] ${payload.title}.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/finances", {
+        action: "update_expense",
+        expense_id: expenseId,
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, `Gasto actualizado: ${payload.title}.`);
   }
 
   async function handleDeleteExpense(expenseId: string) {
-    await postJson("/api/finances", {
-      action: "delete_expense",
-      expense_id: expenseId,
-    });
-    setSyncMessage("[GASTO ELIMINADO] Registro borrado de bitacora.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/finances", {
+        action: "delete_expense",
+        expense_id: expenseId,
+      });
+      await refreshSnapshot();
+    }, "Gasto eliminado de la bitacora.");
   }
 
   async function handleExecutePlannedPurchase(payload: {
@@ -411,28 +501,29 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     payment_method: string | null;
     notes: string | null;
   }) {
-    await postJson("/api/finances", {
-      action: "execute_planned_purchase",
-      ...payload,
-    });
-    setSyncMessage(
-      "[COMPRA EJECUTADA] Stock incrementado, alertas cerradas y gasto registrado."
-    );
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/finances", {
+        action: "execute_planned_purchase",
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, "Compra aplicada a inventario y bitacora de gastos.");
   }
 
   // Agenda Clinica
   async function handleSaveEvent(payload: SaveClinicalEventPayload) {
-    await postJson("/api/events", {
-      action: payload.event_id ? "update" : "create",
-      ...payload,
-    });
-    setSyncMessage(
+    return runMutation(
+      async () => {
+        await postJson("/api/events", {
+          action: payload.event_id ? "update" : "create",
+          ...payload,
+        });
+        await refreshSnapshot();
+      },
       payload.event_id
-        ? `[EVENTO ACTUALIZADO] ${payload.title}.`
-        : `[PROGRAMADO] ${payload.title} con cascada -7d/-3d/-1d/0d.`
+        ? `Evento "${payload.title}" actualizado.`
+        : `Evento "${payload.title}" programado.`
     );
-    await refreshSnapshot();
   }
 
   async function handleCompleteEvent(
@@ -443,47 +534,49 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       log_expense?: boolean;
     }
   ) {
-    const res = await postJson<{
-      nextEventId: string | null;
-      expenseLogged: boolean;
-    }>("/api/events", {
-      action: "complete",
-      event_id: eventId,
-      recorded_by: "Consola Clinica Web",
-      ...options,
+    return runMutation(async () => {
+      const res = await postJson<{
+        nextEventId: string | null;
+        expenseLogged: boolean;
+      }>("/api/events", {
+        action: "complete",
+        event_id: eventId,
+        ...options,
+      });
+      await refreshSnapshot();
+      setSyncMessage(
+        res.nextEventId
+          ? `Evento completado y siguiente ciclo generado.${
+              res.expenseLogged ? " Gasto registrado." : ""
+            }`
+          : `Evento completado.${res.expenseLogged ? " Gasto registrado." : ""}`
+      );
     });
-    setSyncMessage(
-      res.nextEventId
-        ? `[CICLO RENOVADO] Evento completado y siguiente ciclo programado.${
-            res.expenseLogged ? " Gasto registrado." : ""
-          }`
-        : `[EVENTO COMPLETADO] Registro guardado.${
-            res.expenseLogged ? " Gasto registrado." : ""
-          }`
-    );
-    await refreshSnapshot();
   }
 
   async function handleRescheduleEvent(eventId: string, newDatetime: string) {
-    await postJson("/api/events", {
-      action: "reschedule",
-      event_id: eventId,
-      event_datetime: newDatetime,
-    });
-    setSyncMessage("[REPROGRAMADO] Nueva fecha guardada y alertas regeneradas.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/events", {
+        action: "reschedule",
+        event_id: eventId,
+        event_datetime: newDatetime,
+      });
+      await refreshSnapshot();
+    }, "Fecha del evento actualizada.");
   }
 
   async function handleReopenEvent(eventId: string) {
-    await postJson("/api/events", { action: "reopen", event_id: eventId });
-    setSyncMessage("[REABIERTO] Evento regresado a Agenda Programada.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/events", { action: "reopen", event_id: eventId });
+      await refreshSnapshot();
+    }, "Evento reabierto en la agenda.");
   }
 
   async function handleDeleteEvent(eventId: string) {
-    await postJson("/api/events", { action: "delete", event_id: eventId });
-    setSyncMessage("[ELIMINADO] Evento clinico y alertas asociadas borradas.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/events", { action: "delete", event_id: eventId });
+      await refreshSnapshot();
+    }, "Evento clinico eliminado.");
   }
 
   // Temas de Seguimiento
@@ -494,9 +587,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     deadline_at: string;
     estimated_budget: number | null;
   }) {
-    await postJson("/api/topics", { action: "create_topic", ...payload });
-    setSyncMessage(`[CASO CREADO] ${payload.title}.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", { action: "create_topic", ...payload });
+      await refreshSnapshot();
+    }, `Tema "${payload.title}" creado.`);
   }
 
   async function handleUpdateTopic(
@@ -511,19 +605,21 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       estimated_budget?: number | null;
     }
   ) {
-    await postJson("/api/topics", {
-      action: "update_topic",
-      topic_id: topicId,
-      ...updates,
-    });
-    setSyncMessage("[ACTUALIZADO] Tema de seguimiento guardado.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", {
+        action: "update_topic",
+        topic_id: topicId,
+        ...updates,
+      });
+      await refreshSnapshot();
+    }, "Tema de seguimiento actualizado.");
   }
 
   async function handleDeleteTopic(topicId: string) {
-    await postJson("/api/topics", { action: "delete_topic", topic_id: topicId });
-    setSyncMessage("[ELIMINADO] Tema y bitacora eliminados.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", { action: "delete_topic", topic_id: topicId });
+      await refreshSnapshot();
+    }, "Tema y bitacora eliminados.");
   }
 
   async function handleAddAnnotation(payload: {
@@ -535,9 +631,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     estimated_cost: number | null;
     content: string;
   }) {
-    await postJson("/api/topics", { action: "add_annotation", ...payload });
-    setSyncMessage("[BITACORA] Anotacion agregada al tema.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", { action: "add_annotation", ...payload });
+      await refreshSnapshot();
+    }, "Anotacion registrada.");
   }
 
   async function handleUpdateAnnotation(
@@ -551,22 +648,24 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       content: string;
     }
   ) {
-    await postJson("/api/topics", {
-      action: "update_annotation",
-      annotation_id: annotationId,
-      ...payload,
-    });
-    setSyncMessage("[BITACORA] Anotacion actualizada.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", {
+        action: "update_annotation",
+        annotation_id: annotationId,
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, "Anotacion actualizada.");
   }
 
   async function handleDeleteAnnotation(annotationId: string) {
-    await postJson("/api/topics", {
-      action: "delete_annotation",
-      annotation_id: annotationId,
-    });
-    setSyncMessage("[BITACORA] Anotacion eliminada.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", {
+        action: "delete_annotation",
+        annotation_id: annotationId,
+      });
+      await refreshSnapshot();
+    }, "Anotacion eliminada.");
   }
 
   async function handleConvertTopicToEvent(payload: {
@@ -580,9 +679,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     preparation_instructions: string | null;
     mark_topic_completed: boolean;
   }) {
-    await postJson("/api/topics", { action: "convert_to_event", ...payload });
-    setSyncMessage(`[AGENDADO] "${payload.title}" agregado a Agenda Clinica.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/topics", { action: "convert_to_event", ...payload });
+      await refreshSnapshot();
+    }, `"${payload.title}" agendado en Agenda Clinica.`);
   }
 
   // Expediente y Directorio Medico
@@ -601,9 +701,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     emergency_contact_relation: string | null;
     general_notes: string | null;
   }) {
-    await postJson("/api/dossier", { action: "update_profile", ...payload });
-    setSyncMessage("[EXPEDIENTE] Ficha clinica del paciente actualizada.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/dossier", { action: "update_profile", ...payload });
+      await refreshSnapshot();
+    }, "Ficha clinica del paciente actualizada.");
   }
 
   async function handleCreateProvider(payload: {
@@ -617,9 +718,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     notes: string | null;
     is_active: boolean;
   }) {
-    await postJson("/api/dossier", { action: "create_provider", ...payload });
-    setSyncMessage(`[DIRECTORIO] ${payload.name} agregado.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/dossier", { action: "create_provider", ...payload });
+      await refreshSnapshot();
+    }, `Especialista "${payload.name}" agregado.`);
   }
 
   async function handleUpdateProvider(
@@ -636,59 +738,86 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       is_active: boolean;
     }
   ) {
-    await postJson("/api/dossier", {
-      action: "update_provider",
-      provider_id: providerId,
-      ...payload,
-    });
-    setSyncMessage(`[DIRECTORIO] ${payload.name} actualizado.`);
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/dossier", {
+        action: "update_provider",
+        provider_id: providerId,
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, `Especialista "${payload.name}" actualizado.`);
   }
 
   async function handleDeleteProvider(providerId: string) {
-    await postJson("/api/dossier", {
-      action: "delete_provider",
-      provider_id: providerId,
-    });
-    setSyncMessage("[DIRECTORIO] Especialista eliminado.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/dossier", {
+        action: "delete_provider",
+        provider_id: providerId,
+      });
+      await refreshSnapshot();
+    }, "Especialista eliminado del directorio.");
   }
 
-  // Telegram Gobernanza
+  // Solo Administrador: Cuentas de Acceso
+  async function handleUpdateAuthUser(
+    userId: string,
+    payload: {
+      username?: string;
+      display_name?: string;
+      new_password?: string;
+    }
+  ) {
+    return runMutation(async () => {
+      await postJson("/api/auth/users", {
+        action: "update_user",
+        user_id: userId,
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, "Credenciales de acceso actualizadas.");
+  }
+
+  // Solo Administrador: Telegram y Monitoreo
   async function handleSaveRecipient(payload: {
     recipient_id?: string;
     full_name: string;
     role: string;
     telegram_chat_id: string;
-    receive_med_reminders: boolean;
-    receive_restock_alerts: boolean;
-    receive_event_reminders: boolean;
-    receive_topic_reminders: boolean;
+    receive_med_reminders?: boolean;
+    receive_restock_alerts?: boolean;
+    receive_event_reminders?: boolean;
+    receive_topic_reminders?: boolean;
+    receive_missed_block_alerts?: boolean;
+    receive_weekly_report?: boolean;
+    receive_change_alerts?: boolean;
   }) {
-    if (payload.recipient_id) {
-      await postJson("/api/telegram/recipients", {
-        action: "update",
-        recipient_id: payload.recipient_id,
-        full_name: payload.full_name,
-        role: payload.role,
-        telegram_chat_id: payload.telegram_chat_id,
-      });
-    } else {
-      await postJson("/api/telegram/recipients", {
-        action: "upsert",
-        ...payload,
-      });
-    }
-    await refreshSnapshot();
+    return runMutation(async () => {
+      if (payload.recipient_id) {
+        await postJson("/api/telegram/recipients", {
+          action: "update",
+          recipient_id: payload.recipient_id,
+          full_name: payload.full_name,
+          role: payload.role,
+          telegram_chat_id: payload.telegram_chat_id,
+        });
+      } else {
+        await postJson("/api/telegram/recipients", {
+          action: "upsert",
+          ...payload,
+        });
+      }
+      await refreshSnapshot();
+    }, "Destinatario de Telegram guardado.");
   }
 
   async function handleDeleteRecipient(recipientId: string) {
-    await postJson("/api/telegram/recipients", {
-      action: "delete",
-      recipient_id: recipientId,
-    });
-    setSyncMessage("[TELEGRAM] Destinatario eliminado.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/telegram/recipients", {
+        action: "delete",
+        recipient_id: recipientId,
+      });
+      await refreshSnapshot();
+    }, "Destinatario eliminado de Telegram.");
   }
 
   async function handleToggleRecipientPermission(
@@ -698,61 +827,114 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       | "receive_restock_alerts"
       | "receive_event_reminders"
       | "receive_topic_reminders"
+      | "receive_missed_block_alerts"
+      | "receive_weekly_report"
+      | "receive_change_alerts"
       | "is_active",
     value: boolean
   ) {
-    await postJson("/api/telegram/recipients", {
-      action: "toggle",
-      recipient_id: recipientId,
-      field,
-      value,
+    return runMutation(async () => {
+      await postJson("/api/telegram/recipients", {
+        action: "toggle",
+        recipient_id: recipientId,
+        field,
+        value,
+      });
+      await refreshSnapshot();
     });
-    await refreshSnapshot();
   }
 
   async function handleRetryNotification(notifId: string) {
-    await postJson("/api/telegram/recipients", {
-      action: "retry_notification",
-      notification_id: notifId,
-    });
-    setSyncMessage("[TELEGRAM] Notificacion reencolada.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/telegram/recipients", {
+        action: "retry_notification",
+        notification_id: notifId,
+      });
+      await refreshSnapshot();
+    }, "Notificacion reencolada para envio.");
   }
 
   async function handleCancelNotification(notifId: string) {
-    await postJson("/api/telegram/recipients", {
-      action: "cancel_notification",
-      notification_id: notifId,
-    });
-    setSyncMessage("[TELEGRAM] Notificacion cancelada/atendida.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/telegram/recipients", {
+        action: "cancel_notification",
+        notification_id: notifId,
+      });
+      await refreshSnapshot();
+    }, "Notificacion marcada como atendida.");
   }
 
   async function handleDeleteNotification(notifId: string) {
-    await postJson("/api/telegram/recipients", {
-      action: "delete_notification",
-      notification_id: notifId,
-    });
-    setSyncMessage("[TELEGRAM] Notificacion eliminada de cola.");
-    await refreshSnapshot();
+    return runMutation(async () => {
+      await postJson("/api/telegram/recipients", {
+        action: "delete_notification",
+        notification_id: notifId,
+      });
+      await refreshSnapshot();
+    }, "Notificacion eliminada de la cola.");
   }
 
   async function handlePurgeAcknowledged() {
-    const res = await postJson<{ purgedCount: number }>(
-      "/api/telegram/recipients",
-      { action: "purge_acknowledged" }
-    );
-    await refreshSnapshot();
-    return res;
+    return runMutation(async () => {
+      const res = await postJson<{ purgedCount: number }>(
+        "/api/telegram/recipients",
+        { action: "purge_acknowledged" }
+      );
+      await refreshSnapshot();
+      return res;
+    });
   }
 
   async function handleDispatchQueue() {
-    const res = await postJson<{ dispatched: number; mode: string }>(
-      "/api/telegram/dispatch",
-      {}
-    );
-    await refreshSnapshot();
-    return res;
+    return runMutation(async () => {
+      const res = await postJson<{ dispatched: number; mode: string }>(
+        "/api/telegram/dispatch",
+        {}
+      );
+      await refreshSnapshot();
+      return res;
+    });
+  }
+
+  async function handleUpdateMonitoringSettings(payload: {
+    timezone: string;
+    missed_block_grace_mins: number;
+    missed_block_alerts_enabled: boolean;
+    weekly_report_enabled: boolean;
+    weekly_report_day: number;
+    weekly_report_hour: number;
+    notify_admin_on_patient_change: boolean;
+  }) {
+    return runMutation(async () => {
+      await postJson("/api/telegram/recipients", {
+        action: "update_monitoring_settings",
+        ...payload,
+      });
+      await refreshSnapshot();
+    }, "Reglas de monitoreo administrativo actualizadas.");
+  }
+
+  async function handleSendWeeklyReportNow() {
+    return runMutation(async () => {
+      const res = await postJson<{ dispatched: number; reportHtml: string }>(
+        "/api/telegram/recipients",
+        { action: "send_weekly_report_now" }
+      );
+      await refreshSnapshot();
+      return res;
+    }, "Reporte semanal generado y despachado a administradores.");
+  }
+
+  async function handleCheckMissedBlocksNow() {
+    return runMutation(async () => {
+      const res = await postJson<{
+        queued: number;
+        dispatched: number;
+        mode: string;
+      }>("/api/telegram/recipients", { action: "check_missed_blocks_now" });
+      await refreshSnapshot();
+      return res;
+    });
   }
 
   async function handleSimulateWebhook(payload: {
@@ -761,65 +943,71 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
     command?: string;
     chat_id?: string;
   }) {
-    const update =
-      payload.type === "command"
-        ? {
-            update_id: Date.now(),
-            message: {
-              message_id: Date.now(),
-              chat: { id: Number(payload.chat_id ?? "100100002") },
-              text: payload.command ?? "/estado",
-            },
-          }
-        : {
-            update_id: Date.now(),
-            callback_query: {
-              id: `sim_${Date.now()}`,
-              from: { id: Number(payload.chat_id ?? "100100002") },
+    return runMutation(async () => {
+      const update =
+        payload.type === "command"
+          ? {
+              update_id: Date.now(),
               message: {
-                message_id: 9001,
+                message_id: Date.now(),
                 chat: { id: Number(payload.chat_id ?? "100100002") },
-                text: "Notificacion clinica",
+                text: payload.command ?? "/estado",
               },
-              data: payload.callback_data ?? "",
-            },
-          };
+            }
+          : {
+              update_id: Date.now(),
+              callback_query: {
+                id: `sim_${Date.now()}`,
+                from: { id: Number(payload.chat_id ?? "100100002") },
+                message: {
+                  message_id: 9001,
+                  chat: { id: Number(payload.chat_id ?? "100100002") },
+                  text: "Notificacion clinica",
+                },
+                data: payload.callback_data ?? "",
+              },
+            };
 
-    const res = await postJson<{ statusHtml?: string; message?: string }>(
-      "/api/telegram/webhook?simulate=1",
-      update
-    );
-    await refreshSnapshot();
-    return res;
+      const res = await postJson<{ statusHtml?: string; message?: string }>(
+        "/api/telegram/webhook?simulate=1",
+        update
+      );
+      await refreshSnapshot();
+      return res;
+    });
   }
 
   async function handleTestConnection() {
-    return postJson<{
-      configured: boolean;
-      ok: boolean;
-      botUsername?: string;
-      detail: string;
-    }>("/api/telegram/recipients", { action: "test_connection" });
+    return runMutation(() =>
+      postJson<{
+        configured: boolean;
+        ok: boolean;
+        botUsername?: string;
+        detail: string;
+      }>("/api/telegram/recipients", { action: "test_connection" })
+    );
   }
 
   async function handleRegisterVercelWebhook(baseUrl: string) {
-    return postJson<{
-      ok: boolean;
-      simulated: boolean;
-      webhook_url: string;
-      secret_configured: boolean;
-      detail: string;
-    }>("/api/telegram/recipients", {
-      action: "register_webhook",
-      base_url: baseUrl,
-    });
+    return runMutation(() =>
+      postJson<{
+        ok: boolean;
+        simulated: boolean;
+        webhook_url: string;
+        secret_configured: boolean;
+        detail: string;
+      }>("/api/telegram/recipients", {
+        action: "register_webhook",
+        base_url: baseUrl,
+      })
+    );
   }
 
   const invAlertCount =
     snapshot.low_stock_medications.length +
     snapshot.incomplete_medications.length;
 
-  const tabs: Array<{
+  const baseTabs: Array<{
     id: TabId;
     label: string;
     count?: number;
@@ -828,12 +1016,12 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
   }> = [
     {
       id: "command",
-      label: "Command Center",
+      label: "Resumen del Dia",
       icon: Activity,
     },
     {
       id: "inventory",
-      label: "Inventario",
+      label: "Medicamentos",
       count: invAlertCount || undefined,
       alertTone: snapshot.low_stock_medications.length > 0,
       icon: Pill,
@@ -861,12 +1049,21 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
       label: "Expediente",
       icon: FileHeart,
     },
-    {
-      id: "telegram",
-      label: "Telegram Bot",
-      icon: Send,
-    },
   ];
+
+  const tabs = isAdmin
+    ? [
+        ...baseTabs,
+        {
+          id: "telegram" as TabId,
+          label: "Telegram Bot",
+          icon: Send,
+        },
+      ]
+    : baseTabs;
+
+  const effectiveTab: TabId =
+    !isAdmin && activeTab === "telegram" ? "command" : activeTab;
 
   return (
     <div className="min-h-dvh flex flex-col bg-[#F8FAFC]">
@@ -874,32 +1071,32 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-10 h-[64px] sm:h-[72px] flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <div
-              className="w-8 h-8 rounded-[6px] bg-[#164E63] border border-[#0891B2] flex items-center justify-center shrink-0"
+              className="w-9 h-9 rounded-[6px] bg-[#164E63] border border-[#0891B2] flex items-center justify-center shrink-0"
               aria-hidden="true"
             >
-              <Activity className="w-4 h-4 text-[#22D3EE]" strokeWidth={2} />
+              <Activity className="w-5 h-5 text-[#22D3EE]" strokeWidth={2} />
             </div>
             <div className="min-w-0">
               <h1 className="text-[16px] sm:text-[18px] font-bold tracking-tight text-white truncate">
-                Monitoreo Clinico y Gobernanza Familiar
+                Seguimiento Clinico Familiar
               </h1>
               <p className="hidden sm:block font-mono text-[13px] text-[#94A3B8] tabular-nums">
-                {snapshot.patient_profile.full_name} | Fecha: {snapshot.target_date}
+                {snapshot.patient_profile.full_name} | {snapshot.target_date}
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
-            <span className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[4px] border border-[#334155] bg-[#1E293B] font-mono text-[13px] text-[#E2E8F0]">
-              <Database
-                className="w-3.5 h-3.5 text-[#22D3EE]"
-                strokeWidth={1.75}
-                aria-hidden="true"
-              />
-              {snapshot.db_mode === "NEON_POOL"
-                ? "NEON POOL"
-                : "POSTGRES LOCAL"}
-            </span>
+          <div className="flex items-center gap-2 shrink-0">
+            {isAdmin && (
+              <span className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[4px] border border-[#334155] bg-[#1E293B] font-mono text-[12px] text-[#E2E8F0]">
+                <Database
+                  className="w-3.5 h-3.5 text-[#22D3EE]"
+                  strokeWidth={1.75}
+                  aria-hidden="true"
+                />
+                {snapshot.db_mode === "NEON_POOL" ? "NEON" : "LOCAL"}
+              </span>
+            )}
 
             <button
               type="button"
@@ -915,6 +1112,16 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
               />
               <span className="hidden sm:inline">Sincronizar</span>
             </button>
+
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="clinical-btn inline-flex items-center gap-1.5 px-3 bg-[#1E293B] hover:bg-[#334155] border border-[#334155] text-[#CBD5E1] hover:text-white text-[13px] font-medium"
+              aria-label="Cerrar sesion"
+            >
+              <LogOut className="w-4 h-4" strokeWidth={1.75} aria-hidden="true" />
+              <span className="hidden sm:inline">Salir</span>
+            </button>
           </div>
         </div>
 
@@ -925,7 +1132,7 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
           <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-10 flex items-center gap-1 overflow-x-auto">
             {tabs.map((tab) => {
               const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
+              const isActive = effectiveTab === tab.id;
               return (
                 <button
                   key={tab.id}
@@ -968,53 +1175,32 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
         id="main-content"
         className="flex-1 max-w-[1360px] w-full mx-auto px-4 sm:px-6 lg:px-10 py-6 space-y-5"
       >
-        {(syncMessage || syncError) && (
-          <div
-            role="status"
-            className={cn(
-              "px-4 py-3 rounded-[6px] border flex flex-wrap items-center justify-between gap-2 text-[14px]",
-              syncError
-                ? "bg-[#FEF2F2] border-[#FECACA] text-[#991B1B]"
-                : "bg-[#ECFDF5] border-[#A7F3D0] text-[#065F46]"
-            )}
-          >
-            <span className="font-mono font-medium">
-              {syncError ?? syncMessage}
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                setSyncMessage(null);
-                setSyncError(null);
-              }}
-              className="text-[13px] underline font-medium"
-            >
-              Cerrar aviso
-            </button>
-          </div>
-        )}
-
-        {activeTab === "command" && (
+        {effectiveTab === "command" && (
           <CommandCenterView
             snapshot={snapshot}
+            isAdmin={isAdmin}
             onSelectDate={handleSelectDate}
             onConfirmCluster={handleConfirmCluster}
             onUpdateIntakeLog={handleUpdateIntakeLog}
             onDeleteIntakeLog={handleDeleteIntakeLog}
             onRestockMedication={handleRestockMedication}
+            onGenerateTodayLogs={handleGenerateTodayLogs}
             onNavigateTab={setActiveTab}
           />
         )}
 
-        {activeTab === "inventory" && (
+        {effectiveTab === "inventory" && (
           <MedicationsInventoryView
             snapshot={snapshot}
+            isAdmin={isAdmin}
             onSaveMedication={handleSaveMedication}
             onRestockMedication={handleRestockMedication}
             onAdjustStock={handleAdjustStock}
             onArchiveMedication={handleArchiveMedication}
             onRestoreMedication={handleRestoreMedication}
             onDeleteMedication={handleDeleteMedication}
+            onRestoreVersion={handleRestoreMedicationVersion}
+            onMarkVersionReviewed={handleMarkVersionReviewed}
             onGenerateTodayLogs={handleGenerateTodayLogs}
             onCreateCluster={handleCreateCluster}
             onUpdateCluster={handleUpdateCluster}
@@ -1022,9 +1208,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
           />
         )}
 
-        {activeTab === "finances" && (
+        {effectiveTab === "finances" && (
           <FinancialPlannerView
             snapshot={snapshot}
+            isAdmin={isAdmin}
             onUpdateSettings={handleUpdateFinancialSettings}
             onCreateExpense={handleCreateExpense}
             onUpdateExpense={handleUpdateExpense}
@@ -1034,9 +1221,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
           />
         )}
 
-        {activeTab === "events" && (
+        {effectiveTab === "events" && (
           <ClinicalEventsView
             snapshot={snapshot}
+            isAdmin={isAdmin}
             onSaveEvent={handleSaveEvent}
             onCompleteEvent={handleCompleteEvent}
             onRescheduleEvent={handleRescheduleEvent}
@@ -1045,9 +1233,10 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
           />
         )}
 
-        {activeTab === "topics" && (
+        {effectiveTab === "topics" && (
           <FollowUpTopicsView
             snapshot={snapshot}
+            isAdmin={isAdmin}
             onCreateTopic={handleCreateTopic}
             onUpdateTopic={handleUpdateTopic}
             onDeleteTopic={handleDeleteTopic}
@@ -1058,17 +1247,21 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
           />
         )}
 
-        {activeTab === "dossier" && (
+        {effectiveTab === "dossier" && (
           <PatientDossierView
             snapshot={snapshot}
+            isAdmin={isAdmin}
             onUpdateProfile={handleUpdateProfile}
             onCreateProvider={handleCreateProvider}
             onUpdateProvider={handleUpdateProvider}
             onDeleteProvider={handleDeleteProvider}
+            onUpdateAuthUser={handleUpdateAuthUser}
+            onRestoreVersion={handleRestoreMedicationVersion}
+            onMarkVersionReviewed={handleMarkVersionReviewed}
           />
         )}
 
-        {activeTab === "telegram" && (
+        {isAdmin && effectiveTab === "telegram" && (
           <TelegramConfigView
             snapshot={snapshot}
             onSaveRecipient={handleSaveRecipient}
@@ -1082,19 +1275,65 @@ export function ClinicalShell({ initialSnapshot }: ClinicalShellProps) {
             onSimulateWebhook={handleSimulateWebhook}
             onTestConnection={handleTestConnection}
             onRegisterVercelWebhook={handleRegisterVercelWebhook}
+            onUpdateMonitoringSettings={handleUpdateMonitoringSettings}
+            onSendWeeklyReportNow={handleSendWeeklyReportNow}
+            onCheckMissedBlocksNow={handleCheckMissedBlocksNow}
           />
         )}
       </main>
 
+      {/* Toast flotante accesible (siempre visible en pantalla al confirmar o fallar) */}
+      {(syncMessage || syncError) && (
+        <div
+          role={syncError ? "alert" : "status"}
+          aria-live={syncError ? "assertive" : "polite"}
+          className={cn(
+            "clinical-toast fixed bottom-4 right-4 z-50 max-w-md w-[calc(100vw-2rem)] sm:w-auto px-4 py-3 rounded-[6px] border shadow-lg flex items-center justify-between gap-3 text-[14px]",
+            syncError
+              ? "bg-[#FEF2F2] border-[#F87171] text-[#991B1B]"
+              : "bg-[#ECFDF5] border-[#6EE7B7] text-[#065F46]"
+          )}
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            {syncError ? (
+              <AlertCircle
+                className="w-5 h-5 shrink-0"
+                strokeWidth={1.85}
+                aria-hidden="true"
+              />
+            ) : (
+              <CheckCircle2
+                className="w-5 h-5 shrink-0"
+                strokeWidth={1.85}
+                aria-hidden="true"
+              />
+            )}
+            <span className="font-medium break-words">
+              {syncError ?? syncMessage}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setSyncMessage(null);
+              setSyncError(null);
+            }}
+            aria-label="Cerrar aviso"
+            className="w-9 h-9 inline-flex items-center justify-center rounded-[4px] hover:bg-black/5 shrink-0 cursor-pointer"
+          >
+            <X className="w-4 h-4" strokeWidth={1.85} aria-hidden="true" />
+          </button>
+        </div>
+      )}
+
       <footer className="border-t border-[#E2E8F0] bg-white">
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-10 py-3.5 flex flex-wrap items-center justify-between gap-2 text-[13px] text-[#475569] font-mono tabular-nums">
           <span>
-            Ultima sincronizacion: {formatDateTimeEs(snapshot.generated_at)}
+            Ultima actualizacion: {formatDateTimeEs(snapshot.generated_at)}
           </span>
-          <div className="flex items-center gap-2">
-            <StatusBadge label="GOBERNANZA CRUD COMPLETA" tone="ok" />
-            <StatusBadge label="PLANIFICADOR QUINCENAL" tone="info" />
-          </div>
+          <span className="text-[#64748B]">
+            {sessionUser.displayName}
+          </span>
         </div>
       </footer>
     </div>

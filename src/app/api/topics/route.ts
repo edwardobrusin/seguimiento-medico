@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { getActorLabel, requireAdmin, requireSession } from "@/lib/auth/session";
+import { formatApiError } from "@/lib/api-error";
 import { FollowUpTopicsService } from "@/lib/services/follow-up-topics.service";
 import { NO_STORE_HEADERS, safeRevalidateHome } from "@/lib/vercel-cache";
 
@@ -85,8 +87,17 @@ export async function POST(req: Request) {
     const raw = await req.json();
     const body = topicActionSchema.parse(raw);
 
+    const session =
+      body.action === "delete_topic" || body.action === "delete_annotation"
+        ? await requireAdmin()
+        : await requireSession();
+    const actor = getActorLabel(session);
+
     if (body.action === "create_topic") {
-      const topic = await FollowUpTopicsService.createFollowUpTopic(body);
+      const topic = await FollowUpTopicsService.createFollowUpTopic(
+        body,
+        actor
+      );
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, topic },
@@ -105,7 +116,8 @@ export async function POST(req: Request) {
           deadline_at: body.deadline_at,
           description: body.description,
           estimated_budget: body.estimated_budget,
-        }
+        },
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -116,7 +128,8 @@ export async function POST(req: Request) {
 
     if (body.action === "delete_topic") {
       const result = await FollowUpTopicsService.deleteFollowUpTopic(
-        body.topic_id
+        body.topic_id,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -128,7 +141,8 @@ export async function POST(req: Request) {
     if (body.action === "update_annotation") {
       const annotation = await FollowUpTopicsService.updateTopicAnnotation(
         body.annotation_id,
-        body
+        body,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -139,7 +153,8 @@ export async function POST(req: Request) {
 
     if (body.action === "delete_annotation") {
       const result = await FollowUpTopicsService.deleteTopicAnnotation(
-        body.annotation_id
+        body.annotation_id,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -161,7 +176,8 @@ export async function POST(req: Request) {
           estimated_cost: body.estimated_cost ?? null,
           preparation_instructions: body.preparation_instructions ?? null,
         },
-        body.mark_topic_completed
+        body.mark_topic_completed,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -170,20 +186,23 @@ export async function POST(req: Request) {
       );
     }
 
-    const annotation = await FollowUpTopicsService.addTopicAnnotation(body);
+    const annotation = await FollowUpTopicsService.addTopicAnnotation(
+      body,
+      actor
+    );
     safeRevalidateHome();
     return NextResponse.json(
       { ok: true, annotation },
       { headers: NO_STORE_HEADERS }
     );
   } catch (err) {
-    const message =
-      err instanceof Error
-        ? err.message
-        : "Error al procesar tema de seguimiento.";
+    const { status, message } = formatApiError(
+      err,
+      "Error al procesar tema de seguimiento."
+    );
     return NextResponse.json(
       { error: message },
-      { status: 400, headers: NO_STORE_HEADERS }
+      { status, headers: NO_STORE_HEADERS }
     );
   }
 }

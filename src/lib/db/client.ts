@@ -129,6 +129,8 @@ export async function ensureInitialized(): Promise<void> {
       await runSchemaAndTriggers(executor);
       const { seedClinicalDatabaseIfEmpty } = await import("./seed");
       await seedClinicalDatabaseIfEmpty(executor);
+      const { ensureDefaultAuthUsers } = await import("../auth/seed-users");
+      await ensureDefaultAuthUsers(executor);
     })().catch((err) => {
       globalThis.__clinicalDbInitPromise = undefined;
       throw err;

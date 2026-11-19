@@ -1,4 +1,6 @@
 import type { DbExecutor } from "./client";
+import { ensureDefaultAuthUsers } from "../auth/seed-users";
+import { getClinicalDateParts } from "../utils";
 
 function formatClusterMessageHtml(
   label: string,
@@ -22,6 +24,16 @@ function formatClusterMessageHtml(
 export async function seedClinicalDatabaseIfEmpty(
   db: DbExecutor
 ): Promise<void> {
+  await ensureDefaultAuthUsers(db);
+
+  await db.query(
+    `INSERT INTO alert_monitoring_settings (
+       id, timezone, missed_block_grace_mins, missed_block_alerts_enabled,
+       weekly_report_enabled, weekly_report_day, weekly_report_hour, notify_admin_on_patient_change
+     ) VALUES (1, 'America/Mexico_City', 60, TRUE, TRUE, 0, 20, TRUE)
+     ON CONFLICT (id) DO NOTHING`
+  );
+
   const existingClusters = await db.query<{ count: string }>(
     "SELECT COUNT(*)::text AS count FROM intake_clusters"
   );
@@ -29,7 +41,7 @@ export async function seedClinicalDatabaseIfEmpty(
     return;
   }
 
-  // 1. Insertar los 4 bloques horarios optimizados del esquema clinico real
+  // 1. Insertar los 3 bloques horarios reales del esquema clinico (Desayuno 08:00, Vespertino 15:00, Cena 21:00)
   const cDesayuno = await db.query<{ id: string }>(
     `INSERT INTO intake_clusters (label, anchor_time, intake_rule, is_active)
      VALUES ('Bloque Desayuno', '08:00:00', 'WITH_FOOD', TRUE)
@@ -37,7 +49,7 @@ export async function seedClinicalDatabaseIfEmpty(
   );
   const cVespertino = await db.query<{ id: string }>(
     `INSERT INTO intake_clusters (label, anchor_time, intake_rule, is_active)
-     VALUES ('Bloque Vespertino', '16:00:00', 'NONE', TRUE)
+     VALUES ('Bloque Vespertino', '15:00:00', 'NONE', TRUE)
      RETURNING id`
   );
   const cCena = await db.query<{ id: string }>(
@@ -45,29 +57,23 @@ export async function seedClinicalDatabaseIfEmpty(
      VALUES ('Bloque Cena / Noche', '21:00:00', 'WITH_FOOD', TRUE)
      RETURNING id`
   );
-  const cMedianoche = await db.query<{ id: string }>(
-    `INSERT INTO intake_clusters (label, anchor_time, intake_rule, is_active)
-     VALUES ('Bloque Medianoche (Cada 8h)', '00:00:00', 'NONE', TRUE)
-     RETURNING id`
-  );
 
   const clusterDesayunoId = cDesayuno.rows[0].id;
   const clusterVespertinoId = cVespertino.rows[0].id;
   const clusterCenaId = cCena.rows[0].id;
-  const clusterMedianocheId = cMedianoche.rows[0].id;
 
   // 2. Insertar catalogo real de 7 medicamentos del esquema del paciente
   const medLeflunomida = await db.query<{ id: string }>(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Leflunomida 20 mg', 'Leflunomida', 'Tableta', 30, 250.00,
       1, 90, 'DAILY_SLOTS', 1,
-      30, 'WITH_FOOD', 1.0000,
-      1, 7, '1 tableta en el desayuno. Caja de 30 tabletas ($250 MXN).'
+      30, 'WITH_FOOD', '[1,2,3,4,5]'::jsonb, 0.7143,
+      1, 7, '1 tableta en el desayuno de Lunes a Viernes (descansa sabado y domingo). Caja de 30 tabletas ($250 MXN).'
     ) RETURNING id`
   );
 
@@ -75,13 +81,13 @@ export async function seedClinicalDatabaseIfEmpty(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Omega 3', 'Acidos grasos Omega-3 (EPA/DHA)', 'Tableta', 60, 350.00,
       2, 54, 'DAILY_SLOTS', 1,
-      30, 'WITH_FOOD', 2.0000,
-      3, 7, '2 tabletas en el desayuno. Frasco de 60 tabletas ($350 MXN).'
+      30, 'WITH_FOOD', NULL, 2.0000,
+      3, 7, '2 tabletas en el desayuno todos los dias. Frasco de 60 tabletas ($350 MXN).'
     ) RETURNING id`
   );
 
@@ -89,12 +95,12 @@ export async function seedClinicalDatabaseIfEmpty(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Rolet Sup 80/12.5', 'Telmisartan 80 mg / Hidroclorotiazida 12.5 mg', 'Tableta', NULL, NULL,
       1, NULL, 'DAILY_SLOTS', 1,
-      30, 'WITH_FOOD', 1.0000,
+      30, 'WITH_FOOD', NULL, 1.0000,
       1, 7, 'Medicamento nuevo en adquisicion. Pendiente capturar precio por caja, piezas por envase e inventario inicial.'
     ) RETURNING id`
   );
@@ -103,13 +109,13 @@ export async function seedClinicalDatabaseIfEmpty(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Valproato semisodico 500 mg', 'Valproato semisodico', 'Tableta', 30, 330.00,
-      1, 51, 'FIXED_HOURS', 8,
-      30, 'NONE', 3.0000,
-      1, 7, '1 tableta cada 8 horas (08:00, 16:00 y 00:00). Caja de 30 tabletas ($330 MXN).'
+      1, 51, 'DAILY_SLOTS', 3,
+      30, 'NONE', NULL, 3.0000,
+      1, 7, '1 tableta en desayuno (08:00), 1 tableta a las 15:00 y 1 tableta en cena (21:00) — horario aprobado por medico. Caja de 30 tabletas ($330 MXN).'
     ) RETURNING id`
   );
 
@@ -117,12 +123,12 @@ export async function seedClinicalDatabaseIfEmpty(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Quetiapina 100 mg', 'Quetiapina fumarato', 'Tableta', 60, 517.00,
       3, 102, 'DAILY_SLOTS', 2,
-      30, 'WITH_FOOD', 6.0000,
+      30, 'WITH_FOOD', NULL, 6.0000,
       1, 7, '3 tabletas en el desayuno y 3 tabletas en la cena (6/dia; 1 caja de 60 rinde 10 dias, $517 MXN).'
     ) RETURNING id`
   );
@@ -131,12 +137,12 @@ export async function seedClinicalDatabaseIfEmpty(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Amlodipino 5 mg', 'Amlodipino besilato', 'Tableta', 100, 170.00,
       1, 100, 'DAILY_SLOTS', 1,
-      30, 'NONE', 1.0000,
+      30, 'NONE', NULL, 1.0000,
       1, 7, '1 tableta en la noche. Caja de 100 tabletas ($170 MXN).'
     ) RETURNING id`
   );
@@ -145,13 +151,13 @@ export async function seedClinicalDatabaseIfEmpty(
     `INSERT INTO medications (
       name, active_ingredient, presentation, units_per_package, package_price,
       dose_amount, current_stock, frequency_type, frequency_value,
-      tolerance_window_mins, intake_rule, daily_consumption_rate,
+      tolerance_window_mins, intake_rule, active_days, daily_consumption_rate,
       purchase_priority, safety_buffer_days, clinical_notes
     ) VALUES (
       'Fluanxol 20 mg', 'Flupentixol decanoato', 'Inyeccion', 1, 1370.00,
       1, 2, 'INTERVAL_WEEKS', 3,
-      60, 'NONE', 0.0476,
-      1, 10, '1 inyeccion cada 21 dias ($1,370 MXN por pieza). Vinculada a evento clinico recurrente.'
+      60, 'NONE', NULL, 0.0476,
+      1, 10, '1 inyeccion cada 21 dias ($1,370 MXN por pieza). Vinculada a evento clinico recurrente (fecha oficial 27 nov 2026).'
     ) RETURNING id`
   );
 
@@ -163,7 +169,7 @@ export async function seedClinicalDatabaseIfEmpty(
   const amlodipinoId = medAmlodipino.rows[0].id;
   const fluanxolId = medFluanxol.rows[0].id;
 
-  // 3. Programacion vinculada a los 4 Clusters Horarios
+  // 3. Programacion vinculada a los 3 Clusters Horarios (Desayuno 08:00, Vespertino 15:00, Cena 21:00)
   const sLeflu = await db.query<{ id: string }>(
     `INSERT INTO medication_schedules (medication_id, cluster_id, ideal_time, effective_clustered_time)
      VALUES ($1, $2, '08:00:00', '08:00:00') RETURNING id`,
@@ -186,13 +192,13 @@ export async function seedClinicalDatabaseIfEmpty(
   );
   const sValp2 = await db.query<{ id: string }>(
     `INSERT INTO medication_schedules (medication_id, cluster_id, ideal_time, effective_clustered_time)
-     VALUES ($1, $2, '16:00:00', '16:00:00') RETURNING id`,
+     VALUES ($1, $2, '15:00:00', '15:00:00') RETURNING id`,
     [valproatoId, clusterVespertinoId]
   );
   const sValp3 = await db.query<{ id: string }>(
     `INSERT INTO medication_schedules (medication_id, cluster_id, ideal_time, effective_clustered_time)
-     VALUES ($1, $2, '00:00:00', '00:00:00') RETURNING id`,
-    [valproatoId, clusterMedianocheId]
+     VALUES ($1, $2, '21:00:00', '21:00:00') RETURNING id`,
+    [valproatoId, clusterCenaId]
   );
   const sQuet1 = await db.query<{ id: string }>(
     `INSERT INTO medication_schedules (medication_id, cluster_id, ideal_time, effective_clustered_time)
@@ -210,27 +216,33 @@ export async function seedClinicalDatabaseIfEmpty(
     [amlodipinoId, clusterCenaId]
   );
 
-  // 4. Tomas del dia actual
-  const todayStr = new Date().toISOString().slice(0, 10);
+  // 4. Tomas del dia actual (respetando dias activos Lunes-Viernes de Leflunomida en horario America/Mexico_City)
+  const { dateStr: todayStr, dayOfWeek } = getClinicalDateParts("America/Mexico_City");
+  const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+
+  if (isWeekday) {
+    await db.query(
+      `INSERT INTO intake_logs (medication_id, schedule_id, cluster_id, scheduled_for, status, quantity_deducted)
+       VALUES ($1, $2, $3, (($4 || ' 08:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 1)`,
+      [lefluId, sLeflu.rows[0].id, clusterDesayunoId, todayStr]
+    );
+  }
 
   await db.query(
     `INSERT INTO intake_logs (medication_id, schedule_id, cluster_id, scheduled_for, status, quantity_deducted)
      VALUES
-     ($1, $2, $3, ($16 || ' 08:00:00+00')::timestamptz, 'PENDING', 1),
-     ($4, $5, $3, ($16 || ' 08:00:00+00')::timestamptz, 'PENDING', 2),
-     ($6, $7, $3, ($16 || ' 08:00:00+00')::timestamptz, 'PENDING', 1),
-     ($8, $9, $3, ($16 || ' 08:00:00+00')::timestamptz, 'PENDING', 1),
-     ($10, $11, $3, ($16 || ' 08:00:00+00')::timestamptz, 'PENDING', 3),
-     ($8, $12, $13, ($16 || ' 16:00:00+00')::timestamptz, 'PENDING', 1),
-     ($10, $14, $15, ($16 || ' 21:00:00+00')::timestamptz, 'PENDING', 3),
-     ($17, $18, $15, ($16 || ' 21:00:00+00')::timestamptz, 'PENDING', 1),
-     ($8, $19, $20, ($16 || ' 00:00:00+00')::timestamptz, 'PENDING', 1)`,
+     ($1, $2, $3, (($15 || ' 08:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 2),
+     ($4, $5, $3, (($15 || ' 08:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 1),
+     ($6, $7, $3, (($15 || ' 08:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 1),
+     ($8, $9, $3, (($15 || ' 08:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 3),
+     ($6, $10, $11, (($15 || ' 15:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 1),
+     ($8, $12, $13, (($15 || ' 21:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 3),
+     ($6, $14, $13, (($15 || ' 21:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 1),
+     ($16, $17, $13, (($15 || ' 21:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'PENDING', 1)`,
     [
-      lefluId,
-      sLeflu.rows[0].id,
-      clusterDesayunoId,
       omegaId,
       sOmega.rows[0].id,
+      clusterDesayunoId,
       roletId,
       sRolet.rows[0].id,
       valproatoId,
@@ -241,15 +253,23 @@ export async function seedClinicalDatabaseIfEmpty(
       clusterVespertinoId,
       sQuet2.rows[0].id,
       clusterCenaId,
+      sValp3.rows[0].id,
       todayStr,
       amlodipinoId,
       sAmlo.rows[0].id,
-      sValp3.rows[0].id,
-      clusterMedianocheId,
     ]
   );
 
-  // Notificaciones en cola para los bloques del dia
+  const desayunoItems = [
+    ...(isWeekday
+      ? [{ name: "Leflunomida 20 mg", dose: "1 Tableta", ruleLabel: "Con Alimentos" }]
+      : []),
+    { name: "Omega 3", dose: "2 Tableta", ruleLabel: "Con Alimentos" },
+    { name: "Quetiapina 100 mg", dose: "3 Tableta", ruleLabel: "Con Alimentos" },
+    { name: "Rolet Sup 80/12.5", dose: "1 Tableta", ruleLabel: "Con Alimentos" },
+    { name: "Valproato semisodico 500 mg", dose: "1 Tableta", ruleLabel: "Sin Restriccion" },
+  ];
+
   await db.query(
     `INSERT INTO notification_queue (
       source_type, source_id, stage, trigger_at, status, title, message, callback_action_payload, idempotency_key
@@ -262,14 +282,14 @@ export async function seedClinicalDatabaseIfEmpty(
       $4
     ),
     (
-      'MEDICATION_INTAKE', $5::uuid, 'EXACT_TIME', ($6 || ' 16:00:00+00')::timestamptz, 'QUEUED',
-      '[BLOQUE DE MEDICACION - 16:00] Bloque Vespertino',
+      'MEDICATION_INTAKE', $5::uuid, 'EXACT_TIME', (($6 || ' 15:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'QUEUED',
+      '[BLOQUE DE MEDICACION - 15:00] Bloque Vespertino',
       $7,
       $8,
       $9
     ),
     (
-      'MEDICATION_INTAKE', $10::uuid, 'EXACT_TIME', ($6 || ' 21:00:00+00')::timestamptz, 'QUEUED',
+      'MEDICATION_INTAKE', $10::uuid, 'EXACT_TIME', (($6 || ' 21:00:00')::timestamp AT TIME ZONE 'America/Mexico_City'), 'QUEUED',
       '[BLOQUE DE MEDICACION - 21:00] Bloque Cena / Noche',
       $11,
       $12,
@@ -281,13 +301,7 @@ export async function seedClinicalDatabaseIfEmpty(
       formatClusterMessageHtml(
         "BLOQUE DESAYUNO",
         "08:00",
-        [
-          { name: "Leflunomida 20 mg", dose: "1 Tableta", ruleLabel: "Con Alimentos" },
-          { name: "Omega 3", dose: "2 Tableta", ruleLabel: "Con Alimentos" },
-          { name: "Quetiapina 100 mg", dose: "3 Tableta", ruleLabel: "Con Alimentos" },
-          { name: "Rolet Sup 80/12.5", dose: "1 Tableta", ruleLabel: "Con Alimentos" },
-          { name: "Valproato semisodico 500 mg", dose: "1 Tableta", ruleLabel: "Sin Restriccion" },
-        ],
+        desayunoItems,
         "PENDIENTE DE CONFIRMACION"
       ),
       `ack_cluster:${clusterDesayunoId}:${todayStr}`,
@@ -296,7 +310,7 @@ export async function seedClinicalDatabaseIfEmpty(
       todayStr,
       formatClusterMessageHtml(
         "BLOQUE VESPERTINO",
-        "16:00",
+        "15:00",
         [{ name: "Valproato semisodico 500 mg", dose: "1 Tableta", ruleLabel: "Sin Restriccion" }],
         "PENDIENTE DE CONFIRMACION"
       ),
@@ -309,6 +323,7 @@ export async function seedClinicalDatabaseIfEmpty(
         [
           { name: "Amlodipino 5 mg", dose: "1 Tableta", ruleLabel: "Sin Restriccion" },
           { name: "Quetiapina 100 mg", dose: "3 Tableta", ruleLabel: "Con Alimentos" },
+          { name: "Valproato semisodico 500 mg", dose: "1 Tableta", ruleLabel: "Sin Restriccion" },
         ],
         "PENDIENTE DE CONFIRMACION"
       ),
@@ -317,7 +332,7 @@ export async function seedClinicalDatabaseIfEmpty(
     ]
   );
 
-  // 5. Eventos clinicos (inyeccion recurrente + 5 consultas/estudios del paciente)
+  // 5. Eventos clinicos (inyeccion Fluanxol con fecha oficial 27 nov 2026 + 5 consultas/estudios)
   const eventsData: Array<{
     title: string;
     category: string;
@@ -337,14 +352,14 @@ export async function seedClinicalDatabaseIfEmpty(
       category: "INJECTION",
       specialist: "Aplicacion Intramuscular Supervisada",
       location: "Domicilio / Clinica Local",
-      datetimeExpr: "NOW() + INTERVAL '14 days'",
+      datetimeExpr: "'2026-11-27 16:00:00+00'::timestamptz",
       isRecurring: true,
       intervalDays: 21,
       medId: fluanxolId,
-      prep: "Inyeccion de deposito cada 21 dias. Verificar disponibilidad de ampolleta en inventario (valor $1,370 MXN en compras).",
+      prep: "Fecha oficial confirmada (27 nov 2026). Inyeccion de deposito cada 21 dias; verificar ampolleta en inventario ($1,370 MXN en compras).",
       estimatedCost: 0,
       periodicityLabel: "Cada 21 dias",
-      dateEstimated: true,
+      dateEstimated: false,
     },
     {
       title: "Consulta Psiquiatria Comalcalco",
@@ -455,7 +470,7 @@ export async function seedClinicalDatabaseIfEmpty(
     );
   }
 
-  // 6. Temas de seguimiento (incluye captura pendiente de Rolet Sup + 3 valoraciones de la nota)
+  // 6. Temas de seguimiento
   const topicRolet = await db.query<{
     id: string;
     title: string;
@@ -466,7 +481,7 @@ export async function seedClinicalDatabaseIfEmpty(
       title, description, status, priority, progress_percentage, estimated_budget, deadline_at
     ) VALUES (
       'Completar precio e inventario inicial de Rolet Sup 80/12.5',
-      'Al obtener el medicamento hoy, registrar precio por caja, cantidad de tabletas por envase e inventario inicial para integrarlo al plan quincenal.',
+      'Al obtener el medicamento, registrar precio por caja, cantidad de tabletas por envase e inventario inicial para integrarlo al plan quincenal.',
       'IN_PROGRESS', 1, 25, NULL, NOW() + INTERVAL '2 days'
     ) RETURNING id, title, description, deadline_at`
   );
@@ -569,7 +584,7 @@ export async function seedClinicalDatabaseIfEmpty(
      ('Atencion Especializada de Manos (Por valorar)', 'Rehabilitacion / Manos', 'Por definir', 600.00, 'Consultas para atencion de manos en valoracion ($600 c/u).')`
   );
 
-  // 9. Destinatarios plantilla de Telegram (solo si la tabla esta vacia)
+  // 9. Destinatarios plantilla de Telegram (separacion clara Paciente vs Administrador)
   const existingRecipients = await db.query<{ count: string }>(
     "SELECT COUNT(*)::text AS count FROM telegram_recipients"
   );
@@ -577,11 +592,12 @@ export async function seedClinicalDatabaseIfEmpty(
     await db.query(
       `INSERT INTO telegram_recipients (
         full_name, role, telegram_chat_id,
-        receive_med_reminders, receive_restock_alerts, receive_event_reminders, receive_topic_reminders, is_active
+        receive_med_reminders, receive_restock_alerts, receive_event_reminders, receive_topic_reminders,
+        receive_missed_block_alerts, receive_weekly_report, receive_change_alerts, is_active
       ) VALUES
-      ('Paciente (Titular)', 'PATIENT', '100100001', TRUE, FALSE, TRUE, FALSE, TRUE),
-      ('Cuidador Principal', 'PRIMARY_CAREGIVER', '100100002', TRUE, TRUE, TRUE, TRUE, TRUE),
-      ('Familiar de Apoyo', 'FAMILY_MEMBER', '100100003', FALSE, TRUE, TRUE, TRUE, TRUE)`
+      ('Paciente (Titular)', 'PATIENT', '100100001', TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE),
+      ('Cuidador Principal (Admin)', 'ADMIN', '100100002', FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE),
+      ('Familiar Responsable (Admin)', 'ADMIN', '100100003', FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)`
     );
   }
 
@@ -591,7 +607,7 @@ export async function seedClinicalDatabaseIfEmpty(
       entity_type, entity_id, entity_label, action, actor, summary
     ) VALUES (
       'SYSTEM', 'SEED', 'Catalogo Clinico Real', 'CREATE', 'Sistema',
-      'Carga inicial del esquema farmacologico real (7 medicamentos), 6 eventos clinicos, 4 temas de seguimiento y planificador quincenal 15/30.'
+      'Carga inicial del esquema real (Valproato 08/15/21h, Leflunomida Lun-Vie, Fluanxol oficial 27 nov 2026) y control RBAC/versiones.'
     )`
   );
 }

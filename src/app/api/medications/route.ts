@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { getActorLabel, requireAdmin, requireSession } from "@/lib/auth/session";
+import { formatApiError } from "@/lib/api-error";
 import { DoseClusteringService } from "@/lib/services/dose-clustering.service";
+import { MedicationVersionService } from "@/lib/services/medication-version.service";
 import { NO_STORE_HEADERS, safeRevalidateHome } from "@/lib/vercel-cache";
 
 export const dynamic = "force-dynamic";
@@ -25,11 +28,18 @@ const medPayloadFields = {
   intake_rule: z
     .enum(["NONE", "FASTING", "WITH_FOOD", "SEPARATE_FROM_OTHERS"])
     .default("NONE"),
+  active_days: z.array(z.number().int().min(0).max(6)).nullable().optional(),
+  schedule_start_date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullable()
+    .optional(),
   preferred_pharmacy: z.string().max(150).nullable().optional(),
   purchase_priority: z.number().int().min(1).max(3).default(2),
   safety_buffer_days: z.number().int().min(1).max(60).default(7),
   clinical_notes: z.string().nullable().optional(),
   ideal_times: z.array(z.string()).optional(),
+  event_linked_only: z.boolean().optional(),
 };
 
 const medicationActionSchema = z.discriminatedUnion("action", [
@@ -67,6 +77,19 @@ const medicationActionSchema = z.discriminatedUnion("action", [
     medication_id: z.string().uuid(),
   }),
   z.object({
+    action: z.literal("list_versions"),
+    medication_id: z.string().uuid(),
+  }),
+  z.object({
+    action: z.literal("mark_version_reviewed"),
+    version_id: z.string().uuid(),
+  }),
+  z.object({
+    action: z.literal("restore_version"),
+    medication_id: z.string().uuid(),
+    version_id: z.string().uuid(),
+  }),
+  z.object({
     action: z.literal("create_cluster"),
     label: z.string().min(1).max(80),
     anchor_time: z.string().min(4).max(8),
@@ -90,10 +113,26 @@ const medicationActionSchema = z.discriminatedUnion("action", [
   }),
 ]);
 
+const ADMIN_ONLY_MED_ACTIONS = new Set([
+  "delete",
+  "archive",
+  "restore",
+  "delete_cluster",
+  "list_versions",
+  "mark_version_reviewed",
+  "restore_version",
+]);
+
 export async function POST(req: Request) {
   try {
     const raw = await req.json();
     const parsed = medicationActionSchema.parse(raw);
+
+    const session = ADMIN_ONLY_MED_ACTIONS.has(parsed.action)
+      ? await requireAdmin()
+      : await requireSession();
+    const actor = getActorLabel(session);
+    const ctx = { role: session.role, actor };
 
     if (parsed.action === "generate_today") {
       const result =
@@ -108,25 +147,31 @@ export async function POST(req: Request) {
     }
 
     if (parsed.action === "create" || parsed.action === "update") {
-      const medication = await DoseClusteringService.createOrUpdateMedication({
-        id: parsed.id,
-        name: parsed.name,
-        active_ingredient: parsed.active_ingredient ?? null,
-        presentation: parsed.presentation,
-        units_per_package: parsed.units_per_package ?? null,
-        package_price: parsed.package_price ?? null,
-        dose_amount: parsed.dose_amount,
-        current_stock: parsed.current_stock ?? null,
-        frequency_type: parsed.frequency_type,
-        frequency_value: parsed.frequency_value,
-        tolerance_window_mins: parsed.tolerance_window_mins,
-        intake_rule: parsed.intake_rule,
-        preferred_pharmacy: parsed.preferred_pharmacy ?? null,
-        purchase_priority: parsed.purchase_priority,
-        safety_buffer_days: parsed.safety_buffer_days,
-        clinical_notes: parsed.clinical_notes ?? null,
-        ideal_times: parsed.ideal_times,
-      });
+      const medication = await DoseClusteringService.createOrUpdateMedication(
+        {
+          id: parsed.id,
+          name: parsed.name,
+          active_ingredient: parsed.active_ingredient ?? null,
+          presentation: parsed.presentation,
+          units_per_package: parsed.units_per_package ?? null,
+          package_price: parsed.package_price ?? null,
+          dose_amount: parsed.dose_amount,
+          current_stock: parsed.current_stock ?? null,
+          frequency_type: parsed.frequency_type,
+          frequency_value: parsed.frequency_value,
+          tolerance_window_mins: parsed.tolerance_window_mins,
+          intake_rule: parsed.intake_rule,
+          active_days: parsed.active_days ?? null,
+          schedule_start_date: parsed.schedule_start_date ?? null,
+          preferred_pharmacy: parsed.preferred_pharmacy ?? null,
+          purchase_priority: parsed.purchase_priority,
+          safety_buffer_days: parsed.safety_buffer_days,
+          clinical_notes: parsed.clinical_notes ?? null,
+          ideal_times: parsed.ideal_times,
+          event_linked_only: parsed.event_linked_only,
+        },
+        ctx
+      );
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, medication },
@@ -138,7 +183,8 @@ export async function POST(req: Request) {
       const medication = await DoseClusteringService.adjustMedicationStock(
         parsed.medication_id,
         parsed.exact_stock,
-        parsed.reason
+        parsed.reason,
+        ctx
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -150,7 +196,8 @@ export async function POST(req: Request) {
     if (parsed.action === "archive") {
       const medication = await DoseClusteringService.archiveMedication(
         parsed.medication_id,
-        parsed.reason ?? null
+        parsed.reason ?? null,
+        ctx
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -161,7 +208,8 @@ export async function POST(req: Request) {
 
     if (parsed.action === "restore") {
       const medication = await DoseClusteringService.restoreMedication(
-        parsed.medication_id
+        parsed.medication_id,
+        ctx
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -172,7 +220,43 @@ export async function POST(req: Request) {
 
     if (parsed.action === "delete") {
       const result = await DoseClusteringService.deleteMedicationPermanently(
+        parsed.medication_id,
+        actor
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (parsed.action === "list_versions") {
+      const versions = await MedicationVersionService.listVersionsForMedication(
         parsed.medication_id
+      );
+      return NextResponse.json(
+        { ok: true, versions },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (parsed.action === "mark_version_reviewed") {
+      const version = await MedicationVersionService.markVersionReviewed(
+        parsed.version_id,
+        actor
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, version },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (parsed.action === "restore_version") {
+      const result = await MedicationVersionService.restoreMedicationVersion(
+        parsed.medication_id,
+        parsed.version_id,
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -182,11 +266,14 @@ export async function POST(req: Request) {
     }
 
     if (parsed.action === "create_cluster") {
-      const cluster = await DoseClusteringService.createCluster({
-        label: parsed.label,
-        anchor_time: parsed.anchor_time,
-        intake_rule: parsed.intake_rule,
-      });
+      const cluster = await DoseClusteringService.createCluster(
+        {
+          label: parsed.label,
+          anchor_time: parsed.anchor_time,
+          intake_rule: parsed.intake_rule,
+        },
+        actor
+      );
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, cluster },
@@ -202,7 +289,8 @@ export async function POST(req: Request) {
           anchor_time: parsed.anchor_time,
           intake_rule: parsed.intake_rule,
           is_active: parsed.is_active,
-        }
+        },
+        actor
       );
       safeRevalidateHome();
       return NextResponse.json(
@@ -211,18 +299,23 @@ export async function POST(req: Request) {
       );
     }
 
-    const result = await DoseClusteringService.deleteCluster(parsed.cluster_id);
+    const result = await DoseClusteringService.deleteCluster(
+      parsed.cluster_id,
+      actor
+    );
     safeRevalidateHome();
     return NextResponse.json(
       { ok: true, ...result },
       { headers: NO_STORE_HEADERS }
     );
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : "Error al procesar medicamento.";
+    const { status, message } = formatApiError(
+      err,
+      "Error al procesar medicamento."
+    );
     return NextResponse.json(
       { error: message },
-      { status: 400, headers: NO_STORE_HEADERS }
+      { status, headers: NO_STORE_HEADERS }
     );
   }
 }

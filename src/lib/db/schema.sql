@@ -50,7 +50,7 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- 1. Catalogo e Inventario de Medicamentos (con soporte para datos diferibles/pendientes y costos)
+-- 1. Catalogo e Inventario de Medicamentos (con periodicidad por dias, datos diferibles y costos)
 CREATE TABLE IF NOT EXISTS medications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(150) NOT NULL,
@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS medications (
     frequency_value INTEGER NOT NULL,
     tolerance_window_mins INTEGER NOT NULL DEFAULT 30,
     intake_rule intake_constraint NOT NULL DEFAULT 'NONE',
+    active_days JSONB DEFAULT NULL,
+    schedule_start_date DATE DEFAULT NULL,
     daily_consumption_rate NUMERIC(10, 4) NOT NULL,
     days_of_supply_remaining NUMERIC(10, 2) GENERATED ALWAYS AS (
         CASE
@@ -91,6 +93,8 @@ ALTER TABLE medications ADD COLUMN IF NOT EXISTS purchase_priority SMALLINT NOT 
 ALTER TABLE medications ADD COLUMN IF NOT EXISTS safety_buffer_days INTEGER NOT NULL DEFAULT 7;
 ALTER TABLE medications ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 ALTER TABLE medications ADD COLUMN IF NOT EXISTS discontinuation_reason TEXT;
+ALTER TABLE medications ADD COLUMN IF NOT EXISTS active_days JSONB DEFAULT NULL;
+ALTER TABLE medications ADD COLUMN IF NOT EXISTS schedule_start_date DATE DEFAULT NULL;
 
 ALTER TABLE medications ALTER COLUMN units_per_package DROP NOT NULL;
 ALTER TABLE medications ALTER COLUMN units_per_package DROP DEFAULT;
@@ -222,19 +226,47 @@ CREATE TABLE IF NOT EXISTS topic_annotations (
 
 ALTER TABLE topic_annotations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
--- 8. Destinatarios Autorizados de Telegram
+-- 8. Destinatarios Autorizados de Telegram (con separacion Paciente vs Administrador)
 CREATE TABLE IF NOT EXISTS telegram_recipients (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     full_name VARCHAR(120) NOT NULL,
-    role VARCHAR(60) NOT NULL DEFAULT 'CAREGIVER',
+    role VARCHAR(60) NOT NULL DEFAULT 'ADMIN',
     telegram_chat_id VARCHAR(64) UNIQUE NOT NULL,
     receive_med_reminders BOOLEAN NOT NULL DEFAULT TRUE,
     receive_restock_alerts BOOLEAN NOT NULL DEFAULT TRUE,
     receive_event_reminders BOOLEAN NOT NULL DEFAULT TRUE,
     receive_topic_reminders BOOLEAN NOT NULL DEFAULT TRUE,
+    receive_missed_block_alerts BOOLEAN NOT NULL DEFAULT FALSE,
+    receive_weekly_report BOOLEAN NOT NULL DEFAULT FALSE,
+    receive_change_alerts BOOLEAN NOT NULL DEFAULT FALSE,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+DO $$
+DECLARE
+    v_col_existed BOOLEAN;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'telegram_recipients'
+          AND column_name = 'receive_missed_block_alerts'
+    ) INTO v_col_existed;
+
+    ALTER TABLE telegram_recipients ADD COLUMN IF NOT EXISTS receive_missed_block_alerts BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE telegram_recipients ADD COLUMN IF NOT EXISTS receive_weekly_report BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE telegram_recipients ADD COLUMN IF NOT EXISTS receive_change_alerts BOOLEAN NOT NULL DEFAULT FALSE;
+
+    IF NOT v_col_existed THEN
+        UPDATE telegram_recipients
+        SET receive_missed_block_alerts = TRUE,
+            receive_weekly_report = TRUE,
+            receive_change_alerts = TRUE
+        WHERE UPPER(role) != 'PATIENT';
+    END IF;
+END $$;
 
 -- 9. Cola Unificada de Recordatorios y Alertas via Telegram (Idempotente)
 CREATE TABLE IF NOT EXISTS notification_queue (
@@ -342,6 +374,52 @@ CREATE TABLE IF NOT EXISTS governance_audit_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 15. Cuentas de Acceso (Paciente y Administrador)
+CREATE TABLE IF NOT EXISTS auth_users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username VARCHAR(64) UNIQUE NOT NULL,
+    display_name VARCHAR(120) NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('ADMIN', 'PATIENT')),
+    password_hash TEXT NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 16. Control de Versiones y Restauracion de Medicamentos (Solo Administrador)
+CREATE TABLE IF NOT EXISTS medication_versions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    medication_id UUID NOT NULL REFERENCES medications(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    change_action VARCHAR(40) NOT NULL,
+    changed_by_role VARCHAR(20) NOT NULL DEFAULT 'ADMIN',
+    changed_by_actor VARCHAR(120) NOT NULL DEFAULT 'Sistema',
+    change_summary TEXT NOT NULL,
+    changed_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
+    snapshot_json JSONB NOT NULL,
+    reviewed_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (medication_id, version_number)
+);
+
+-- 17. Configuracion de Monitoreo Admin en Telegram (Singleton)
+CREATE TABLE IF NOT EXISTS alert_monitoring_settings (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    timezone VARCHAR(64) NOT NULL DEFAULT 'America/Mexico_City',
+    missed_block_grace_mins INTEGER NOT NULL DEFAULT 60 CHECK (missed_block_grace_mins BETWEEN 10 AND 360),
+    missed_block_alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    weekly_report_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    weekly_report_day SMALLINT NOT NULL DEFAULT 0 CHECK (weekly_report_day BETWEEN 0 AND 6),
+    weekly_report_hour SMALLINT NOT NULL DEFAULT 20 CHECK (weekly_report_hour BETWEEN 0 AND 23),
+    notify_admin_on_patient_change BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO alert_monitoring_settings (id)
+VALUES (1)
+ON CONFLICT (id) DO NOTHING;
+
 -- Indices Parciales de Alta Velocidad para Neon y PGlite
 CREATE INDEX IF NOT EXISTS idx_meds_low_stock ON medications (days_of_supply_remaining) WHERE is_active = TRUE AND days_of_supply_remaining IS NOT NULL AND days_of_supply_remaining <= 7;
 CREATE INDEX IF NOT EXISTS idx_intake_pending_today ON intake_logs (scheduled_for, cluster_id) WHERE status = 'PENDING';
@@ -351,3 +429,5 @@ CREATE INDEX IF NOT EXISTS idx_notifications_dispatch ON notification_queue (tri
 CREATE INDEX IF NOT EXISTS idx_telegram_active_recipients ON telegram_recipients (telegram_chat_id) WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_expenses_active_date ON medical_expenses (expense_date DESC) WHERE status != 'CANCELLED';
 CREATE INDEX IF NOT EXISTS idx_audit_recent ON governance_audit_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_med_versions_med ON medication_versions (medication_id, version_number DESC);
+CREATE INDEX IF NOT EXISTS idx_med_versions_unreviewed ON medication_versions (created_at DESC) WHERE reviewed_by_admin = FALSE;

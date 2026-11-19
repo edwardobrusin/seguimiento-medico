@@ -1,3 +1,14 @@
+export type UserRole = "ADMIN" | "PATIENT";
+
+export interface AuthUserPublic {
+  id: string;
+  username: string;
+  display_name: string;
+  role: UserRole;
+  is_active: boolean;
+  updated_at: string;
+}
+
 export type MedFrequencyType =
   | "FIXED_HOURS"
   | "DAILY_SLOTS"
@@ -77,6 +88,8 @@ export interface Medication {
   frequency_value: number;
   tolerance_window_mins: number;
   intake_rule: IntakeConstraint;
+  active_days: number[] | null;
+  schedule_start_date: string | null;
   daily_consumption_rate: number;
   days_of_supply_remaining: number | null;
   preferred_pharmacy: string | null;
@@ -89,6 +102,68 @@ export interface Medication {
   created_at: string;
   updated_at: string;
   schedules?: MedicationScheduleSummary[];
+}
+
+export interface MedicationVersionFieldDiff {
+  field: string;
+  label: string;
+  before: string;
+  after: string;
+}
+
+export interface MedicationVersionSnapshotData {
+  name: string;
+  active_ingredient: string | null;
+  presentation: string;
+  units_per_package: number | null;
+  package_price: number | null;
+  dose_amount: number;
+  current_stock: number | null;
+  frequency_type: MedFrequencyType;
+  frequency_value: number;
+  tolerance_window_mins: number;
+  intake_rule: IntakeConstraint;
+  active_days: number[] | null;
+  schedule_start_date: string | null;
+  daily_consumption_rate: number;
+  preferred_pharmacy: string | null;
+  purchase_priority: number;
+  safety_buffer_days: number;
+  clinical_notes: string | null;
+  is_active: boolean;
+  archived_at: string | null;
+  discontinuation_reason: string | null;
+  schedules: Array<{
+    cluster_id: string | null;
+    cluster_label: string | null;
+    ideal_time: string;
+    effective_clustered_time: string;
+    day_of_week: number | null;
+  }>;
+}
+
+export interface MedicationVersionItem {
+  id: string;
+  medication_id: string;
+  medication_name?: string;
+  version_number: number;
+  change_action: string;
+  changed_by_role: "ADMIN" | "PATIENT" | "SYSTEM";
+  changed_by_actor: string;
+  change_summary: string;
+  changed_fields: MedicationVersionFieldDiff[];
+  snapshot_json: MedicationVersionSnapshotData;
+  reviewed_by_admin: boolean;
+  reviewed_at: string | null;
+  created_at: string;
+}
+
+export interface RestingMedicationToday {
+  medication_id: string;
+  name: string;
+  dose_amount: number;
+  presentation: string;
+  active_days_label: string;
 }
 
 export interface IntakeCluster {
@@ -211,8 +286,23 @@ export interface TelegramRecipient {
   receive_restock_alerts: boolean;
   receive_event_reminders: boolean;
   receive_topic_reminders: boolean;
+  receive_missed_block_alerts: boolean;
+  receive_weekly_report: boolean;
+  receive_change_alerts: boolean;
   is_active: boolean;
   created_at: string;
+}
+
+export interface AlertMonitoringSettings {
+  id: number;
+  timezone: string;
+  missed_block_grace_mins: number;
+  missed_block_alerts_enabled: boolean;
+  weekly_report_enabled: boolean;
+  weekly_report_day: number;
+  weekly_report_hour: number;
+  notify_admin_on_patient_change: boolean;
+  updated_at: string;
 }
 
 export interface NotificationQueueItem {
@@ -422,6 +512,7 @@ export interface CommandCenterSnapshot {
   telegram_configured: boolean;
   today_clusters: TodayClusterBlock[];
   unclustered_today_intakes: ClusterIntakeItem[];
+  resting_medications_today: RestingMedicationToday[];
   low_stock_medications: Medication[];
   incomplete_medications: Medication[];
   medications: Medication[];
@@ -440,4 +531,7 @@ export interface CommandCenterSnapshot {
   care_providers: CareProvider[];
   adherence_30d: MedicationAdherenceSummary[];
   recent_audit_logs: GovernanceAuditLog[];
+  medication_versions: MedicationVersionItem[];
+  alert_monitoring_settings: AlertMonitoringSettings | null;
+  auth_users: AuthUserPublic[];
 }
