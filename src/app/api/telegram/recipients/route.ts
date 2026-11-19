@@ -18,6 +18,17 @@ const recipientActionSchema = z.discriminatedUnion("action", [
     receive_topic_reminders: z.boolean().default(true),
   }),
   z.object({
+    action: z.literal("update"),
+    recipient_id: z.string().uuid(),
+    full_name: z.string().min(1).max(120),
+    role: z.string().min(1).max(60),
+    telegram_chat_id: z.string().min(1).max(64),
+  }),
+  z.object({
+    action: z.literal("delete"),
+    recipient_id: z.string().uuid(),
+  }),
+  z.object({
     action: z.literal("toggle"),
     recipient_id: z.string().uuid(),
     field: z.enum([
@@ -36,6 +47,21 @@ const recipientActionSchema = z.discriminatedUnion("action", [
     action: z.literal("register_webhook"),
     base_url: z.string().max(300).optional(),
   }),
+  z.object({
+    action: z.literal("retry_notification"),
+    notification_id: z.string().uuid(),
+  }),
+  z.object({
+    action: z.literal("cancel_notification"),
+    notification_id: z.string().uuid(),
+  }),
+  z.object({
+    action: z.literal("delete_notification"),
+    notification_id: z.string().uuid(),
+  }),
+  z.object({
+    action: z.literal("purge_acknowledged"),
+  }),
 ]);
 
 export async function POST(req: Request) {
@@ -48,6 +74,33 @@ export async function POST(req: Request) {
       safeRevalidateHome();
       return NextResponse.json(
         { ok: true, recipient },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (body.action === "update") {
+      const recipient = await TelegramNotificationService.updateRecipient(
+        body.recipient_id,
+        {
+          full_name: body.full_name,
+          role: body.role,
+          telegram_chat_id: body.telegram_chat_id,
+        }
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, recipient },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (body.action === "delete") {
+      const result = await TelegramNotificationService.deleteRecipient(
+        body.recipient_id
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
         { headers: NO_STORE_HEADERS }
       );
     }
@@ -72,13 +125,56 @@ export async function POST(req: Request) {
       return NextResponse.json(result, { headers: NO_STORE_HEADERS });
     }
 
+    if (body.action === "retry_notification") {
+      const result = await TelegramNotificationService.retryNotification(
+        body.notification_id
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (body.action === "cancel_notification") {
+      const result = await TelegramNotificationService.cancelNotification(
+        body.notification_id
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (body.action === "delete_notification") {
+      const result = await TelegramNotificationService.deleteNotification(
+        body.notification_id
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
+    if (body.action === "purge_acknowledged") {
+      const result =
+        await TelegramNotificationService.purgeAcknowledgedNotifications();
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
     const status = await TelegramNotificationService.testBotConnection();
     return NextResponse.json(status, { headers: NO_STORE_HEADERS });
   } catch (err) {
     const message =
       err instanceof Error
         ? err.message
-        : "Error al gestionar destinatarios de Telegram.";
+        : "Error al gestionar destinatarios y cola de Telegram.";
     return NextResponse.json(
       { error: message },
       { status: 400, headers: NO_STORE_HEADERS }

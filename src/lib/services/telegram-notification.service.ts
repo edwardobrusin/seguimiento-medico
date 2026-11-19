@@ -6,6 +6,7 @@ import {
   PRIORITY_TAG,
   TASK_STATUS_TAG,
 } from "@/lib/clinical-labels";
+import { GovernanceAuditService } from "./governance-audit.service";
 import type {
   AlertStage,
   AlertStatus,
@@ -760,7 +761,7 @@ export class TelegramNotificationService {
   static async generateEstadoHtml(): Promise<string> {
     const todayStr = new Date().toISOString().slice(0, 10);
 
-    const [pendingRes, lowStockRes, eventsRes, topicsRes] = await Promise.all([
+    const [pendingRes, lowStockRes, pendingDataRes, eventsRes, topicsRes] = await Promise.all([
       query<{
         cluster_id: string | null;
         cluster_label: string | null;
@@ -783,6 +784,7 @@ export class TelegramNotificationService {
          LEFT JOIN intake_clusters ic ON ic.id = il.cluster_id
          WHERE (il.scheduled_for AT TIME ZONE 'UTC')::date = $1::date
            AND il.status = 'PENDING'
+           AND m.is_active = TRUE
          ORDER BY anchor_time ASC, m.name ASC`,
         [todayStr]
       ),
@@ -799,8 +801,25 @@ export class TelegramNotificationService {
            days_of_supply_remaining::float8 AS days_of_supply_remaining
          FROM medications
          WHERE is_active = TRUE
+           AND days_of_supply_remaining IS NOT NULL
            AND days_of_supply_remaining <= 7
          ORDER BY days_of_supply_remaining ASC, name ASC`
+      ),
+      query<{
+        name: string;
+        current_stock: number | null;
+        package_price: number | null;
+        units_per_package: number | null;
+      }>(
+        `SELECT
+           name,
+           current_stock::float8 AS current_stock,
+           package_price::float8 AS package_price,
+           units_per_package::float8 AS units_per_package
+         FROM medications
+         WHERE is_active = TRUE
+           AND (current_stock IS NULL OR package_price IS NULL OR units_per_package IS NULL)
+         ORDER BY name ASC`
       ),
       query<{
         title: string;
@@ -899,6 +918,20 @@ export class TelegramNotificationService {
         const prio = PRIORITY_TAG[topic.priority] ?? `[P${topic.priority}]`;
         lines.push(
           `<code>${escapeHtml(prio)}</code> <b>${escapeHtml(topic.title)}</b> | ${escapeHtml(TASK_STATUS_TAG[topic.status])} | ${topic.progress_percentage}% | Limite: ${escapeHtml(dl)}`
+        );
+      }
+    }
+
+    if (pendingDataRes.rows.length > 0) {
+      lines.push("----------------------------------------");
+      lines.push("<b>5. FARMACOS CON DATOS PENDIENTES</b>");
+      for (const pm of pendingDataRes.rows) {
+        const missing: string[] = [];
+        if (pm.current_stock === null) missing.push("Stock");
+        if (pm.package_price === null) missing.push("Precio");
+        if (pm.units_per_package === null) missing.push("Envase");
+        lines.push(
+          `<code>[PENDIENTE]</code> <b>${escapeHtml(pm.name)}</b> | Faltan: ${escapeHtml(missing.join(", "))}`
         );
       }
     }
@@ -1379,9 +1412,9 @@ export class TelegramNotificationService {
           id: string;
           name: string;
           presentation: string;
-          units_per_package: number;
-          current_stock: number;
-          days_of_supply_remaining: number;
+          units_per_package: number | null;
+          current_stock: number | null;
+          days_of_supply_remaining: number | null;
         }>(
           `SELECT
              id, name, presentation,
@@ -1404,13 +1437,20 @@ export class TelegramNotificationService {
           };
         }
 
-        const pkg = Math.max(1, Math.round(Number(med.units_per_package) || 30));
+        const pkg = Math.max(1, Math.round(Number(med.units_per_package ?? 30) || 30));
+        const stockText =
+          med.current_stock === null ? "PENDIENTE DE CAPTURA" : `${med.current_stock} unidades`;
+        const daysText =
+          med.days_of_supply_remaining === null
+            ? "PENDIENTE"
+            : `${med.days_of_supply_remaining} dias`;
+
         const statusHtml = [
           `<b>[RESTOCK - ${escapeHtml(med.name)}]</b>`,
           "----------------------------------------",
-          `Presentacion: ${escapeHtml(med.presentation)} (${pkg} u/envase)`,
-          `Inventario actual: ${med.current_stock} unidades`,
-          `Cobertura estimada: ${med.days_of_supply_remaining} dias`,
+          `Presentacion: ${escapeHtml(med.presentation)} (${med.units_per_package ? `${pkg} u/envase` : "envase pendiente, ref 30u"})`,
+          `Inventario actual: ${stockText}`,
+          `Cobertura estimada: ${daysText}`,
           "----------------------------------------",
           "Seleccione la cantidad a sumar al inventario:",
         ].join("\n");
@@ -1683,11 +1723,37 @@ export class TelegramNotificationService {
           clusterMap.set(row.cluster_id, entry);
         }
 
+        const unclusteredRes = await query<{
+          intake_log_id: string;
+          med_name: string;
+          quantity_deducted: number;
+          presentation: string;
+          intake_rule: IntakeConstraint;
+          scheduled_time: string;
+        }>(
+          `SELECT
+             il.id AS intake_log_id,
+             m.name AS med_name,
+             il.quantity_deducted::float8 AS quantity_deducted,
+             m.presentation,
+             m.intake_rule,
+             COALESCE(ms.effective_clustered_time::text, (il.scheduled_for AT TIME ZONE 'UTC')::time::text) AS scheduled_time
+           FROM intake_logs il
+           JOIN medications m ON m.id = il.medication_id
+           LEFT JOIN medication_schedules ms ON ms.id = il.schedule_id
+           WHERE (il.scheduled_for AT TIME ZONE 'UTC')::date = $1::date
+             AND il.cluster_id IS NULL
+             AND il.status = 'PENDING'
+             AND m.is_active = TRUE
+           ORDER BY scheduled_time ASC, m.name ASC`,
+          [todayStr]
+        );
+
         const pendingClusters = Array.from(clusterMap.values()).filter(
           (c) => c.pendingItems.length > 0
         );
 
-        if (pendingClusters.length === 0) {
+        if (pendingClusters.length === 0 && unclusteredRes.rows.length === 0) {
           const statusHtml =
             "<code>[OK] Todas las tomas de hoy han sido confirmadas.</code>";
           await sendTelegramMessageSafe(
@@ -1706,6 +1772,37 @@ export class TelegramNotificationService {
 
         const blocksHtml: string[] = [];
         let simOffset = 0;
+
+        if (unclusteredRes.rows.length > 0) {
+          const dedicatedHtml = this.formatClusterStateHtml(
+            "Tomas en Horario Dedicado",
+            unclusteredRes.rows[0].scheduled_time.slice(0, 5),
+            unclusteredRes.rows.map((r) => ({
+              name: `${r.med_name} (${r.scheduled_time.slice(0, 5)})`,
+              dose: `${r.quantity_deducted} ${r.presentation}`,
+              ruleLabel: INTAKE_RULE_LABEL[r.intake_rule],
+              status: "PENDING",
+            })),
+            "PENDIENTE DE CONFIRMACION"
+          );
+          const dedicatedMarkup: InlineKeyboardMarkup = {
+            inline_keyboard: unclusteredRes.rows.map((r) => [
+              {
+                text: `[ Tomar: ${r.med_name.slice(0, 26)} (${r.scheduled_time.slice(0, 5)}) ]`,
+                callback_data: truncateCallbackData(`ack_log:${r.intake_log_id}`),
+              },
+            ]),
+          };
+          await sendTelegramMessageSafe(
+            botToken,
+            chatId,
+            dedicatedHtml,
+            dedicatedMarkup,
+            simOffset
+          );
+          simOffset += 1;
+          blocksHtml.push(dedicatedHtml);
+        }
 
         for (const cluster of pendingClusters) {
           const timeHHMM = cluster.anchorTime.slice(0, 5);
@@ -1803,8 +1900,8 @@ export class TelegramNotificationService {
           id: string;
           name: string;
           presentation: string;
-          current_stock: number;
-          days_of_supply_remaining: number;
+          current_stock: number | null;
+          days_of_supply_remaining: number | null;
         }>(
           `SELECT
              id,
@@ -1814,7 +1911,7 @@ export class TelegramNotificationService {
              days_of_supply_remaining::float8 AS days_of_supply_remaining
            FROM medications
            WHERE is_active = TRUE
-           ORDER BY days_of_supply_remaining ASC, name ASC`
+           ORDER BY days_of_supply_remaining ASC NULLS FIRST, name ASC`
         );
 
         if (medsRes.rows.length === 0) {
@@ -1840,10 +1937,16 @@ export class TelegramNotificationService {
           "Seleccione el medicamento que desea reabastecer:",
           ...medsRes.rows.map((m, idx) => {
             const tag =
-              Number(m.days_of_supply_remaining) <= 7
+              m.days_of_supply_remaining === null
+                ? "[PENDIENTE]"
+                : Number(m.days_of_supply_remaining) <= 7
                 ? "[CRITICO]"
                 : "[ESTABLE]";
-            return `<code>${tag}</code> <b>${idx + 1}. ${escapeHtml(m.name)}</b> | Stock: ${m.current_stock} ${escapeHtml(m.presentation)} (${m.days_of_supply_remaining} d)`;
+            const stockDesc =
+              m.current_stock === null
+                ? "Stock: PENDIENTE"
+                : `Stock: ${m.current_stock} ${escapeHtml(m.presentation)} (${m.days_of_supply_remaining} d)`;
+            return `<code>${tag}</code> <b>${idx + 1}. ${escapeHtml(m.name)}</b> | ${stockDesc}`;
           }),
         ];
         const statusHtml = lines.join("\n");
@@ -1851,7 +1954,10 @@ export class TelegramNotificationService {
         const inlineKeyboard: InlineKeyboardMarkup = {
           inline_keyboard: medsRes.rows.map((m) => [
             {
-              text: `[ ${m.name.slice(0, 24)} | ${m.current_stock}u (${m.days_of_supply_remaining}d) ]`,
+              text:
+                m.current_stock === null
+                  ? `[ ${m.name.slice(0, 24)} | PENDIENTE ]`
+                  : `[ ${m.name.slice(0, 24)} | ${m.current_stock}u (${m.days_of_supply_remaining}d) ]`,
               callback_data: truncateCallbackData(`restock_sel:${m.id}`),
             },
           ]),
@@ -2021,6 +2127,160 @@ export class TelegramNotificationService {
       throw new Error("Destinatario de Telegram no encontrado.");
     }
     return updated;
+  }
+
+  static async updateRecipient(
+    recipientId: string,
+    input: { full_name: string; role: string; telegram_chat_id: string },
+    actor = "Consola Clinica Web"
+  ): Promise<TelegramRecipient> {
+    const res = await query<TelegramRecipientRow>(
+      `UPDATE telegram_recipients
+       SET full_name = $2,
+           role = $3,
+           telegram_chat_id = $4
+       WHERE id = $1::uuid
+       RETURNING *`,
+      [
+        recipientId,
+        input.full_name.trim(),
+        input.role.trim(),
+        input.telegram_chat_id.trim(),
+      ]
+    );
+    const updated = res.rows[0];
+    if (!updated) {
+      throw new Error("Destinatario de Telegram no encontrado.");
+    }
+    await GovernanceAuditService.log({
+      entity_type: "TELEGRAM_RECIPIENT",
+      entity_id: updated.id,
+      entity_label: updated.full_name,
+      action: "UPDATE",
+      actor,
+      summary: `Destinatario "${updated.full_name}" (Chat ID ${updated.telegram_chat_id}) actualizado.`,
+    });
+    return updated;
+  }
+
+  static async deleteRecipient(
+    recipientId: string,
+    actor = "Consola Clinica Web"
+  ): Promise<{ deletedId: string }> {
+    const res = await query<{ id: string; full_name: string }>(
+      `DELETE FROM telegram_recipients WHERE id = $1::uuid RETURNING id, full_name`,
+      [recipientId]
+    );
+    const deleted = res.rows[0];
+    if (!deleted) {
+      throw new Error("Destinatario de Telegram no encontrado.");
+    }
+    await GovernanceAuditService.log({
+      entity_type: "TELEGRAM_RECIPIENT",
+      entity_id: deleted.id,
+      entity_label: deleted.full_name,
+      action: "DELETE",
+      actor,
+      summary: `Destinatario "${deleted.full_name}" eliminado de Telegram.`,
+    });
+    return { deletedId: deleted.id };
+  }
+
+  static async retryNotification(
+    notifId: string,
+    actor = "Consola Clinica Web"
+  ): Promise<{ id: string }> {
+    const res = await query<{ id: string; title: string }>(
+      `UPDATE notification_queue
+       SET status = 'QUEUED',
+           retry_count = 0,
+           last_error = NULL,
+           trigger_at = NOW()
+       WHERE id = $1::uuid
+       RETURNING id, title`,
+      [notifId]
+    );
+    const updated = res.rows[0];
+    if (!updated) {
+      throw new Error("Notificacion no encontrada.");
+    }
+    await GovernanceAuditService.log({
+      entity_type: "NOTIFICATION",
+      entity_id: updated.id,
+      entity_label: updated.title,
+      action: "RETRY",
+      actor,
+      summary: `Notificacion "${updated.title}" reencolada para envio inmediato.`,
+    });
+    return { id: updated.id };
+  }
+
+  static async cancelNotification(
+    notifId: string,
+    actor = "Consola Clinica Web"
+  ): Promise<{ id: string }> {
+    const res = await query<{ id: string; title: string }>(
+      `UPDATE notification_queue
+       SET status = 'ACKNOWLEDGED',
+           acknowledged_at = NOW(),
+           acknowledged_by_chat_id = 'CANCELADO_WEB'
+       WHERE id = $1::uuid
+       RETURNING id, title`,
+      [notifId]
+    );
+    const updated = res.rows[0];
+    if (!updated) {
+      throw new Error("Notificacion no encontrada.");
+    }
+    await GovernanceAuditService.log({
+      entity_type: "NOTIFICATION",
+      entity_id: updated.id,
+      entity_label: updated.title,
+      action: "CANCEL",
+      actor,
+      summary: `Notificacion "${updated.title}" marcada como atendida/cancelada.`,
+    });
+    return { id: updated.id };
+  }
+
+  static async deleteNotification(
+    notifId: string,
+    actor = "Consola Clinica Web"
+  ): Promise<{ deletedId: string }> {
+    const res = await query<{ id: string; title: string }>(
+      `DELETE FROM notification_queue WHERE id = $1::uuid RETURNING id, title`,
+      [notifId]
+    );
+    const deleted = res.rows[0];
+    if (!deleted) {
+      throw new Error("Notificacion no encontrada.");
+    }
+    await GovernanceAuditService.log({
+      entity_type: "NOTIFICATION",
+      entity_id: deleted.id,
+      entity_label: deleted.title,
+      action: "DELETE",
+      actor,
+      summary: `Notificacion "${deleted.title}" eliminada de la cola.`,
+    });
+    return { deletedId: deleted.id };
+  }
+
+  static async purgeAcknowledgedNotifications(
+    actor = "Consola Clinica Web"
+  ): Promise<{ purgedCount: number }> {
+    const res = await query<{ id: string }>(
+      `DELETE FROM notification_queue WHERE status = 'ACKNOWLEDGED' RETURNING id`
+    );
+    await GovernanceAuditService.log({
+      entity_type: "NOTIFICATION",
+      entity_id: "BATCH",
+      entity_label: "Cola de Notificaciones",
+      action: "DELETE",
+      actor,
+      summary: `Depuracion de cola: ${res.rowCount} notificaciones confirmadas eliminadas.`,
+    });
+    return { purgedCount: res.rowCount };
   }
 
   static async testBotConnection(): Promise<{

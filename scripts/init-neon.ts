@@ -23,34 +23,22 @@ async function main() {
   console.log("DB_MODE:", getDbMode());
   await ensureInitialized();
 
-  // Asegurar migracion idempotente de columna units_per_package y valor de Adalimumab
-  await query(
-    `ALTER TABLE medications
-     ADD COLUMN IF NOT EXISTS units_per_package NUMERIC(10, 2) NOT NULL DEFAULT 30`
-  );
-  await query(
-    `UPDATE medications
-     SET units_per_package = 2
-     WHERE name = 'Adalimumab 40mg' AND units_per_package = 30`
-  );
+  const [meds, events, topics, clusters, expenses, providers] = await Promise.all([
+    query<{ c: number }>("SELECT count(*)::int AS c FROM medications"),
+    query<{ c: number }>("SELECT count(*)::int AS c FROM clinical_events"),
+    query<{ c: number }>("SELECT count(*)::int AS c FROM follow_up_topics"),
+    query<{ c: number }>("SELECT count(*)::int AS c FROM intake_clusters"),
+    query<{ c: number }>("SELECT count(*)::int AS c FROM medical_expenses"),
+    query<{ c: number }>("SELECT count(*)::int AS c FROM care_providers"),
+  ]);
 
-  const meds = await query<{ c: number }>(
-    "SELECT count(*)::int AS c FROM medications"
-  );
-  const events = await query<{ c: number }>(
-    "SELECT count(*)::int AS c FROM clinical_events"
-  );
-  const topics = await query<{ c: number }>(
-    "SELECT count(*)::int AS c FROM follow_up_topics"
-  );
-  const clusters = await query<{ c: number }>(
-    "SELECT count(*)::int AS c FROM intake_clusters"
-  );
   console.log("NEON_COUNTS:", {
     clusters: clusters.rows[0].c,
     medications: meds.rows[0].c,
     clinical_events: events.rows[0].c,
     follow_up_topics: topics.rows[0].c,
+    medical_expenses: expenses.rows[0].c,
+    care_providers: providers.rows[0].c,
   });
 
   const bot = await TelegramNotificationService.testBotConnection();

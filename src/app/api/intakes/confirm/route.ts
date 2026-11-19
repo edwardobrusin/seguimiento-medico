@@ -18,12 +18,22 @@ const intakeActionSchema = z.discriminatedUnion("action", [
     intake_log_id: z.string().uuid(),
     status: z.enum(["PENDING", "TAKEN", "DELAYED", "SKIPPED"]),
     recorded_by: z.string().min(1).max(100).default("Consola Clinica Web"),
-    observations: z.string().optional(),
+    observations: z.string().max(500).optional(),
+  }),
+  z.object({
+    action: z.literal("delete_log"),
+    intake_log_id: z.string().uuid(),
   }),
   z.object({
     action: z.literal("restock"),
     medication_id: z.string().uuid(),
     quantity: z.number().positive(),
+    package_price: z.number().min(0).nullable().optional(),
+    units_per_package: z.number().positive().nullable().optional(),
+    expense_amount: z.number().min(0).nullable().optional(),
+    provider_or_pharmacy: z.string().max(150).nullable().optional(),
+    payment_method: z.string().max(60).nullable().optional(),
+    log_expense: z.boolean().optional(),
   }),
 ]);
 
@@ -56,9 +66,30 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true }, { headers: NO_STORE_HEADERS });
     }
 
+    if (body.action === "delete_log") {
+      const result = await DoseClusteringService.deleteIntakeLog(
+        body.intake_log_id
+      );
+      safeRevalidateHome();
+      return NextResponse.json(
+        { ok: true, ...result },
+        { headers: NO_STORE_HEADERS }
+      );
+    }
+
     const medication = await DoseClusteringService.restockMedication(
       body.medication_id,
-      body.quantity
+      body.quantity,
+      "RESTOCK_WEB",
+      {
+        origin: "WEB",
+        package_price: body.package_price ?? null,
+        units_per_package: body.units_per_package ?? null,
+        expense_amount: body.expense_amount ?? null,
+        provider_or_pharmacy: body.provider_or_pharmacy ?? null,
+        payment_method: body.payment_method ?? null,
+        log_expense: body.log_expense ?? false,
+      }
     );
     safeRevalidateHome();
     return NextResponse.json(

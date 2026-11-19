@@ -1,4 +1,5 @@
--- A. Descuento Atomico de Inventario y Alerta de Restock (Umbral <= 7 Dias)
+-- A. Descuento y Reembolso Atomico de Inventario + Alerta de Restock (Umbral <= 7 Dias)
+-- Respeta inventarios diferidos (current_stock IS NULL) y revierte stock si una toma TAKEN se revierte o elimina.
 CREATE OR REPLACE FUNCTION fn_process_medication_intake()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -7,12 +8,21 @@ DECLARE
     v_current_stock NUMERIC;
     v_presentation VARCHAR;
     v_should_deduct BOOLEAN := FALSE;
+    v_should_refund BOOLEAN := FALSE;
 BEGIN
-    IF NEW.status = 'TAKEN' THEN
-        IF TG_OP = 'INSERT' THEN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status = 'TAKEN' THEN
             v_should_deduct := TRUE;
-        ELSIF OLD.status IS DISTINCT FROM 'TAKEN' THEN
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.status = 'TAKEN' AND OLD.status IS DISTINCT FROM 'TAKEN' THEN
             v_should_deduct := TRUE;
+        ELSIF OLD.status = 'TAKEN' AND NEW.status IS DISTINCT FROM 'TAKEN' THEN
+            v_should_refund := TRUE;
+        END IF;
+    ELSIF TG_OP = 'DELETE' THEN
+        IF OLD.status = 'TAKEN' THEN
+            v_should_refund := TRUE;
         END IF;
     END IF;
 
@@ -21,11 +31,12 @@ BEGIN
         SET current_stock = GREATEST(0, current_stock - NEW.quantity_deducted),
             updated_at = NOW()
         WHERE id = NEW.medication_id
+          AND current_stock IS NOT NULL
         RETURNING days_of_supply_remaining, name, current_stock, presentation
         INTO v_remaining_days, v_med_name, v_current_stock, v_presentation;
 
-        -- Si el inventario existente no dura para mas de una semana (<= 7 dias), disparar alerta de restock
-        IF v_remaining_days IS NOT NULL AND v_remaining_days <= 7 THEN
+        -- Si el inventario conocido no dura para mas de una semana (<= 7 dias), disparar alerta de restock
+        IF FOUND AND v_remaining_days IS NOT NULL AND v_remaining_days <= 7 THEN
             INSERT INTO notification_queue (
                 source_type, source_id, stage, trigger_at, title, message, callback_action_payload, idempotency_key
             ) VALUES (
@@ -39,6 +50,16 @@ BEGIN
                 'RESTOCK_' || NEW.medication_id || '_' || CURRENT_DATE
             ) ON CONFLICT (idempotency_key) DO NOTHING;
         END IF;
+    ELSIF v_should_refund THEN
+        UPDATE medications
+        SET current_stock = current_stock + OLD.quantity_deducted,
+            updated_at = NOW()
+        WHERE id = OLD.medication_id
+          AND current_stock IS NOT NULL;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
     END IF;
     RETURN NEW;
 END;
@@ -46,7 +67,7 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_after_intake_taken ON intake_logs;
 CREATE TRIGGER trg_after_intake_taken
-AFTER INSERT OR UPDATE ON intake_logs
+AFTER INSERT OR UPDATE OR DELETE ON intake_logs
 FOR EACH ROW EXECUTE FUNCTION fn_process_medication_intake();
 
 -- B. Generador Automatico de Cascada de Recordatorios (-7d, -3d, -1d, 0d)

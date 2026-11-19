@@ -7,10 +7,15 @@ import {
   CheckCircle2,
   ClipboardList,
   Clock,
+  FileWarning,
   PackagePlus,
+  RotateCcw,
   Send,
+  Trash2,
+  Wallet,
 } from "lucide-react";
 import type {
+  ClusterIntakeItem,
   CommandCenterSnapshot,
   IntakeStatus,
   TodayClusterBlock,
@@ -22,42 +27,74 @@ import {
   PRIORITY_TAG,
   TASK_STATUS_TAG,
 } from "@/lib/clinical-labels";
-import { cn, formatDateTimeEs, formatShortTime, getDaysUntil } from "@/lib/utils";
+import {
+  cn,
+  formatCurrencyMxn,
+  formatDateTimeEs,
+  formatShortTime,
+  getDaysUntil,
+} from "@/lib/utils";
 import { StatusBadge } from "./StatusBadge";
 
 interface CommandCenterViewProps {
   snapshot: CommandCenterSnapshot;
+  onSelectDate: (dateStr: string) => Promise<void>;
   onConfirmCluster: (clusterId: string, dateStr: string) => Promise<void>;
   onUpdateIntakeLog: (
     intakeLogId: string,
-    status: IntakeStatus
+    status: IntakeStatus,
+    observations?: string
   ) => Promise<void>;
-  onRestockMedication: (medicationId: string, quantity: number) => Promise<void>;
-  onNavigateTab: (tab: "inventory" | "events" | "topics" | "telegram") => void;
+  onDeleteIntakeLog: (intakeLogId: string) => Promise<void>;
+  onRestockMedication: (
+    medicationId: string,
+    quantity: number,
+    options?: {
+      expense_amount?: number | null;
+      provider_or_pharmacy?: string | null;
+      log_expense?: boolean;
+    }
+  ) => Promise<void>;
+  onNavigateTab: (
+    tab: "inventory" | "finances" | "events" | "topics" | "dossier" | "telegram"
+  ) => void;
 }
 
 export function CommandCenterView({
   snapshot,
+  onSelectDate,
   onConfirmCluster,
   onUpdateIntakeLog,
+  onDeleteIntakeLog,
   onRestockMedication,
   onNavigateTab,
 }: CommandCenterViewProps) {
   const [restockTargetId, setRestockTargetId] = useState<string | null>(null);
   const [restockQty, setRestockQty] = useState<string>("30");
+  const [restockCost, setRestockCost] = useState<string>("");
+  const [restockLogExpense, setRestockLogExpense] = useState(true);
+
+  const [editingObsLogId, setEditingObsLogId] = useState<string | null>(null);
+  const [obsText, setObsText] = useState("");
+  const [confirmDeleteLogId, setConfirmDeleteLogId] = useState<string | null>(
+    null
+  );
   const [busyKey, setBusyKey] = useState<string | null>(null);
 
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const yesterdayIso = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+  const allItems = [
+    ...snapshot.today_clusters.flatMap((c) => c.items),
+    ...snapshot.unclustered_today_intakes,
+  ];
   const pendingClustersCount = snapshot.today_clusters.filter(
     (c) => c.block_status === "PENDING" || c.block_status === "PARTIAL"
   ).length;
-  const totalIntakesToday = snapshot.today_clusters.reduce(
-    (acc, c) => acc + c.items.length,
-    0
-  );
-  const takenIntakesToday = snapshot.today_clusters.reduce(
-    (acc, c) => acc + c.items.filter((i) => i.status === "TAKEN").length,
-    0
-  );
+  const totalIntakesToday = allItems.length;
+  const takenIntakesToday = allItems.filter((i) => i.status === "TAKEN").length;
+
+  const nextBucket = snapshot.financial_plan.buckets[0] ?? null;
 
   async function handleClusterConfirm(block: TodayClusterBlock) {
     setBusyKey(`cluster:${block.cluster_id}`);
@@ -71,26 +108,234 @@ export function CommandCenterView({
   async function handleRestockSubmit(medId: string) {
     const qty = Number(restockQty);
     if (!Number.isFinite(qty) || qty <= 0) return;
+    const parsedCost =
+      restockCost.trim() !== "" && Number.isFinite(Number(restockCost))
+        ? Number(restockCost)
+        : null;
     setBusyKey(`restock:${medId}`);
     try {
-      await onRestockMedication(medId, qty);
+      await onRestockMedication(medId, qty, {
+        expense_amount: parsedCost,
+        log_expense: restockLogExpense && parsedCost !== null,
+      });
       setRestockTargetId(null);
+      setRestockCost("");
     } finally {
       setBusyKey(null);
     }
   }
 
+  async function handleSaveObservation(item: ClusterIntakeItem) {
+    setBusyKey(`obs:${item.intake_log_id}`);
+    try {
+      await onUpdateIntakeLog(item.intake_log_id, item.status, obsText.trim());
+      setEditingObsLogId(null);
+      setObsText("");
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  function renderIntakeRow(item: ClusterIntakeItem) {
+    const isEditingObs = editingObsLogId === item.intake_log_id;
+    const isConfirmDelete = confirmDeleteLogId === item.intake_log_id;
+    return (
+      <tr key={item.intake_log_id} className="bg-white hover:bg-[#F8FAFC]">
+        <td className="py-3 px-4 align-top">
+          <div className="font-bold text-[15px] text-[#0F172A]">
+            {item.medication_name}
+          </div>
+          {item.active_ingredient && (
+            <div className="text-[13px] text-[#475569]">
+              {item.active_ingredient}
+            </div>
+          )}
+          {item.observations && !isEditingObs && (
+            <p className="mt-1 text-[13px] text-[#164E63] bg-[#ECFEFF] border border-[#A5F3FC] rounded-[4px] px-2 py-0.5 inline-block">
+              Nota: {item.observations}
+            </p>
+          )}
+          {isEditingObs && (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <input
+                type="text"
+                placeholder="Motivo o observacion clinica"
+                value={obsText}
+                onChange={(e) => setObsText(e.target.value)}
+                className="h-[38px] px-2.5 border border-[#CBD5E1] rounded-[6px] text-[13px] min-w-[200px]"
+              />
+              <button
+                type="button"
+                disabled={busyKey === `obs:${item.intake_log_id}`}
+                onClick={() => handleSaveObservation(item)}
+                className="px-2.5 h-[38px] rounded-[6px] bg-[#0E7490] text-white text-[13px] font-medium"
+              >
+                Guardar
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditingObsLogId(null)}
+                className="px-2.5 h-[38px] rounded-[6px] border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
+              >
+                Cancelar
+              </button>
+            </div>
+          )}
+        </td>
+        <td className="py-3 px-3 align-top font-mono text-[14px] tabular-nums text-[#0F172A]">
+          {item.quantity_deducted} {item.presentation}
+        </td>
+        <td className="py-3 px-3 align-top">
+          <div className="flex flex-col gap-1">
+            <span className="font-mono text-[13px] text-[#334155]">
+              {INTAKE_RULE_TAG[item.intake_rule]}
+            </span>
+            {item.ideal_time && item.effective_clustered_time && (
+              <span className="font-mono text-[13px] text-[#64748B] tabular-nums">
+                Ideal {formatShortTime(item.ideal_time)} -&gt;{" "}
+                {formatShortTime(item.effective_clustered_time)}
+              </span>
+            )}
+          </div>
+        </td>
+        <td className="py-3 px-3 align-top font-mono text-[13px] tabular-nums">
+          {item.current_stock === null ? (
+            <span className="text-[#92400E] font-semibold">[PENDIENTE]</span>
+          ) : (
+            <span
+              className={cn(
+                "font-semibold",
+                item.days_of_supply_remaining !== null &&
+                  item.days_of_supply_remaining <= 7
+                  ? "text-[#991B1B]"
+                  : "text-[#0F172A]"
+              )}
+            >
+              {item.current_stock} (
+              {item.days_of_supply_remaining === null
+                ? "--"
+                : `${item.days_of_supply_remaining}d`}
+              )
+            </span>
+          )}
+        </td>
+        <td className="py-3 px-4 align-top text-right">
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
+            <StatusBadge
+              label={INTAKE_STATUS_TAG[item.status]}
+              tone={
+                item.status === "TAKEN"
+                  ? "ok"
+                  : item.status === "PENDING"
+                  ? "warn"
+                  : "neutral"
+              }
+            />
+            {item.status === "PENDING" ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateIntakeLog(item.intake_log_id, "TAKEN")
+                  }
+                  className="clinical-btn px-2.5 text-[13px] font-bold border border-[#0E7490] bg-[#0E7490] hover:bg-[#155E75] text-white"
+                  aria-label={`Marcar ${item.medication_name} como tomado`}
+                >
+                  Tomado
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateIntakeLog(item.intake_log_id, "DELAYED")
+                  }
+                  className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155]"
+                >
+                  Posponer
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onUpdateIntakeLog(item.intake_log_id, "SKIPPED")
+                  }
+                  className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155]"
+                >
+                  Omitir
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateIntakeLog(item.intake_log_id, "PENDING")
+                }
+                className="clinical-btn inline-flex items-center gap-1 px-2.5 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A]"
+                title="Revertir a pendiente (reembolsa stock si estaba tomado)"
+              >
+                <RotateCcw
+                  className="w-3.5 h-3.5 text-[#0E7490]"
+                  strokeWidth={1.75}
+                  aria-hidden="true"
+                />
+                Revertir
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setEditingObsLogId(isEditingObs ? null : item.intake_log_id);
+                setObsText(item.observations ?? "");
+              }}
+              className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#475569]"
+            >
+              Nota
+            </button>
+            {isConfirmDelete ? (
+              <>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await onDeleteIntakeLog(item.intake_log_id);
+                    setConfirmDeleteLogId(null);
+                  }}
+                  className="clinical-btn px-2 text-[13px] bg-[#991B1B] text-white font-bold"
+                >
+                  Confirmar Borrar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteLogId(null)}
+                  className="clinical-btn px-2 text-[13px] border border-[#CBD5E1] bg-white text-[#334155]"
+                >
+                  No
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteLogId(item.intake_log_id)}
+                className="clinical-btn px-2 border border-[#E2E8F0] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
+                aria-label={`Eliminar registro de toma ${item.medication_name}`}
+              >
+                <Trash2 className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
   return (
     <div className="space-y-6 clinical-enter">
-      {/* KPIs Clinicos del Dia */}
+      {/* KPIs Clinicos y Financieros del Dia */}
       <section
         aria-label="Indicadores clinicos del dia"
-        className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"
+        className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4"
       >
         <div className="clinical-card p-4">
           <div className="flex items-center justify-between">
             <span className="text-[13px] font-medium text-[#475569]">
-              Adherencia del dia
+              Adherencia ({snapshot.target_date})
             </span>
             <CheckCircle2
               className="w-4 h-4 text-[#0E7490]"
@@ -98,11 +343,11 @@ export function CommandCenterView({
               aria-hidden="true"
             />
           </div>
-          <p className="mt-2 font-mono text-[28px] font-bold leading-none tabular-nums text-[#0F172A]">
+          <p className="mt-2 font-mono text-[26px] font-bold leading-none tabular-nums text-[#0F172A]">
             {takenIntakesToday}/{totalIntakesToday}
           </p>
           <p className="mt-1.5 text-[13px] text-[#475569] tabular-nums">
-            {pendingClustersCount} bloques pendientes hoy
+            {pendingClustersCount} bloques pendientes
           </p>
         </div>
 
@@ -122,7 +367,7 @@ export function CommandCenterView({
                   : "text-[#475569]"
               )}
             >
-              Alertas de restock (&lt;= 7 dias)
+              Restock critico (&lt;= 7d)
             </span>
             <AlertTriangle
               className={cn(
@@ -137,7 +382,7 @@ export function CommandCenterView({
           </div>
           <p
             className={cn(
-              "mt-2 font-mono text-[28px] font-bold leading-none tabular-nums",
+              "mt-2 font-mono text-[26px] font-bold leading-none tabular-nums",
               snapshot.low_stock_medications.length > 0
                 ? "text-[#991B1B]"
                 : "text-[#0F172A]"
@@ -155,11 +400,42 @@ export function CommandCenterView({
           >
             {snapshot.low_stock_medications.length > 0
               ? "Reabastecimiento requerido"
-              : "Cobertura farmacologica estable"}
+              : "Cobertura estable"}
           </p>
         </div>
 
-        <div className="clinical-card p-4">
+        <button
+          type="button"
+          onClick={() => onNavigateTab("finances")}
+          className="clinical-card p-4 text-left hover:border-[#0E7490] transition-colors cursor-pointer"
+        >
+          <div className="flex items-center justify-between">
+            <span className="text-[13px] font-medium text-[#475569]">
+              Proxima Quincena
+            </span>
+            <Wallet
+              className="w-4 h-4 text-[#0E7490]"
+              strokeWidth={1.75}
+              aria-hidden="true"
+            />
+          </div>
+          <p className="mt-2 font-mono text-[24px] font-bold leading-none tabular-nums text-[#0F172A]">
+            {nextBucket
+              ? formatCurrencyMxn(nextBucket.total_cost)
+              : "$0.00"}
+          </p>
+          <p className="mt-1.5 text-[13px] text-[#0E7490] truncate">
+            {nextBucket
+              ? `${nextBucket.pay_date} (${nextBucket.purchases.length} comp.)`
+              : "Sin compras planeadas"}
+          </p>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onNavigateTab("events")}
+          className="clinical-card p-4 text-left hover:border-[#0E7490] transition-colors cursor-pointer"
+        >
           <div className="flex items-center justify-between">
             <span className="text-[13px] font-medium text-[#475569]">
               Eventos clinicos activos
@@ -170,15 +446,19 @@ export function CommandCenterView({
               aria-hidden="true"
             />
           </div>
-          <p className="mt-2 font-mono text-[28px] font-bold leading-none tabular-nums text-[#0F172A]">
+          <p className="mt-2 font-mono text-[26px] font-bold leading-none tabular-nums text-[#0F172A]">
             {snapshot.upcoming_events.length}
           </p>
           <p className="mt-1.5 text-[13px] text-[#475569]">
-            Citas e inyecciones programadas
+            Citas, estudios e inyecciones
           </p>
-        </div>
+        </button>
 
-        <div className="clinical-card p-4">
+        <button
+          type="button"
+          onClick={() => onNavigateTab("topics")}
+          className="clinical-card p-4 text-left hover:border-[#0E7490] transition-colors cursor-pointer"
+        >
           <div className="flex items-center justify-between">
             <span className="text-[13px] font-medium text-[#475569]">
               Temas de seguimiento
@@ -189,14 +469,53 @@ export function CommandCenterView({
               aria-hidden="true"
             />
           </div>
-          <p className="mt-2 font-mono text-[28px] font-bold leading-none tabular-nums text-[#0F172A]">
+          <p className="mt-2 font-mono text-[26px] font-bold leading-none tabular-nums text-[#0F172A]">
             {snapshot.open_topics.length}
           </p>
           <p className="mt-1.5 text-[13px] text-[#475569]">
             Casos abiertos con bitacora
           </p>
-        </div>
+        </button>
       </section>
+
+      {/* Banda de Datos Pendientes (Medicamentos diferibles como Rolet Sup) */}
+      {snapshot.incomplete_medications.length > 0 && (
+        <section
+          aria-labelledby="incomplete-meds-heading"
+          className="border border-[#FDE68A] bg-[#FFFBEB] rounded-[6px] p-4 flex flex-wrap items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-2.5">
+            <FileWarning
+              className="w-5 h-5 text-[#92400E] shrink-0 mt-0.5"
+              strokeWidth={1.75}
+              aria-hidden="true"
+            />
+            <div>
+              <h2
+                id="incomplete-meds-heading"
+                className="text-[15px] font-bold text-[#92400E]"
+              >
+                [DATOS PENDIENTES]{" "}
+                {snapshot.incomplete_medications.length} medicamento(s) requieren
+                precio, piezas por envase o inventario inicial
+              </h2>
+              <p className="text-[14px] text-[#78350F]">
+                Pendientes:{" "}
+                {snapshot.incomplete_medications.map((m) => m.name).join(", ")}.
+                Sus tomas diarias funcionan con normalidad y podras integrarlos al
+                optimizador quincenal al completar estos datos.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigateTab("inventory")}
+            className="clinical-btn px-3.5 bg-white border border-[#F59E0B] text-[#92400E] hover:bg-[#FEF3C7] text-[14px] font-bold"
+          >
+            Completar en Inventario
+          </button>
+        </section>
+      )}
 
       {/* Banda de Alerta de Restock Critico (<= 7 dias) */}
       {snapshot.low_stock_medications.length > 0 && (
@@ -250,13 +569,13 @@ export function CommandCenterView({
                         <StatusBadge label="[CRITICO]" tone="crit" />
                       </div>
                       <p className="mt-1 text-[13px] text-[#475569] font-mono tabular-nums">
-                        Stock actual: {med.current_stock} {med.presentation}(s)
-                        | Tasa diaria: {med.daily_consumption_rate}/dia
+                        Stock actual: {med.current_stock ?? 0} {med.presentation}
+                        (s) | Tasa diaria: {med.daily_consumption_rate}/dia
                       </p>
                     </div>
                     <div className="text-right shrink-0">
                       <span className="block font-mono text-[20px] font-bold tabular-nums text-[#991B1B]">
-                        {med.days_of_supply_remaining} d
+                        {med.days_of_supply_remaining ?? 0} d
                       </span>
                       <span className="text-[13px] text-[#991B1B]">
                         restantes
@@ -265,39 +584,74 @@ export function CommandCenterView({
                   </div>
 
                   {isEditing ? (
-                    <div className="flex items-end gap-2 pt-2 border-t border-[#F1F5F9]">
-                      <div className="flex-1">
-                        <label
-                          htmlFor={`cmd-restock-${med.id}`}
-                          className="block text-[13px] font-medium text-[#334155] mb-1"
-                        >
-                          Unidades a sumar ({med.presentation})
-                        </label>
-                        <input
-                          id={`cmd-restock-${med.id}`}
-                          type="number"
-                          min="1"
-                          step="1"
-                          value={restockQty}
-                          onChange={(e) => setRestockQty(e.target.value)}
-                          className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums bg-white"
-                        />
+                    <div className="space-y-2 pt-2 border-t border-[#F1F5F9]">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label
+                            htmlFor={`cmd-restock-${med.id}`}
+                            className="block text-[12px] font-medium text-[#334155] mb-1"
+                          >
+                            Unidades ({med.presentation})
+                          </label>
+                          <input
+                            id={`cmd-restock-${med.id}`}
+                            type="number"
+                            min="1"
+                            step="1"
+                            value={restockQty}
+                            onChange={(e) => setRestockQty(e.target.value)}
+                            className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] tabular-nums bg-white"
+                          />
+                        </div>
+                        <div>
+                          <label
+                            htmlFor={`cmd-cost-${med.id}`}
+                            className="block text-[12px] font-medium text-[#334155] mb-1"
+                          >
+                            Costo pagado (MXN opc.)
+                          </label>
+                          <input
+                            id={`cmd-cost-${med.id}`}
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            placeholder={
+                              med.package_price !== null
+                                ? String(med.package_price)
+                                : "0.00"
+                            }
+                            value={restockCost}
+                            onChange={(e) => setRestockCost(e.target.value)}
+                            className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] tabular-nums bg-white"
+                          />
+                        </div>
                       </div>
-                      <button
-                        type="button"
-                        disabled={busyKey === `restock:${med.id}`}
-                        onClick={() => handleRestockSubmit(med.id)}
-                        className="clinical-btn px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-medium"
-                      >
-                        Guardar
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setRestockTargetId(null)}
-                        className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
-                      >
-                        Cancelar
-                      </button>
+                      <label className="inline-flex items-center gap-2 text-[13px] text-[#334155] cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={restockLogExpense}
+                          onChange={(e) => setRestockLogExpense(e.target.checked)}
+                          className="w-4 h-4 accent-[#0E7490]"
+                        />
+                        Registrar compra en Bitacora de Gastos
+                      </label>
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setRestockTargetId(null)}
+                          className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
+                        >
+                          Cancelar
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyKey === `restock:${med.id}`}
+                          onClick={() => handleRestockSubmit(med.id)}
+                          className="clinical-btn px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-medium"
+                        >
+                          Guardar
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <div className="flex justify-end">
@@ -306,6 +660,11 @@ export function CommandCenterView({
                         onClick={() => {
                           setRestockTargetId(med.id);
                           setRestockQty(String(med.units_per_package ?? 30));
+                          setRestockCost(
+                            med.package_price !== null
+                              ? String(med.package_price)
+                              : ""
+                          );
                         }}
                         className="clinical-btn inline-flex items-center gap-2 px-3 bg-[#991B1B] hover:bg-[#7F1D1D] text-white text-[14px] font-medium"
                       >
@@ -327,12 +686,11 @@ export function CommandCenterView({
 
       {/* Cuerpo Principal: Bloques Horarios del Dia + Resumen Lateral */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Columna Izquierda (8 cols): Bloques Horarios Optimizados */}
         <section
           aria-labelledby="clusters-heading"
           className="lg:col-span-8 space-y-4"
         >
-          <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2
                 id="clusters-heading"
@@ -341,16 +699,56 @@ export function CommandCenterView({
                 Bloques Horarios de Medicacion ({snapshot.target_date})
               </h2>
               <p className="text-[14px] text-[#475569]">
-                Tomas agrupadas por tolerancia horaria y restriccion clinica
-                para adherencia del 100%.
+                Confirmar, posponer, omitir, revertir tomas (con reembolso de stock)
+                o consultar dias anteriores.
               </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => onSelectDate(yesterdayIso)}
+                className={cn(
+                  "clinical-btn px-3 text-[13px] font-medium border",
+                  snapshot.target_date === yesterdayIso
+                    ? "bg-[#0E7490] border-[#0E7490] text-white"
+                    : "bg-white border-[#CBD5E1] text-[#334155]"
+                )}
+              >
+                Ayer
+              </button>
+              <button
+                type="button"
+                onClick={() => onSelectDate(todayIso)}
+                className={cn(
+                  "clinical-btn px-3 text-[13px] font-medium border",
+                  snapshot.target_date === todayIso
+                    ? "bg-[#0E7490] border-[#0E7490] text-white"
+                    : "bg-white border-[#CBD5E1] text-[#334155]"
+                )}
+              >
+                Hoy
+              </button>
+              <label htmlFor="cmd-date-picker" className="sr-only">
+                Seleccionar fecha operativa
+              </label>
+              <input
+                id="cmd-date-picker"
+                type="date"
+                value={snapshot.target_date}
+                onChange={(e) => {
+                  if (e.target.value) onSelectDate(e.target.value);
+                }}
+                className="h-[44px] px-2.5 border border-[#CBD5E1] rounded-[6px] font-mono text-[13px] bg-white"
+              />
             </div>
           </div>
 
-          {snapshot.today_clusters.length === 0 ? (
+          {snapshot.today_clusters.length === 0 &&
+          snapshot.unclustered_today_intakes.length === 0 ? (
             <div className="clinical-card p-6 text-center text-[#475569]">
-              No hay tomas programadas para el dia de hoy. Registra un
-              medicamento en Inventario para generar bloques automaticos.
+              No hay tomas registradas para {snapshot.target_date}. Puedes
+              generar las tomas del dia desde Inventario Farmacologico.
             </div>
           ) : (
             <div className="space-y-4">
@@ -397,10 +795,19 @@ export function CommandCenterView({
                               ? "[BLOQUE CONFIRMADO]"
                               : block.block_status === "PARTIAL"
                               ? "[PARCIAL]"
+                              : block.block_status === "DELAYED"
+                              ? "[POSPUESTO]"
+                              : block.block_status === "SKIPPED"
+                              ? "[OMITIDO]"
                               : "[PENDIENTE]"
                           }
                           tone={
-                            block.block_status === "TAKEN" ? "ok" : "warn"
+                            block.block_status === "TAKEN"
+                              ? "ok"
+                              : block.block_status === "PENDING" ||
+                                block.block_status === "PARTIAL"
+                              ? "warn"
+                              : "neutral"
                           }
                         />
                       </div>
@@ -423,7 +830,6 @@ export function CommandCenterView({
                       </div>
                     </header>
 
-                    {/* Tabla de medicamentos del bloque */}
                     <div className="overflow-x-auto">
                       <table className="w-full text-left border-collapse">
                         <thead>
@@ -432,93 +838,17 @@ export function CommandCenterView({
                             <th className="py-2.5 px-3">Dosis</th>
                             <th className="py-2.5 px-3">Regla / Horario</th>
                             <th className="py-2.5 px-3">Stock Restante</th>
-                            <th className="py-2.5 px-4 text-right">Estado</th>
+                            <th className="py-2.5 px-4 text-right">
+                              Estado y Gobernanza
+                            </th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#E2E8F0]">
-                          {block.items.map((item) => (
-                            <tr
-                              key={item.intake_log_id}
-                              className="bg-white hover:bg-[#F8FAFC]"
-                            >
-                              <td className="py-3 px-4">
-                                <div className="font-bold text-[15px] text-[#0F172A]">
-                                  {item.medication_name}
-                                </div>
-                                {item.active_ingredient && (
-                                  <div className="text-[13px] text-[#475569]">
-                                    {item.active_ingredient}
-                                  </div>
-                                )}
-                              </td>
-                              <td className="py-3 px-3 font-mono text-[14px] tabular-nums text-[#0F172A]">
-                                {item.quantity_deducted} {item.presentation}
-                              </td>
-                              <td className="py-3 px-3">
-                                <div className="flex flex-col gap-1">
-                                  <span className="font-mono text-[13px] text-[#334155]">
-                                    {INTAKE_RULE_TAG[item.intake_rule]}
-                                  </span>
-                                  {item.ideal_time &&
-                                    item.effective_clustered_time && (
-                                      <span className="font-mono text-[13px] text-[#64748B] tabular-nums">
-                                        Ideal {formatShortTime(item.ideal_time)}{" "}
-                                        -&gt;{" "}
-                                        {formatShortTime(
-                                          item.effective_clustered_time
-                                        )}
-                                      </span>
-                                    )}
-                                </div>
-                              </td>
-                              <td className="py-3 px-3 font-mono text-[13px] tabular-nums">
-                                <span
-                                  className={cn(
-                                    "font-semibold",
-                                    item.days_of_supply_remaining <= 7
-                                      ? "text-[#991B1B]"
-                                      : "text-[#0F172A]"
-                                  )}
-                                >
-                                  {item.current_stock} ({item.days_of_supply_remaining}d)
-                                </span>
-                              </td>
-                              <td className="py-3 px-4 text-right">
-                                <div className="inline-flex items-center justify-end gap-2">
-                                  <StatusBadge
-                                    label={INTAKE_STATUS_TAG[item.status]}
-                                    tone={
-                                      item.status === "TAKEN"
-                                        ? "ok"
-                                        : item.status === "PENDING"
-                                        ? "warn"
-                                        : "neutral"
-                                    }
-                                  />
-                                  {item.status === "PENDING" && (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        onUpdateIntakeLog(
-                                          item.intake_log_id,
-                                          "TAKEN"
-                                        )
-                                      }
-                                      className="clinical-btn px-2.5 text-[13px] font-medium border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A]"
-                                      aria-label={`Marcar ${item.medication_name} como tomado`}
-                                    >
-                                      Tomado
-                                    </button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
+                          {block.items.map(renderIntakeRow)}
                         </tbody>
                       </table>
                     </div>
 
-                    {/* Pie de accion del bloque */}
                     <footer className="px-4 py-3 bg-[#F8FAFC] border-t border-[#E2E8F0] flex flex-wrap items-center justify-between gap-3">
                       <div className="text-[13px] font-mono text-[#475569] tabular-nums">
                         {isTaken && block.items[0]?.taken_at
@@ -527,10 +857,10 @@ export function CommandCenterView({
                             )} | Registro: ${
                               block.items[0].recorded_by ?? "Sistema"
                             }`
-                          : "Al confirmar se descuenta inventario atomicamente en PostgreSQL."}
+                          : "Al confirmar se descuenta inventario atomicamente (si el stock esta capturado)."}
                       </div>
 
-                      {!isTaken && (
+                      {block.items.some((i) => i.status === "PENDING") && (
                         <button
                           type="button"
                           disabled={isConfirming}
@@ -551,12 +881,115 @@ export function CommandCenterView({
                   </article>
                 );
               })}
+
+              {snapshot.unclustered_today_intakes.length > 0 && (
+                <article className="clinical-card overflow-hidden">
+                  <header className="px-4 py-3 border-b bg-[#F8FAFC] border-[#E2E8F0] flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Clock
+                        className="w-4 h-4 text-[#0E7490]"
+                        strokeWidth={1.75}
+                        aria-hidden="true"
+                      />
+                      <h3 className="text-[16px] font-bold text-[#0F172A]">
+                        Tomas en Horario Dedicado (Sin Bloque Compartido)
+                      </h3>
+                    </div>
+                    <StatusBadge
+                      label={`${snapshot.unclustered_today_intakes.length} TOMA(S)`}
+                      tone="info"
+                    />
+                  </header>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="border-b border-[#E2E8F0] text-[13px] font-medium text-[#475569] bg-white">
+                          <th className="py-2.5 px-4">Medicamento</th>
+                          <th className="py-2.5 px-3">Dosis</th>
+                          <th className="py-2.5 px-3">Regla / Horario</th>
+                          <th className="py-2.5 px-3">Stock Restante</th>
+                          <th className="py-2.5 px-4 text-right">
+                            Estado y Gobernanza
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#E2E8F0]">
+                        {snapshot.unclustered_today_intakes.map(renderIntakeRow)}
+                      </tbody>
+                    </table>
+                  </div>
+                </article>
+              )}
             </div>
           )}
         </section>
 
-        {/* Columna Derecha (4 cols): Agenda Proxima + Casos Urgentes */}
+        {/* Columna Derecha (4 cols): Proxima Quincena + Agenda + Temas */}
         <aside className="lg:col-span-4 space-y-4">
+          {nextBucket && (
+            <div className="clinical-card p-4 space-y-3 border-[#A5F3FC]">
+              <div className="flex items-center justify-between border-b border-[#E2E8F0] pb-2.5">
+                <h2 className="text-[16px] font-bold text-[#0F172A]">
+                  Proxima Quincena de Compras
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => onNavigateTab("finances")}
+                  className="text-[13px] font-medium text-[#0E7490] hover:underline"
+                >
+                  Plan Quincenal
+                </button>
+              </div>
+              <div className="flex items-baseline justify-between">
+                <div>
+                  <p className="text-[14px] font-bold text-[#0F172A]">
+                    {nextBucket.label}
+                  </p>
+                  <p className="font-mono text-[12px] text-[#64748B]">
+                    Ventana: {nextBucket.pay_date} a {nextBucket.period_end}
+                  </p>
+                </div>
+                <span className="font-mono text-[20px] font-bold text-[#0E7490] tabular-nums">
+                  {formatCurrencyMxn(nextBucket.total_cost)}
+                </span>
+              </div>
+              {nextBucket.purchases.length === 0 && nextBucket.events.length === 0 ? (
+                <p className="text-[13px] text-[#475569]">
+                  Sin compras ni consultas programadas en esta quincena.
+                </p>
+              ) : (
+                <ul className="space-y-1.5 text-[13px]">
+                  {nextBucket.purchases.map((p) => (
+                    <li
+                      key={p.plan_item_id}
+                      className="flex items-center justify-between gap-2 py-1 border-b border-[#F1F5F9]"
+                    >
+                      <span className="text-[#0F172A] truncate">
+                        {p.medication_name} ({p.packages}x)
+                      </span>
+                      <span className="font-mono font-semibold text-[#0F172A] tabular-nums shrink-0">
+                        {formatCurrencyMxn(p.total_cost)}
+                      </span>
+                    </li>
+                  ))}
+                  {nextBucket.events.map((ev) => (
+                    <li
+                      key={ev.event_id}
+                      className="flex items-center justify-between gap-2 py-1 border-b border-[#F1F5F9]"
+                    >
+                      <span className="text-[#164E63] truncate">
+                        [EVENTO] {ev.title}
+                      </span>
+                      <span className="font-mono font-semibold text-[#164E63] tabular-nums shrink-0">
+                        {formatCurrencyMxn(ev.estimated_cost)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
           <div className="clinical-card p-4 space-y-3">
             <div className="flex items-center justify-between border-b border-[#E2E8F0] pb-2.5">
               <h2 className="text-[16px] font-bold text-[#0F172A]">
@@ -598,12 +1031,17 @@ export function CommandCenterView({
                       <p className="mt-1.5 font-bold text-[14px] text-[#0F172A]">
                         {evt.title}
                       </p>
-                      <p className="mt-0.5 font-mono text-[13px] text-[#475569] tabular-nums">
-                        {formatDateTimeEs(evt.event_datetime)}
-                      </p>
+                      <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[13px] text-[#475569] tabular-nums">
+                        <span>{formatDateTimeEs(evt.event_datetime)}</span>
+                        {evt.estimated_cost !== null && evt.estimated_cost > 0 && (
+                          <span className="font-semibold text-[#0F172A]">
+                            {formatCurrencyMxn(evt.estimated_cost)}
+                          </span>
+                        )}
+                      </div>
                       {evt.is_recurring && (
-                        <p className="mt-1 font-mono text-[13px] text-[#0E7490]">
-                          [CICLO CADA {evt.recurrence_interval_days} DIAS]
+                        <p className="mt-1 font-mono text-[12px] text-[#0E7490]">
+                          [CICLO {evt.periodicity_label ?? `CADA ${evt.recurrence_interval_days} DIAS`}]
                         </p>
                       )}
                     </li>

@@ -1,12 +1,20 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { ClipboardPlus, MessageSquarePlus } from "lucide-react";
+import {
+  CalendarCheck2,
+  ClipboardPlus,
+  Edit3,
+  MessageSquarePlus,
+  Trash2,
+} from "lucide-react";
 import type {
   CommandCenterSnapshot,
+  EventCategory,
   FollowUpTopicItem,
   NoteType,
   TaskStatus,
+  TopicAnnotation,
 } from "@/lib/types/clinical";
 import {
   NOTE_TYPE_TAG,
@@ -24,16 +32,21 @@ interface FollowUpTopicsViewProps {
     description: string;
     priority: number;
     deadline_at: string;
+    estimated_budget: number | null;
   }) => Promise<void>;
   onUpdateTopic: (
     topicId: string,
     updates: {
+      title?: string;
       status?: TaskStatus;
       priority?: number;
       progress_percentage?: number;
       deadline_at?: string;
+      description?: string | null;
+      estimated_budget?: number | null;
     }
   ) => Promise<void>;
+  onDeleteTopic: (topicId: string) => Promise<void>;
   onAddAnnotation: (payload: {
     topic_id: string;
     author: string;
@@ -43,26 +56,60 @@ interface FollowUpTopicsViewProps {
     estimated_cost: number | null;
     content: string;
   }) => Promise<void>;
+  onUpdateAnnotation: (
+    annotationId: string,
+    payload: {
+      author: string;
+      note_type: NoteType;
+      contact_name: string;
+      contact_phone: string;
+      estimated_cost: number | null;
+      content: string;
+    }
+  ) => Promise<void>;
+  onDeleteAnnotation: (annotationId: string) => Promise<void>;
+  onConvertToEvent: (payload: {
+    topic_id: string;
+    title: string;
+    category: EventCategory;
+    specialist_or_center: string | null;
+    location_address: string | null;
+    event_datetime: string;
+    estimated_cost: number | null;
+    preparation_instructions: string | null;
+    mark_topic_completed: boolean;
+  }) => Promise<void>;
 }
 
 export function FollowUpTopicsView({
   snapshot,
   onCreateTopic,
   onUpdateTopic,
+  onDeleteTopic,
   onAddAnnotation,
+  onUpdateAnnotation,
+  onDeleteAnnotation,
+  onConvertToEvent,
 }: FollowUpTopicsViewProps) {
+  // Crear / Editar tema
   const [showTopicForm, setShowTopicForm] = useState(false);
+  const [editingTopicId, setEditingTopicId] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("1");
+  const [estimatedBudget, setEstimatedBudget] = useState("");
   const [deadlineAt, setDeadlineAt] = useState(() => {
     const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     return d.toISOString().slice(0, 16);
   });
   const [topicError, setTopicError] = useState<string | null>(null);
-  const [creatingTopic, setCreatingTopic] = useState(false);
+  const [savingTopic, setSavingTopic] = useState(false);
 
+  // Anotaciones (Crear / Editar)
   const [activeNoteTopicId, setActiveNoteTopicId] = useState<string | null>(
+    null
+  );
+  const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(
     null
   );
   const [author, setAuthor] = useState("Cuidador Principal");
@@ -73,34 +120,118 @@ export function FollowUpTopicsView({
   const [noteContent, setNoteContent] = useState("");
   const [savingNote, setSavingNote] = useState(false);
 
-  async function handleCreateTopic(e: FormEvent) {
+  // Convertir tema en evento clinico
+  const [convertingTopicId, setConvertingTopicId] = useState<string | null>(
+    null
+  );
+  const [evtTitle, setEvtTitle] = useState("");
+  const [evtCategory, setEvtCategory] = useState<EventCategory>("APPOINTMENT");
+  const [evtSpecialist, setEvtSpecialist] = useState("");
+  const [evtDatetime, setEvtDatetime] = useState(() => {
+    const d = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+    return d.toISOString().slice(0, 16);
+  });
+  const [evtCost, setEvtCost] = useState("");
+  const [evtMarkDone, setEvtMarkDone] = useState(true);
+  const [convertingBusy, setConvertingBusy] = useState(false);
+
+  // Confirmaciones de borrado
+  const [confirmDeleteTopicId, setConfirmDeleteTopicId] = useState<
+    string | null
+  >(null);
+  const [confirmDeleteAnnId, setConfirmDeleteAnnId] = useState<string | null>(
+    null
+  );
+
+  function resetTopicForm() {
+    setEditingTopicId(null);
+    setTitle("");
+    setDescription("");
+    setPriority("1");
+    setEstimatedBudget("");
+    const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    setDeadlineAt(d.toISOString().slice(0, 16));
+    setTopicError(null);
+  }
+
+  function startEditTopic(topic: FollowUpTopicItem) {
+    setEditingTopicId(topic.id);
+    setTitle(topic.title);
+    setDescription(topic.description ?? "");
+    setPriority(String(topic.priority));
+    setEstimatedBudget(
+      topic.estimated_budget !== null ? String(topic.estimated_budget) : ""
+    );
+    setDeadlineAt(new Date(topic.deadline_at).toISOString().slice(0, 16));
+    setTopicError(null);
+    setShowTopicForm(true);
+  }
+
+  async function handleSaveTopic(e: FormEvent) {
     e.preventDefault();
     setTopicError(null);
     if (!title.trim()) {
       setTopicError("Escribe el titulo del tema de seguimiento.");
       return;
     }
-    setCreatingTopic(true);
+    const parsedBudget =
+      estimatedBudget.trim() !== "" && Number.isFinite(Number(estimatedBudget))
+        ? Number(estimatedBudget)
+        : null;
+
+    setSavingTopic(true);
     try {
-      await onCreateTopic({
-        title: title.trim(),
-        description: description.trim(),
-        priority: Number(priority),
-        deadline_at: new Date(deadlineAt).toISOString(),
-      });
-      setTitle("");
-      setDescription("");
+      if (editingTopicId) {
+        await onUpdateTopic(editingTopicId, {
+          title: title.trim(),
+          description: description.trim() || null,
+          priority: Number(priority),
+          deadline_at: new Date(deadlineAt).toISOString(),
+          estimated_budget: parsedBudget,
+        });
+      } else {
+        await onCreateTopic({
+          title: title.trim(),
+          description: description.trim(),
+          priority: Number(priority),
+          deadline_at: new Date(deadlineAt).toISOString(),
+          estimated_budget: parsedBudget,
+        });
+      }
+      resetTopicForm();
       setShowTopicForm(false);
     } catch (err) {
       setTopicError(
-        err instanceof Error ? err.message : "Error al crear tema."
+        err instanceof Error ? err.message : "Error al guardar tema."
       );
     } finally {
-      setCreatingTopic(false);
+      setSavingTopic(false);
     }
   }
 
-  async function handleAddAnnotation(e: FormEvent, topicId: string) {
+  function startEditAnnotation(topicId: string, ann: TopicAnnotation) {
+    setActiveNoteTopicId(topicId);
+    setEditingAnnotationId(ann.id);
+    setAuthor(ann.author ?? "Cuidador Principal");
+    setNoteType(ann.note_type);
+    setContactName(ann.contact_name ?? "");
+    setContactPhone(ann.contact_phone ?? "");
+    setEstimatedCost(
+      ann.estimated_cost !== null ? String(ann.estimated_cost) : ""
+    );
+    setNoteContent(ann.content);
+  }
+
+  function resetAnnotationForm() {
+    setEditingAnnotationId(null);
+    setContactName("");
+    setContactPhone("");
+    setEstimatedCost("");
+    setNoteContent("");
+    setActiveNoteTopicId(null);
+  }
+
+  async function handleSaveAnnotation(e: FormEvent, topicId: string) {
     e.preventDefault();
     if (!noteContent.trim()) return;
     setSavingNote(true);
@@ -109,27 +240,72 @@ export function FollowUpTopicsView({
         estimatedCost.trim() !== "" && Number.isFinite(Number(estimatedCost))
           ? Number(estimatedCost)
           : null;
-      await onAddAnnotation({
-        topic_id: topicId,
-        author: author.trim() || "Cuidador",
-        note_type: noteType,
-        contact_name: contactName.trim(),
-        contact_phone: contactPhone.trim(),
-        estimated_cost: parsedCost,
-        content: noteContent.trim(),
-      });
-      setContactName("");
-      setContactPhone("");
-      setEstimatedCost("");
-      setNoteContent("");
-      setActiveNoteTopicId(null);
+      if (editingAnnotationId) {
+        await onUpdateAnnotation(editingAnnotationId, {
+          author: author.trim() || "Cuidador",
+          note_type: noteType,
+          contact_name: contactName.trim(),
+          contact_phone: contactPhone.trim(),
+          estimated_cost: parsedCost,
+          content: noteContent.trim(),
+        });
+      } else {
+        await onAddAnnotation({
+          topic_id: topicId,
+          author: author.trim() || "Cuidador",
+          note_type: noteType,
+          contact_name: contactName.trim(),
+          contact_phone: contactPhone.trim(),
+          estimated_cost: parsedCost,
+          content: noteContent.trim(),
+        });
+      }
+      resetAnnotationForm();
     } finally {
       setSavingNote(false);
     }
   }
 
+  function startConvertToEvent(topic: FollowUpTopicItem) {
+    setConvertingTopicId(topic.id);
+    setEvtTitle(topic.title.replace(/^Valorar\s+/i, ""));
+    setEvtCategory("APPOINTMENT");
+    setEvtSpecialist("");
+    setEvtCost(
+      topic.estimated_budget !== null ? String(topic.estimated_budget) : ""
+    );
+    setEvtMarkDone(true);
+  }
+
+  async function handleConvertSubmit(e: FormEvent, topic: FollowUpTopicItem) {
+    e.preventDefault();
+    if (!evtTitle.trim()) return;
+    setConvertingBusy(true);
+    try {
+      const parsedCost =
+        evtCost.trim() !== "" && Number.isFinite(Number(evtCost))
+          ? Number(evtCost)
+          : null;
+      await onConvertToEvent({
+        topic_id: topic.id,
+        title: evtTitle.trim(),
+        category: evtCategory,
+        specialist_or_center: evtSpecialist.trim() || null,
+        location_address: null,
+        event_datetime: new Date(evtDatetime).toISOString(),
+        estimated_cost: parsedCost,
+        preparation_instructions: topic.description,
+        mark_topic_completed: evtMarkDone,
+      });
+      setConvertingTopicId(null);
+    } finally {
+      setConvertingBusy(false);
+    }
+  }
+
   function renderTopicCard(topic: FollowUpTopicItem) {
     const isAddingNote = activeNoteTopicId === topic.id;
+    const isConverting = convertingTopicId === topic.id;
     return (
       <article key={topic.id} className="clinical-card p-5 space-y-4">
         <header className="flex flex-wrap items-start justify-between gap-3 border-b border-[#E2E8F0] pb-3">
@@ -149,6 +325,14 @@ export function FollowUpTopicsView({
                 label={TASK_STATUS_TAG[topic.status]}
                 tone={topic.status === "COMPLETED" ? "ok" : "info"}
               />
+              {topic.estimated_budget !== null && (
+                <StatusBadge
+                  label={`PRESUPUESTO: ${formatCurrencyMxn(
+                    topic.estimated_budget
+                  )}`}
+                  tone="ok"
+                />
+              )}
             </div>
             <h3 className="text-[18px] font-bold text-[#0F172A]">
               {topic.title}
@@ -199,7 +383,7 @@ export function FollowUpTopicsView({
               }
               className="h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] bg-white tabular-nums"
             >
-              {[0, 20, 40, 45, 50, 60, 65, 80, 100].map((pct) => (
+              {[0, 10, 20, 25, 40, 50, 60, 75, 80, 90, 100].map((pct) => (
                 <option key={pct} value={pct}>
                   Progreso {pct}%
                 </option>
@@ -208,10 +392,43 @@ export function FollowUpTopicsView({
 
             <button
               type="button"
+              onClick={() => startEditTopic(topic)}
+              className="clinical-btn inline-flex items-center gap-1 px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px] font-medium"
+            >
+              <Edit3 className="w-3.5 h-3.5" strokeWidth={1.75} aria-hidden="true" />
+              Editar
+            </button>
+
+            <button
+              type="button"
               onClick={() =>
-                setActiveNoteTopicId(isAddingNote ? null : topic.id)
+                isConverting
+                  ? setConvertingTopicId(null)
+                  : startConvertToEvent(topic)
               }
-              className="clinical-btn inline-flex items-center gap-1.5 px-3.5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
+              className="clinical-btn inline-flex items-center gap-1 px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0E7490] text-[13px] font-medium"
+              title="Convertir tema en una cita o estudio en Agenda Clinica"
+            >
+              <CalendarCheck2
+                className="w-3.5 h-3.5"
+                strokeWidth={1.75}
+                aria-hidden="true"
+              />
+              Agendar Cita
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (isAddingNote) {
+                  resetAnnotationForm();
+                } else {
+                  setEditingAnnotationId(null);
+                  setNoteContent("");
+                  setActiveNoteTopicId(topic.id);
+                }
+              }}
+              className="clinical-btn inline-flex items-center gap-1.5 px-3.5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[13px] font-bold"
             >
               <MessageSquarePlus
                 className="w-4 h-4"
@@ -220,6 +437,41 @@ export function FollowUpTopicsView({
               />
               {isAddingNote ? "Cerrar Nota" : "Agregar Anotacion"}
             </button>
+
+            {confirmDeleteTopicId === topic.id ? (
+              <>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await onDeleteTopic(topic.id);
+                    setConfirmDeleteTopicId(null);
+                  }}
+                  className="clinical-btn px-3 bg-[#991B1B] text-white text-[13px] font-bold"
+                >
+                  Confirmar Borrar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteTopicId(null)}
+                  className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white text-[13px]"
+                >
+                  No
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteTopicId(topic.id)}
+                className="clinical-btn px-2.5 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
+                aria-label={`Eliminar tema ${topic.title}`}
+              >
+                <Trash2
+                  className="w-4 h-4"
+                  strokeWidth={1.75}
+                  aria-hidden="true"
+                />
+              </button>
+            )}
           </div>
         </header>
 
@@ -245,14 +497,122 @@ export function FollowUpTopicsView({
           <CascadeTimeline alerts={topic.cascade_alerts} />
         </div>
 
-        {/* Formulario inline de anotacion */}
+        {/* Convertir tema en evento clinico */}
+        {isConverting && (
+          <form
+            onSubmit={(e) => handleConvertSubmit(e, topic)}
+            className="p-4 bg-[#ECFEFF] border border-[#A5F3FC] rounded-[6px] space-y-3"
+          >
+            <h4 className="text-[15px] font-bold text-[#164E63]">
+              Agendar en Agenda Clinica desde este Tema
+            </h4>
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+              <div className="sm:col-span-2">
+                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
+                  Titulo de la cita / estudio *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={evtTitle}
+                  onChange={(e) => setEvtTitle(e.target.value)}
+                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
+                />
+              </div>
+              <div>
+                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
+                  Categoria
+                </label>
+                <select
+                  value={evtCategory}
+                  onChange={(e) =>
+                    setEvtCategory(e.target.value as EventCategory)
+                  }
+                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
+                >
+                  <option value="APPOINTMENT">Cita Medica</option>
+                  <option value="LAB_TEST">Estudio / Lab</option>
+                  <option value="PROCEDURE">Procedimiento</option>
+                  <option value="OTHER">Otro</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
+                  Costo estimado MXN
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={evtCost}
+                  onChange={(e) => setEvtCost(e.target.value)}
+                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[14px]"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
+                  Fecha y hora
+                </label>
+                <input
+                  type="datetime-local"
+                  required
+                  value={evtDatetime}
+                  onChange={(e) => setEvtDatetime(e.target.value)}
+                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white font-mono text-[14px]"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block text-[12px] font-medium text-[#0F172A] mb-1">
+                  Especialista o centro
+                </label>
+                <input
+                  type="text"
+                  value={evtSpecialist}
+                  onChange={(e) => setEvtSpecialist(e.target.value)}
+                  className="w-full h-[42px] px-2.5 border border-[#CBD5E1] rounded-[6px] bg-white text-[14px]"
+                />
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="inline-flex items-center gap-2 text-[13px] text-[#164E63] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={evtMarkDone}
+                  onChange={(e) => setEvtMarkDone(e.target.checked)}
+                  className="w-4 h-4 accent-[#0E7490]"
+                />
+                Marcar tema de seguimiento como COMPLETADO al agendar
+              </label>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConvertingTopicId(null)}
+                  className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={convertingBusy}
+                  className="clinical-btn px-4 bg-[#0E7490] text-white text-[13px] font-bold"
+                >
+                  {convertingBusy ? "Agendando..." : "Crear Evento en Agenda"}
+                </button>
+              </div>
+            </div>
+          </form>
+        )}
+
+        {/* Formulario inline de anotacion (crear / editar) */}
         {isAddingNote && (
           <form
-            onSubmit={(e) => handleAddAnnotation(e, topic.id)}
+            onSubmit={(e) => handleSaveAnnotation(e, topic.id)}
             className="p-4 bg-[#F8FAFC] border border-[#A5F3FC] rounded-[6px] space-y-3"
           >
             <h4 className="text-[15px] font-bold text-[#0F172A]">
-              Registrar Propuesta, Contacto o Cotizacion en Bitacora
+              {editingAnnotationId
+                ? "Editar Anotacion en Bitacora"
+                : "Registrar Propuesta, Contacto o Cotizacion en Bitacora"}
             </h4>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               <div>
@@ -366,7 +726,7 @@ export function FollowUpTopicsView({
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setActiveNoteTopicId(null)}
+                onClick={resetAnnotationForm}
                 className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
               >
                 Cancelar
@@ -376,7 +736,11 @@ export function FollowUpTopicsView({
                 disabled={savingNote}
                 className="clinical-btn px-4 bg-[#0E7490] text-white text-[14px] font-bold"
               >
-                {savingNote ? "Guardando..." : "Guardar en Bitacora"}
+                {savingNote
+                  ? "Guardando..."
+                  : editingAnnotationId
+                  ? "Actualizar Anotacion"
+                  : "Guardar en Bitacora"}
               </button>
             </div>
           </form>
@@ -412,7 +776,7 @@ export function FollowUpTopicsView({
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-3 font-mono text-[13px] tabular-nums">
+                    <div className="flex flex-wrap items-center gap-2 font-mono text-[13px] tabular-nums">
                       {ann.estimated_cost !== null && (
                         <span className="font-bold text-[#0F172A]">
                           Costo: {formatCurrencyMxn(ann.estimated_cost)}
@@ -421,6 +785,42 @@ export function FollowUpTopicsView({
                       <span className="text-[#64748B]">
                         {formatDateTimeEs(ann.created_at)}
                       </span>
+                      <button
+                        type="button"
+                        onClick={() => startEditAnnotation(topic.id, ann)}
+                        className="px-2 py-1 border border-[#CBD5E1] bg-white rounded-[4px] text-[12px] font-sans"
+                      >
+                        Editar
+                      </button>
+                      {confirmDeleteAnnId === ann.id ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await onDeleteAnnotation(ann.id);
+                              setConfirmDeleteAnnId(null);
+                            }}
+                            className="px-2 py-1 bg-[#991B1B] text-white rounded-[4px] text-[12px] font-sans font-bold"
+                          >
+                            Confirmar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteAnnId(null)}
+                            className="px-2 py-1 border border-[#CBD5E1] bg-white rounded-[4px] text-[12px] font-sans"
+                          >
+                            No
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteAnnId(ann.id)}
+                          className="px-2 py-1 border border-[#FECACA] bg-white text-[#991B1B] rounded-[4px] text-[12px] font-sans"
+                        >
+                          Borrar
+                        </button>
+                      )}
                     </div>
                   </div>
                   <p className="text-[14px] text-[#1E293B]">{ann.content}</p>
@@ -443,17 +843,24 @@ export function FollowUpTopicsView({
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-[20px] font-bold text-[#0F172A]">
-            Gestor de Temas de Seguimiento y Bitacora
+            Gestor de Temas de Seguimiento y Valoraciones
           </h2>
           <p className="text-[14px] text-[#475569]">
-            Gestion de casos abiertos con fecha limite, alertas en cascada y
-            registro de propuestas, telefonos y costos.
+            Casos abiertos, cotizaciones, contactos, conversion a cita medica y
+            gobernanza completa de bitacora.
           </p>
         </div>
 
         <button
           type="button"
-          onClick={() => setShowTopicForm((v) => !v)}
+          onClick={() => {
+            if (showTopicForm && !editingTopicId) {
+              setShowTopicForm(false);
+            } else {
+              resetTopicForm();
+              setShowTopicForm(true);
+            }
+          }}
           className="clinical-btn inline-flex items-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
         >
           <ClipboardPlus
@@ -467,11 +874,13 @@ export function FollowUpTopicsView({
 
       {showTopicForm && (
         <form
-          onSubmit={handleCreateTopic}
+          onSubmit={handleSaveTopic}
           className="clinical-card p-5 space-y-4 border-[#A5F3FC]"
         >
           <h3 className="text-[16px] font-bold text-[#0F172A]">
-            Crear Caso o Pendiente Medico-Administrativo
+            {editingTopicId
+              ? `Editar Tema: ${title}`
+              : "Crear Caso o Pendiente Medico-Administrativo"}
           </h3>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="md:col-span-2">
@@ -479,16 +888,16 @@ export function FollowUpTopicsView({
                 htmlFor="topic-title"
                 className="block text-[14px] font-medium text-[#0F172A] mb-1"
               >
-                Titulo del tema
+                Titulo del tema *
               </label>
               <input
                 id="topic-title"
                 type="text"
                 required
-                placeholder="Ej. Encontrar Terapeuta / Tramitar Reembolso"
+                placeholder="Ej. Valorar Consulta Psiquiatria CDMX"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[16px]"
+                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
               />
             </div>
 
@@ -503,7 +912,7 @@ export function FollowUpTopicsView({
                 id="topic-priority"
                 value={priority}
                 onChange={(e) => setPriority(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[16px] bg-white"
+                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px] bg-white"
               >
                 <option value="1">1 - Critica</option>
                 <option value="2">2 - Alta</option>
@@ -516,7 +925,7 @@ export function FollowUpTopicsView({
                 htmlFor="topic-deadline"
                 className="block text-[14px] font-medium text-[#0F172A] mb-1"
               >
-                Fecha limite (genera alertas -7d/-3d/-1d/0d)
+                Fecha limite (alertas -7d/-3d/-1d/0d)
               </label>
               <input
                 id="topic-deadline"
@@ -524,11 +933,30 @@ export function FollowUpTopicsView({
                 required
                 value={deadlineAt}
                 onChange={(e) => setDeadlineAt(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px] tabular-nums"
+                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[14px] tabular-nums"
               />
             </div>
 
-            <div className="md:col-span-2">
+            <div>
+              <label
+                htmlFor="topic-budget"
+                className="block text-[14px] font-medium text-[#0F172A] mb-1"
+              >
+                Presupuesto de referencia (MXN opc.)
+              </label>
+              <input
+                id="topic-budget"
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="Ej. 3000"
+                value={estimatedBudget}
+                onChange={(e) => setEstimatedBudget(e.target.value)}
+                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] font-mono text-[15px]"
+              />
+            </div>
+
+            <div>
               <label
                 htmlFor="topic-desc"
                 className="block text-[14px] font-medium text-[#0F172A] mb-1"
@@ -538,10 +966,10 @@ export function FollowUpTopicsView({
               <input
                 id="topic-desc"
                 type="text"
-                placeholder="Requisitos clinicos, cobertura o documentos necesarios"
+                placeholder="Requisitos, ubicacion o documentos"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[16px]"
+                className="w-full h-[46px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
               />
             </div>
           </div>
@@ -555,17 +983,24 @@ export function FollowUpTopicsView({
           <div className="flex justify-end gap-3">
             <button
               type="button"
-              onClick={() => setShowTopicForm(false)}
+              onClick={() => {
+                setShowTopicForm(false);
+                resetTopicForm();
+              }}
               className="clinical-btn px-4 border border-[#CBD5E1] bg-white text-[#334155] text-[14px]"
             >
               Cancelar
             </button>
             <button
               type="submit"
-              disabled={creatingTopic}
+              disabled={savingTopic}
               className="clinical-btn px-5 bg-[#0E7490] text-white text-[15px] font-bold"
             >
-              {creatingTopic ? "Creando..." : "Crear Tema y Programar Alertas"}
+              {savingTopic
+                ? "Guardando..."
+                : editingTopicId
+                ? "Guardar Cambios"
+                : "Crear Tema y Programar Alertas"}
             </button>
           </div>
         </form>

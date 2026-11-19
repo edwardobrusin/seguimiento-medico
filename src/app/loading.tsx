@@ -18,11 +18,13 @@ export default function ClinicalLoadingSkeleton() {
           <div className="h-[44px] w-28 bg-[#1E293B] rounded-[6px]" />
         </div>
         <div className="bg-white border-b border-[#E2E8F0]">
-          <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-10 h-[48px] flex items-center gap-6">
+          <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-10 h-[48px] flex items-center gap-5 overflow-hidden">
             <div className="h-4 w-28 bg-[#E2E8F0] rounded-[4px]" />
+            <div className="h-4 w-24 bg-[#F1F5F9] rounded-[4px]" />
             <div className="h-4 w-36 bg-[#F1F5F9] rounded-[4px]" />
             <div className="h-4 w-28 bg-[#F1F5F9] rounded-[4px]" />
-            <div className="h-4 w-36 bg-[#F1F5F9] rounded-[4px]" />
+            <div className="h-4 w-24 bg-[#F1F5F9] rounded-[4px]" />
+            <div className="h-4 w-24 bg-[#F1F5F9] rounded-[4px]" />
             <div className="h-4 w-24 bg-[#F1F5F9] rounded-[4px]" />
           </div>
         </div>
@@ -30,12 +32,12 @@ export default function ClinicalLoadingSkeleton() {
 
       {/* Skeleton cuerpo principal sin desplazamiento de layout (Zero CLS) */}
       <main className="flex-1 max-w-[1360px] w-full mx-auto px-4 sm:px-6 lg:px-10 py-6 space-y-6">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {[0, 1, 2, 3].map((idx) => (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          {[0, 1, 2, 3, 4].map((idx) => (
             <div key={idx} className="clinical-card p-4 space-y-3">
-              <div className="h-3.5 w-32 bg-[#E2E8F0] rounded-[4px]" />
+              <div className="h-3.5 w-28 bg-[#E2E8F0] rounded-[4px]" />
               <div className="h-7 w-16 bg-[#CBD5E1] rounded-[4px]" />
-              <div className="h-3 w-40 bg-[#F1F5F9] rounded-[4px]" />
+              <div className="h-3 w-36 bg-[#F1F5F9] rounded-[4px]" />
             </div>
           ))}
         </div>

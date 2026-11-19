@@ -2,12 +2,16 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import {
+  Ban,
   CheckCircle2,
+  Edit3,
   Link2,
   Play,
+  RotateCcw,
   Send,
   ShieldCheck,
   Terminal,
+  Trash2,
   UserPlus,
 } from "lucide-react";
 import type {
@@ -22,6 +26,7 @@ import { StatusBadge } from "./StatusBadge";
 interface TelegramConfigViewProps {
   snapshot: CommandCenterSnapshot;
   onSaveRecipient: (payload: {
+    recipient_id?: string;
     full_name: string;
     role: string;
     telegram_chat_id: string;
@@ -30,6 +35,7 @@ interface TelegramConfigViewProps {
     receive_event_reminders: boolean;
     receive_topic_reminders: boolean;
   }) => Promise<void>;
+  onDeleteRecipient: (recipientId: string) => Promise<void>;
   onToggleRecipientPermission: (
     recipientId: string,
     field:
@@ -40,6 +46,10 @@ interface TelegramConfigViewProps {
       | "is_active",
     value: boolean
   ) => Promise<void>;
+  onRetryNotification: (notifId: string) => Promise<void>;
+  onCancelNotification: (notifId: string) => Promise<void>;
+  onDeleteNotification: (notifId: string) => Promise<void>;
+  onPurgeAcknowledged: () => Promise<{ purgedCount: number }>;
   onDispatchQueue: () => Promise<{ dispatched: number; mode: string }>;
   onSimulateWebhook: (payload: {
     type: "callback" | "command";
@@ -65,16 +75,31 @@ interface TelegramConfigViewProps {
 export function TelegramConfigView({
   snapshot,
   onSaveRecipient,
+  onDeleteRecipient,
   onToggleRecipientPermission,
+  onRetryNotification,
+  onCancelNotification,
+  onDeleteNotification,
+  onPurgeAcknowledged,
   onDispatchQueue,
   onSimulateWebhook,
   onTestConnection,
   onRegisterVercelWebhook,
 }: TelegramConfigViewProps) {
+  const [editingRecipientId, setEditingRecipientId] = useState<string | null>(
+    null
+  );
   const [fullName, setFullName] = useState("");
   const [role, setRole] = useState("CAREGIVER");
   const [chatId, setChatId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [confirmDeleteRecId, setConfirmDeleteRecId] = useState<string | null>(
+    null
+  );
+  const [confirmDeleteNotifId, setConfirmDeleteNotifId] = useState<
+    string | null
+  >(null);
+
   const [actionLog, setActionLog] = useState<string | null>(null);
   const [statusReportHtml, setStatusReportHtml] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -88,12 +113,27 @@ export function TelegramConfigView({
     }
   }, []);
 
-  async function handleAddRecipient(e: FormEvent) {
+  function startEditRecipient(rec: TelegramRecipient) {
+    setEditingRecipientId(rec.id);
+    setFullName(rec.full_name);
+    setRole(rec.role);
+    setChatId(rec.telegram_chat_id);
+  }
+
+  function resetRecipientForm() {
+    setEditingRecipientId(null);
+    setFullName("");
+    setRole("CAREGIVER");
+    setChatId("");
+  }
+
+  async function handleSaveRecipientSubmit(e: FormEvent) {
     e.preventDefault();
     if (!fullName.trim() || !chatId.trim()) return;
     setSaving(true);
     try {
       await onSaveRecipient({
+        recipient_id: editingRecipientId ?? undefined,
         full_name: fullName.trim(),
         role,
         telegram_chat_id: chatId.trim(),
@@ -102,9 +142,12 @@ export function TelegramConfigView({
         receive_event_reminders: true,
         receive_topic_reminders: true,
       });
-      setFullName("");
-      setChatId("");
-      setActionLog("[OK] Destinatario registrado en telegram_recipients.");
+      setActionLog(
+        editingRecipientId
+          ? "[OK] Destinatario de Telegram actualizado."
+          : "[OK] Destinatario registrado en telegram_recipients."
+      );
+      resetRecipientForm();
     } finally {
       setSaving(false);
     }
@@ -169,7 +212,10 @@ export function TelegramConfigView({
     }
   }
 
-  async function handleSimulateCallback(notif: NotificationQueueItem, action: "ack" | "snooze") {
+  async function handleSimulateCallback(
+    notif: NotificationQueueItem,
+    action: "ack" | "snooze"
+  ) {
     setBusyAction(`${action}:${notif.id}`);
     try {
       const firstChatId =
@@ -231,8 +277,8 @@ export function TelegramConfigView({
             Configuracion Bidireccional de Telegram Bot
           </h2>
           <p className="text-[14px] text-[#475569]">
-            Destinatarios autorizados, matriz de alertas sin emojis, despachador
-            transaccional y webhook interactivo.
+            Destinatarios editables, matriz de alertas sin emojis, despachador
+            transaccional, webhook y gobernanza de cola.
           </p>
         </div>
 
@@ -303,7 +349,9 @@ export function TelegramConfigView({
                   chat_id: firstChatId,
                 });
                 if (res.statusHtml) setStatusReportHtml(res.statusHtml);
-                setActionLog("[MENU PACIENTE] Simulado boton [ Registrar Restock ].");
+                setActionLog(
+                  "[MENU PACIENTE] Simulado boton [ Registrar Restock ]."
+                );
               } finally {
                 setBusyAction(null);
               }
@@ -325,7 +373,7 @@ export function TelegramConfigView({
         </div>
       </div>
 
-      {/* Estado de credenciales y log */}
+      {/* Estado de credenciales */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="clinical-card p-4 flex items-center justify-between gap-3">
           <div>
@@ -357,7 +405,7 @@ export function TelegramConfigView({
         </div>
       </div>
 
-      {/* Vinculacion de Webhook con Vercel + Configuracion de Cron Externo Hobby */}
+      {/* Vinculacion de Webhook + Cron Hobby */}
       <section
         aria-labelledby="vercel-integration-heading"
         className="grid grid-cols-1 lg:grid-cols-2 gap-4"
@@ -462,7 +510,7 @@ export function TelegramConfigView({
         </div>
       )}
 
-      {/* Matriz de Destinatarios */}
+      {/* Matriz de Destinatarios CRUD */}
       <section aria-labelledby="recipients-heading" className="space-y-4">
         <h3
           id="recipients-heading"
@@ -472,7 +520,7 @@ export function TelegramConfigView({
         </h3>
 
         <form
-          onSubmit={handleAddRecipient}
+          onSubmit={handleSaveRecipientSubmit}
           className="clinical-card p-4 grid grid-cols-1 sm:grid-cols-4 gap-3 items-end"
         >
           <div>
@@ -486,7 +534,7 @@ export function TelegramConfigView({
               id="tg-name"
               type="text"
               required
-              placeholder="Ej. Maria Dobrusin"
+              placeholder="Ej. Eduardo Dobrusin"
               value={fullName}
               onChange={(e) => setFullName(e.target.value)}
               className="w-full h-[44px] px-3 border border-[#CBD5E1] rounded-[6px] text-[15px]"
@@ -531,18 +579,33 @@ export function TelegramConfigView({
             />
           </div>
 
-          <button
-            type="submit"
-            disabled={saving}
-            className="clinical-btn inline-flex items-center justify-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
-          >
-            <UserPlus
-              className="w-4 h-4"
-              strokeWidth={1.75}
-              aria-hidden="true"
-            />
-            {saving ? "Guardando..." : "Agregar Destinatario"}
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="submit"
+              disabled={saving}
+              className="clinical-btn flex-1 inline-flex items-center justify-center gap-2 px-4 bg-[#0E7490] hover:bg-[#155E75] text-white text-[14px] font-bold"
+            >
+              <UserPlus
+                className="w-4 h-4"
+                strokeWidth={1.75}
+                aria-hidden="true"
+              />
+              {saving
+                ? "Guardando..."
+                : editingRecipientId
+                ? "Actualizar"
+                : "Agregar"}
+            </button>
+            {editingRecipientId && (
+              <button
+                type="button"
+                onClick={resetRecipientForm}
+                className="clinical-btn px-3 border border-[#CBD5E1] bg-white text-[#334155] text-[13px]"
+              >
+                Cancelar
+              </button>
+            )}
+          </div>
         </form>
 
         <div className="clinical-card overflow-hidden">
@@ -556,7 +619,8 @@ export function TelegramConfigView({
                   <th className="py-3 px-3">Restock &lt;= 7d</th>
                   <th className="py-3 px-3">Eventos Clinicos</th>
                   <th className="py-3 px-3">Temas Seg.</th>
-                  <th className="py-3 px-4">Estado</th>
+                  <th className="py-3 px-3">Estado</th>
+                  <th className="py-3 px-4 text-right">Gobernanza</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E2E8F0]">
@@ -580,16 +644,74 @@ export function TelegramConfigView({
                       {renderPermToggle(rec, "receive_med_reminders", "Tomas")}
                     </td>
                     <td className="py-3 px-3">
-                      {renderPermToggle(rec, "receive_restock_alerts", "Restock")}
+                      {renderPermToggle(
+                        rec,
+                        "receive_restock_alerts",
+                        "Restock"
+                      )}
                     </td>
                     <td className="py-3 px-3">
-                      {renderPermToggle(rec, "receive_event_reminders", "Eventos")}
+                      {renderPermToggle(
+                        rec,
+                        "receive_event_reminders",
+                        "Eventos"
+                      )}
                     </td>
                     <td className="py-3 px-3">
                       {renderPermToggle(rec, "receive_topic_reminders", "Temas")}
                     </td>
-                    <td className="py-3 px-4">
+                    <td className="py-3 px-3">
                       {renderPermToggle(rec, "is_active", "Activo")}
+                    </td>
+                    <td className="py-3 px-4 text-right">
+                      <div className="inline-flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => startEditRecipient(rec)}
+                          className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[13px]"
+                          aria-label={`Editar destinatario ${rec.full_name}`}
+                        >
+                          <Edit3
+                            className="w-3.5 h-3.5"
+                            strokeWidth={1.75}
+                            aria-hidden="true"
+                          />
+                        </button>
+                        {confirmDeleteRecId === rec.id ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await onDeleteRecipient(rec.id);
+                                setConfirmDeleteRecId(null);
+                              }}
+                              className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[12px] font-bold"
+                            >
+                              Confirmar
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteRecId(null)}
+                              className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[12px]"
+                            >
+                              No
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteRecId(rec.id)}
+                            className="clinical-btn px-2.5 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
+                            aria-label={`Eliminar destinatario ${rec.full_name}`}
+                          >
+                            <Trash2
+                              className="w-3.5 h-3.5"
+                              strokeWidth={1.75}
+                              aria-hidden="true"
+                            />
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -599,11 +721,26 @@ export function TelegramConfigView({
         </div>
       </section>
 
-      {/* Cola Unificada de Notificaciones */}
+      {/* Cola Unificada de Notificaciones con Gobernanza */}
       <section aria-labelledby="queue-heading" className="space-y-3">
-        <h3 id="queue-heading" className="text-[16px] font-bold text-[#0F172A]">
-          Cola Unificada de Notificaciones (Ultimas {snapshot.recent_notifications.length})
-        </h3>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 id="queue-heading" className="text-[16px] font-bold text-[#0F172A]">
+            Cola Unificada de Notificaciones (Ultimas{" "}
+            {snapshot.recent_notifications.length})
+          </h3>
+          <button
+            type="button"
+            onClick={async () => {
+              const res = await onPurgeAcknowledged();
+              setActionLog(
+                `[COLA DEPURADA] ${res.purgedCount} notificaciones confirmadas eliminadas.`
+              );
+            }}
+            className="clinical-btn px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155] text-[13px] font-medium"
+          >
+            Limpiar Confirmadas
+          </button>
+        </div>
 
         <div className="space-y-3">
           {snapshot.recent_notifications.map((notif) => {
@@ -642,6 +779,12 @@ export function TelegramConfigView({
                   {notif.message}
                 </pre>
 
+                {notif.last_error && (
+                  <p className="text-[12px] font-mono text-[#991B1B]">
+                    Ultimo error: {notif.last_error}
+                  </p>
+                )}
+
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                   <span className="font-mono text-[13px] text-[#64748B] tabular-nums">
                     Payload: {notif.callback_action_payload ?? "N/A"} (
@@ -651,41 +794,107 @@ export function TelegramConfigView({
                       : ""}
                   </span>
 
-                  {notif.status !== "ACKNOWLEDGED" && (
-                    <div className="flex flex-wrap items-center gap-2">
-                      {notif.source_type === "MEDICATION_INTAKE" && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {notif.status !== "ACKNOWLEDGED" && (
+                      <>
+                        {notif.source_type === "MEDICATION_INTAKE" && (
+                          <button
+                            type="button"
+                            disabled={busyAction === `snooze:${notif.id}`}
+                            onClick={() =>
+                              handleSimulateCallback(notif, "snooze")
+                            }
+                            className="clinical-btn px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[12px] font-medium"
+                          >
+                            Posponer +15m
+                          </button>
+                        )}
                         <button
                           type="button"
-                          disabled={busyAction === `snooze:${notif.id}`}
-                          onClick={() => handleSimulateCallback(notif, "snooze")}
-                          className="clinical-btn px-3 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0F172A] text-[13px] font-medium"
+                          disabled={busyAction === `ack:${notif.id}`}
+                          onClick={() => handleSimulateCallback(notif, "ack")}
+                          className="clinical-btn inline-flex items-center gap-1 px-2.5 bg-[#0E7490] hover:bg-[#155E75] text-white text-[12px] font-bold"
                         >
-                          Simular Posponer 15 min
+                          {notif.status === "QUEUED" ? (
+                            <Send
+                              className="w-3.5 h-3.5"
+                              strokeWidth={1.75}
+                              aria-hidden="true"
+                            />
+                          ) : (
+                            <CheckCircle2
+                              className="w-3.5 h-3.5"
+                              strokeWidth={1.75}
+                              aria-hidden="true"
+                            />
+                          )}
+                          Simular ACK
                         </button>
-                      )}
+                        <button
+                          type="button"
+                          onClick={() => onCancelNotification(notif.id)}
+                          className="clinical-btn inline-flex items-center gap-1 px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155] text-[12px]"
+                          title="Cancelar / marcar atendida"
+                        >
+                          <Ban
+                            className="w-3.5 h-3.5"
+                            strokeWidth={1.75}
+                            aria-hidden="true"
+                          />
+                          Cancelar
+                        </button>
+                      </>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => onRetryNotification(notif.id)}
+                      className="clinical-btn inline-flex items-center gap-1 px-2.5 border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#0E7490] text-[12px]"
+                      title="Reencolar para envio inmediato"
+                    >
+                      <RotateCcw
+                        className="w-3.5 h-3.5"
+                        strokeWidth={1.75}
+                        aria-hidden="true"
+                      />
+                      Reencolar
+                    </button>
+
+                    {confirmDeleteNotifId === notif.id ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await onDeleteNotification(notif.id);
+                            setConfirmDeleteNotifId(null);
+                          }}
+                          className="clinical-btn px-2.5 bg-[#991B1B] text-white text-[12px] font-bold"
+                        >
+                          Confirmar
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteNotifId(null)}
+                          className="clinical-btn px-2 border border-[#CBD5E1] bg-white text-[12px]"
+                        >
+                          No
+                        </button>
+                      </>
+                    ) : (
                       <button
                         type="button"
-                        disabled={busyAction === `ack:${notif.id}`}
-                        onClick={() => handleSimulateCallback(notif, "ack")}
-                        className="clinical-btn inline-flex items-center gap-1.5 px-3 bg-[#0E7490] hover:bg-[#155E75] text-white text-[13px] font-bold"
+                        onClick={() => setConfirmDeleteNotifId(notif.id)}
+                        className="clinical-btn px-2 border border-[#FECACA] bg-white hover:bg-[#FEF2F2] text-[#991B1B]"
+                        aria-label={`Eliminar notificacion ${notif.title}`}
                       >
-                        {notif.status === "QUEUED" ? (
-                          <Send
-                            className="w-3.5 h-3.5"
-                            strokeWidth={1.75}
-                            aria-hidden="true"
-                          />
-                        ) : (
-                          <CheckCircle2
-                            className="w-3.5 h-3.5"
-                            strokeWidth={1.75}
-                            aria-hidden="true"
-                          />
-                        )}
-                        Simular Confirmacion Telegram
+                        <Trash2
+                          className="w-3.5 h-3.5"
+                          strokeWidth={1.75}
+                          aria-hidden="true"
+                        />
                       </button>
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </div>
               </article>
             );
